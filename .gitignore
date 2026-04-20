@@ -33,3 +33,6 @@ third_party/
 
 # Logs
 *.log
+artifacts/
+videos/
+.build/

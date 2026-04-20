@@ -10,8 +10,8 @@ from configs.common import KnnBackendConfig, TensorboardConfig
 class GlobalOptimizationConfig(TensorboardConfig, KnnBackendConfig):
     """Stage 2: Global optimization (LOO consensus + joint deformation)."""
 
-    # KNN backend. GPU KD-tree default (large-N throughput).
-    knn_backend: str = "gpu_kdtree"
+    # KNN backend. CPU KD-tree default for stability on this workflow.
+    knn_backend: str = "cpu_kdtree"
 
     # Paths
     root_path: str = ""
@@ -60,7 +60,7 @@ class GlobalOptimizationConfig(TensorboardConfig, KnnBackendConfig):
     Typical: 1–2.
     """
 
-    deform_chunk_size: int = 200_000
+    deform_chunk_size: int = 50_000
     """Deformation forward chunk size (TCNN peak-memory control)."""
 
     # Anchoring (stability / drift control)
@@ -70,9 +70,9 @@ class GlobalOptimizationConfig(TensorboardConfig, KnnBackendConfig):
     """Anchor samples per frame."""
 
     # TV regularization (optional)
-    tv_reg: float = 0.0
+    tv_reg: float = 50.0
     """TV weight."""
-    tv_voxel_size: float = 0.05
+    tv_voxel_size: float = 0.01
     """Voxel size for TV sampling."""
     tv_every_k: int = 1
     """TV evaluation period (iterations)."""
@@ -80,7 +80,7 @@ class GlobalOptimizationConfig(TensorboardConfig, KnnBackendConfig):
     """TV random subsampling ratio (None: full)."""
 
     # LOO photometric term (Colored-ICP style; geometry-only)
-    loo_color_icp_weight: float = 0.05
+    loo_color_icp_weight: float = 0.02
     """Photometric weight."""
 
     loo_color_icp_k: int = 10

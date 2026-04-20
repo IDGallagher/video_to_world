@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
+from utils.third_party_bootstrap import prepend_local_third_party_paths
+
 
 def nearest_neighbors_torch_kdtree(
     src: torch.Tensor, ref: torch.Tensor, *, K: int = 1, tree=None
@@ -38,6 +40,7 @@ def nearest_neighbors_torch_kdtree(
         idxs: (N,) or (N, K) indices into ref
         d2: (N,) or (N, K) squared distances
     """
+    prepend_local_third_party_paths("torch_kdtree")
     from torch_kdtree import build_kd_tree
 
     if tree is None:
@@ -51,6 +54,7 @@ def nearest_neighbors_torch_kdtree(
 
 def build_torch_kdtree(ref: torch.Tensor):
     """Build torch_kdtree for repeated queries. Ref must be on CUDA."""
+    prepend_local_third_party_paths("torch_kdtree")
     from torch_kdtree import build_kd_tree
 
     return build_kd_tree(ref)

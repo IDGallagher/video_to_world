@@ -8,7 +8,7 @@ for a single scene.
 Usage:
     python run_reconstruction.py \
         --config.root-path /path/to/da3_scene \
-        --config.stage1.alignment.num-frames 50 --config.stage1.alignment.stride 2 \
+        --config.stage0-alignment.num-frames 50 --config.stage0-alignment.stride 2 \
         --config.mode fast           # or "extensive"
 """
 
@@ -22,10 +22,12 @@ from typing import Any, Iterable, Literal, Optional
 
 import tyro
 
+from configs.common import AlignmentDataConfig
 from configs.stage1_align import FrameToModelICPConfig
 from configs.stage2_global_optimization import GlobalOptimizationConfig
 from configs.stage3_gs import GSConfig
 from configs.stage3_inverse_deformation import TrainInverseDeformationConfig
+from utils.stage1_preparation import prepare_stage1_inputs, resolve_stage1_out_path
 
 
 @dataclass
@@ -51,7 +53,7 @@ class PipelineConfig:
     preprocess_overwrite: bool = False
     """Force rerunning Stage 0 preprocessing even if outputs exist."""
 
-    preprocess_max_frames: int = 100
+    preprocess_max_frames: int = 30
     """Stage 0: maximum number of frames to run DA3 on."""
 
     preprocess_max_stride: int = 8
@@ -62,6 +64,30 @@ class PipelineConfig:
 
     preprocess_model_name: str = "depth-anything/DA3NESTED-GIANT-LARGE"
     """Stage 0: DA3 model name/path (HuggingFace repo or local)."""
+
+    preprocess_process_res: int = 768
+    """Stage 0: DA3 processing resolution (longest side in pixels). Higher = denser points, more VRAM."""
+
+    preprocess_process_res_method: str = "upper_bound_resize"
+    """Stage 0: DA3 preprocessing resize method."""
+
+    preprocess_use_ray_pose: bool = False
+    """Stage 0: use DA3 ray-based pose estimation instead of the camera decoder."""
+
+    preprocess_ref_view_strategy: str = "first"
+    """Stage 0: DA3 multi-view reference-view strategy. Defaults to 'first' for this project."""
+
+    preprocess_export_gs_video: bool = False
+    """Stage 0: also export the DA3 gs_video preview outputs. Disabled by default to keep Stage 0 faster."""
+
+    preprocess_export_kinect_rgbd_video: bool = False
+    """Stage 0: also export a KinectStreamer-style packed RGBD video."""
+
+    preprocess_kinect_rgbd_video_fps: int = 30
+    """Stage 0: frame rate for the packed Kinect-layout RGBD video export."""
+
+    stage0_alignment: AlignmentDataConfig = field(default_factory=AlignmentDataConfig)
+    """Stage 0: frame selection and confidence filtering used to prepare Stage 1's pre-ICP inputs."""
 
     # ---- Scene root (required if Stage 0 is not used) ----
     root_path: Optional[str] = None
@@ -119,6 +145,20 @@ class PipelineConfig:
 
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_stage0_alignment_config(
+    stage0_alignment: AlignmentDataConfig,
+    stage1_alignment: AlignmentDataConfig,
+) -> AlignmentDataConfig:
+    default_alignment = AlignmentDataConfig()
+    if stage0_alignment != default_alignment:
+        if stage1_alignment != default_alignment and stage1_alignment != stage0_alignment:
+            print(
+                "[PIPELINE] Stage 0 alignment config overrides Stage 1 alignment config for pre-ICP preparation.",
+            )
+        return stage0_alignment
+    return stage1_alignment
 
 
 def _run(cmd: list[str], dry_run: bool = False) -> None:
@@ -213,6 +253,7 @@ def _iter_config_overrides(
 
 def main(config: PipelineConfig) -> None:
     python = sys.executable
+    prep_alignment_cfg = _resolve_stage0_alignment_config(config.stage0_alignment, config.stage1.alignment)
 
     # ---- Stage 0: DA3 preprocessing (optional) ----
     # Determine whether we're in "direct scene" mode (root_path given) or "raw input" mode.
@@ -231,7 +272,25 @@ def main(config: PipelineConfig) -> None:
             scene_root = os.path.abspath(config.scene_root)
 
         npz_path = os.path.join(scene_root, "exports", "npz", "results.npz")
+        kinect_video_path = os.path.join(
+            scene_root,
+            "exports",
+            "kinect_rgbd_video",
+            "kinect_rgbd_hapq.mov",
+        )
+        prep_out_path = resolve_stage1_out_path(
+            scene_root,
+            prep_alignment_cfg,
+            out_path=config.stage1.out_path,
+            out_suffix=config.stage1.out_suffix,
+        )
+        prep_before_non_rigid = os.path.join(prep_out_path, "before_non_rigid_icp.ply")
         need_preprocess = config.preprocess_overwrite or (not os.path.exists(npz_path))
+        need_kinect_video = (
+            bool(config.preprocess_export_kinect_rgbd_video)
+            and (config.preprocess_overwrite or (not os.path.exists(kinect_video_path)))
+        )
+        need_stage1_prep = config.preprocess_overwrite or (not os.path.exists(prep_before_non_rigid))
         if need_preprocess:
             print("[PIPELINE] === Stage 0: DA3 Preprocessing ===")
             stage0_cmd = [
@@ -247,7 +306,76 @@ def main(config: PipelineConfig) -> None:
                 str(config.preprocess_max_frames),
                 "--max_stride",
                 str(config.preprocess_max_stride),
+                "--process_res",
+                str(config.preprocess_process_res),
+                "--process_res_method",
+                config.preprocess_process_res_method,
+                "--ref_view_strategy",
+                config.preprocess_ref_view_strategy,
+                "--prepare_stage1_inputs",
+                "--prepare_num_frames",
+                str(prep_alignment_cfg.num_frames),
+                "--prepare_stride",
+                str(prep_alignment_cfg.stride),
+                "--prepare_offset",
+                str(prep_alignment_cfg.offset),
+                "--prepare_conf_thresh_percentile",
+                str(prep_alignment_cfg.conf_thresh_percentile),
+                "--prepare_conf_mode",
+                prep_alignment_cfg.conf_mode,
+                "--prepare_conf_global_percentile",
+                "none"
+                if prep_alignment_cfg.conf_global_percentile is None
+                else str(prep_alignment_cfg.conf_global_percentile),
+                "--prepare_conf_local_percentile",
+                "none"
+                if prep_alignment_cfg.conf_local_percentile is None
+                else str(prep_alignment_cfg.conf_local_percentile),
+                "--prepare_conf_voxel_size",
+                str(prep_alignment_cfg.conf_voxel_size),
+                "--prepare_conf_voxel_min_count_percentile",
+                "none"
+                if prep_alignment_cfg.conf_voxel_min_count_percentile is None
+                else str(prep_alignment_cfg.conf_voxel_min_count_percentile),
+                "--prepare_conf_sky_depth_band_percent",
+                str(prep_alignment_cfg.conf_sky_depth_band_percent),
+                "--prepare_conf_edge_rtol",
+                "none" if prep_alignment_cfg.conf_edge_rtol is None else str(prep_alignment_cfg.conf_edge_rtol),
+                "--prepare_conf_edge_atol",
+                "none" if prep_alignment_cfg.conf_edge_atol is None else str(prep_alignment_cfg.conf_edge_atol),
+                "--prepare_conf_edge_kernel_size",
+                str(prep_alignment_cfg.conf_edge_kernel_size),
+                "--prepare_conf_max_depth_rtol",
+                "none"
+                if prep_alignment_cfg.conf_max_depth_rtol is None
+                else str(prep_alignment_cfg.conf_max_depth_rtol),
+                "--prepare_conf_max_depth_atol",
+                "none"
+                if prep_alignment_cfg.conf_max_depth_atol is None
+                else str(prep_alignment_cfg.conf_max_depth_atol),
+                "--prepare_out_path",
+                prep_out_path,
+                "--prepare_out_suffix",
+                config.stage1.out_suffix,
             ]
+            if prep_alignment_cfg.conf_mask_sky:
+                stage0_cmd += ["--prepare_conf_mask_sky"]
+            if prep_alignment_cfg.conf_mask_sky_depth_band:
+                stage0_cmd += ["--prepare_conf_mask_sky_depth_band"]
+            if prep_alignment_cfg.conf_mask_depth_edges:
+                stage0_cmd += ["--prepare_conf_mask_depth_edges"]
+            if prep_alignment_cfg.conf_mask_max_depth:
+                stage0_cmd += ["--prepare_conf_mask_max_depth"]
+            if config.preprocess_export_gs_video:
+                stage0_cmd += ["--export_gs_video"]
+            if config.preprocess_export_kinect_rgbd_video:
+                stage0_cmd += [
+                    "--export_kinect_rgbd_video",
+                    "--kinect_rgbd_video_fps",
+                    str(config.preprocess_kinect_rgbd_video_fps),
+                ]
+            if config.preprocess_use_ray_pose:
+                stage0_cmd += ["--use_ray_pose"]
             if config.input_video is not None:
                 stage0_cmd += ["--input_video", os.path.abspath(config.input_video)]
             else:
@@ -258,7 +386,37 @@ def main(config: PipelineConfig) -> None:
 
             _run(stage0_cmd, config.dry_run)
         else:
-            print(f"[PIPELINE] Skipping Stage 0 (found existing NPZ): {npz_path}")
+            if need_kinect_video:
+                print("[PIPELINE] === Stage 0: Kinect RGBD Video Export ===")
+                if config.dry_run:
+                    print(f"[PIPELINE] Would export packed Kinect-layout RGBD video at {kinect_video_path}")
+                else:
+                    from export_stage0_kinect_video import export_stage0_kinect_video
+
+                    export_stage0_kinect_video(
+                        scene_root=scene_root,
+                        fps=int(config.preprocess_kinect_rgbd_video_fps),
+                        overwrite=bool(config.preprocess_overwrite),
+                    )
+            if need_stage1_prep:
+                print("[PIPELINE] === Stage 0: Stage 1 Input Preparation ===")
+                if config.dry_run:
+                    print(
+                        f"[PIPELINE] Would prepare filtered point-cloud cache + before_non_rigid_icp at {prep_out_path}",
+                    )
+                else:
+                    prepare_stage1_inputs(
+                        root_path=scene_root,
+                        alignment=prep_alignment_cfg,
+                        out_path=config.stage1.out_path,
+                        out_suffix=config.stage1.out_suffix,
+                        device="cpu",
+                        overwrite_before_non_rigid=config.preprocess_overwrite,
+                    )
+            if not need_kinect_video and not need_stage1_prep:
+                print(
+                    f"[PIPELINE] Skipping Stage 0 (found existing NPZ + pre-ICP prep): {npz_path} and {prep_before_non_rigid}",
+                )
 
         root_path = scene_root
     elif config.root_path is not None and str(config.root_path).strip() != "":
@@ -310,16 +468,17 @@ def main(config: PipelineConfig) -> None:
     else:
         effective_renderers = (config.renderer,)
 
-    stage1_cfg = replace(stage1_cfg, root_path=root_path)
+    stage1_out_path = resolve_stage1_out_path(
+        root_path,
+        prep_alignment_cfg,
+        out_path=config.stage1.out_path,
+        out_suffix=config.stage1.out_suffix,
+    )
     stage1_cfg = replace(
         stage1_cfg,
-        alignment=replace(
-            stage1_cfg.alignment,
-            # If the user set these via --config.stage1.alignment.*, tyro already updated them.
-            # Otherwise, we keep the stage1 defaults.
-            num_frames=stage1_cfg.alignment.num_frames,
-            stride=stage1_cfg.alignment.stride,
-        ),
+        root_path=root_path,
+        out_path=stage1_out_path,
+        alignment=AlignmentDataConfig(),
     )
 
     # ---- Stage 1: Iterative Alignment ----

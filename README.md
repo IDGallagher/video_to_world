@@ -106,6 +106,23 @@ Reconstruct a 3D world from a single MP4 (generated from a video model):
 python run_reconstruction.py --config.input-video /path/to/video.mp4
 ```
 
+### Gradio App
+
+For a local UI around the same pipeline:
+
+```bash
+pip install gradio
+python gradio_app.py --server-name 0.0.0.0 --server-port 7860
+```
+
+The app can:
+
+- launch `run_reconstruction.py` from upload and dropdown-based inputs without typing paths
+- browse existing videos and scene roots directly from the UI
+- run Stage 0, Stage 1, Stage 2, Stage 3.1, or Stage 3.2 explicitly instead of only the full pipeline
+- live-tail the pipeline log
+- surface the latest preview videos and key artifacts discovered in the scene directory
+
 Alternatively, run the full pipeline from a folder of frames:
 
 ```bash
@@ -126,12 +143,13 @@ Use `--config.renderer [2dgs,3dgs,both]` to select which type of Gaussian Splatt
 ### Stage 0: DA3 preprocessing (video / frames → pointcloud)
 
 ```bash
-python preprocess_video.py --input_video /path/to/video.mp4
+python preprocess_video.py --input_video /path/to/video.mp4 --prepare_stage1_inputs --export_kinect_rgbd_video
 ```
 
 This estimates per-frame pointclouds using DepthAnyting-3 and saves the results to `<scene_root> = /path/to/video` (overwrite via `--scene_root /path/to/da3_scene`).
+With `--prepare_stage1_inputs`, Stage 0 also materializes the filtered `exports/ply/...` cache and writes `before_non_rigid_icp.ply` into the corresponding `frame_to_model_icp_<...>/` run directory. Add `--export_gs_video` if you also want the DA3 preview video and trajectory export. Add `--export_kinect_rgbd_video` to also write a packed KinectStreamer-style RGBD video under `exports/kinect_rgbd_video/`.
 
-Subsampling of frames is controlled by `--max_frames` (default: 100) and `--max_stride` (default: 8).
+Subsampling of frames is controlled by `--max_frames` (default: 30) and `--max_stride` (default: 8).
 The script extracts all frames to `<scene_root>/frames/`, then writes the selected subset (renumbered from `000000.*`) to `<scene_root>/frames_subsampled/` and runs DepthAnyting-3 on that folder.
 This constrains memory of DA3 to the available budget (choose fewer frames for smaller GPUs).
 Please consult the original repository for more information regarding memory.
@@ -146,34 +164,119 @@ If the scene contains much more frames, one can use [DA3-Streaming](https://gith
       results.npz          # Contains: depth (N,H,W), conf (N,H,W),
                             #   extrinsics (N,3,4) w2c, intrinsics (N,3,3),
                             #   image (N,H,W,3) uint8
-  gs_video/
-    *.mp4                  # flythrough video of naive DA3 reconstruction
-    *_transforms.json       # exported camera trajectory (used later for evaluation)
+    kinect_rgbd_video/     # Optional packed Stage 0 export
+      kinect_rgbd_hapq.mov
+      sequence_info.json
+      frames/
+        000000.png         # Layout: [metadata_barcode|color|depth]
+    kinect_rgbd_sequence/  # Optional exact packed frame-sequence export
+      sequence_info.json
+      frames/
+        000000.png         # Layout: [metadata_barcode|color|depth]
+    kinect_rgbd_sequence_depth8/  # Optional exact packed frame-sequence export with 8-bit inverse depth
+      sequence_info.json
+      frames/
+        000000.png         # Layout: [metadata_barcode|color|depth]
+    depth_image_stream/    # Optional exact DirectStorage stream export
+      depth_image_stream.divstream
   frames/                   # extracted original frames
   frames_subsampled/         # renumbered subset used for DA3
 ```
+
+If `--export_gs_video` is enabled, Stage 0 also writes:
+
+```
+  gs_video/
+    *.mp4                  # flythrough video of naive DA3 reconstruction
+    *_transforms.json      # exported camera trajectory (used later for evaluation)
+```
+
+If `--export_kinect_rgbd_video` is enabled, Stage 0 also writes:
+
+```
+  exports/
+    kinect_rgbd_video/
+      kinect_rgbd_hapq.mov
+      sequence_info.json   # fps + metadata width + packed frame dimensions
+      frames/
+        000000.png         # [barcode|color|depth], first-frame-relative camera metadata
+```
+
+The Gradio app can also export:
+- an exact packed frame sequence to `exports/kinect_rgbd_sequence/` using the current 16-bit inverse-depth RGB codebook
+- an exact packed frame sequence to `exports/kinect_rgbd_sequence_depth8/` using 8-bit inverse-depth grayscale replicated across RGB
+- an exact single-file DirectStorage stream to `exports/depth_image_stream/depth_image_stream.divstream`
+
+The two PNG-sequence exports can be used with `ADepthImageVolumeImageSequenceActor` for side-by-side Unreal comparisons against the HAP path. The `.divstream` export is intended for `ADepthImageVolumeDirectStorageActor`.
+
+Runtime HAP playback uses `kinect_rgbd_hapq.mov`. The accompanying `frames/` directory plus `sequence_info.json` are left behind so Unreal can also drive a separate exact PNG-sequence actor from the same packed frames.
+
+#### DirectStorage stream format
+
+- The `.divstream` export is not a video codec. It is a single-file frame stream designed for DirectStorage playback in Unreal.
+- The current export format is `DIVBC7C3`.
+- The export uses 3-frame chunks:
+  - color is stored as raw `BC7` blocks on disk
+  - depth is stored as exact `G16` bytes per frame
+  - within each chunk, depth frame `0` is absolute and later depth frames are lossless XOR residuals against the previous frame
+  - the chunked depth payload is then `GDeflate`-compressed
+- Depth is stored as `uint16`, not float16:
+  - `0` = invalid pixel
+  - `[1, 65535]` = valid depth mapped linearly between that frame's `near` / `far` values in centimeters
+- Per-frame metadata is stored in a binary frame table: first-frame-relative camera-to-world, `near`, `far`, `fx`, `fy`, `cx`, `cy`.
+- `ADepthImageVolumeDirectStorageActor` only supports `DIVBC7C3`. Older `DIVSTRM1`, `DIVBC7C1`, and `DIVBC7C2` streams are rejected and should be re-exported.
+- The Unreal runtime uses this data through `ADepthImageVolumeDirectStorageActor`, preserving the existing `DepthImageVolume` exact depth/color path while exposing video-style controls (`play`, `pause`, `seek`, `loop`, playback rate).
+
+#### Packed Stage 0 video format
+
+- Frame layout is `[metadata_barcode | color | depth]`.
+- The left barcode is `64` pixels wide by default so each of the 13 float values spans 4-5 columns before HAP block compression.
+- The left barcode stores 13 float32 values in this order: `px, py, pz, rx, ry, rz, near, far, fx, fy, cx, cy, hash`.
+- Frame `000000` is the reference pose: its relative transform is identity. All later frames are stored relative to frame `000000`.
+- `rx, ry, rz` are the vector part of a unit quaternion. The scalar `w` is recovered in the reader from `sqrt(max(0, 1 - x^2 - y^2 - z^2))`.
+- `fx, fy, cx, cy` are per-frame intrinsics in pixels.
+- The color and depth halves are center-padded as needed to HAP-compatible block dimensions. `cx/cy` are stored after padding so the camera model still matches the padded frame exactly.
+- The packed depth half uses a lossless exact 16-bit inverse-depth codebook with the coarse byte in `G` and the low byte spread across a small `R/B` serpentine lattice, so it remains exact under lossless RGB storage and degrades more gracefully than a hue-wheel encoding if the frames are later transcoded lossily.
+- The packed PNG frames are transcoded to `HAP Q` in `kinect_rgbd_hapq.mov` for Unreal playback. This is still lossy, but it avoids YUV conversion and temporal prediction, which makes it a much better fit than H.264 for the barcode and packed depth image.
+- Depth normalization is global per exported clip: `u = (1/z - 1/far) / (1/near - 1/far)`, then `q = round(clamp(u, 0, 1) * 65535)`.
+- The optional `kinect_rgbd_sequence_depth8/` export uses the same global inverse-depth normalization, but stores `q8 = round(clamp(u, 0, 1) * 254) + 1` as grayscale in the depth half, reserving `0` for invalid pixels.
 
 The `results.npz` file is the primary input for all subsequent stages.
 
 ### Stage 1: Iterative Non-rigid Frame-to-model ICP
 
-This non-rigidly aligns the per-frame DA3 point clouds into a single canonical frame and writes the aligned canonical point cloud plus per-frame deformation fields.
+This runs non-rigid ICP on the Stage-0-prepared point-cloud cache and writes the aligned canonical point cloud plus per-frame deformation fields.
 
 ```bash
-python -m frame_to_model_icp --config.root-path <scene_root>
+python -m frame_to_model_icp --config.root-path <scene_root> \
+  --config.out-path <scene_root>/frame_to_model_icp_<N>_<stride>_offset<offset>
 ```
 
-#### Frame subsampling: `N`, `stride`, `offset`
+Point `--config.out-path` at the prepared Stage 0 run directory. Stage 1 loads the persisted Stage 0 prep config from that directory and only runs the non-rigid ICP stage.
 
-Stage 1 can optionally align only a subset of frames from `exports/npz/results.npz`. The run folder name encodes the chosen subset:
+#### Stage 0 pre-ICP sampling: `N`, `stride`, `offset`
 
-- **`--config.alignment.num-frames` (`N`)**: number of frames used by Stage 1 (default: 50).
-- **`--config.alignment.stride`**: take every `stride`-th frame from the underlying sequence (default: 2).
-- **`--config.alignment.offset`**: starting index into the underlying sequence (default: 0).
+Stage 0 can optionally prepare only a subset of frames from `exports/npz/results.npz` before Stage 1 starts. The run folder name encodes the chosen subset:
+
+- **`--prepare_num_frames` (`N`)**: number of frames prepared for Stage 1 (default: 50).
+- **`--prepare_stride`**: take every `stride`-th frame from the underlying sequence (default: 2).
+- **`--prepare_offset`**: starting index into the underlying sequence (default: 0).
 
 **Output**: `<scene_root>/frame_to_model_icp_<N>_<stride>_offset<offset>/` containing:
+- `before_non_rigid_icp.ply` -- merged Stage-0-prepared point cloud before non-rigid ICP
 - `after_non_rigid_icp/` -- per-frame SE(3) twists, deformation grids, merged point cloud
 - `after_non_rigid_icp/config.json` -- run configuration
+
+#### Stage 0 pre-ICP confidence filtering
+
+Stage 0 now uses the DA3 per-pixel confidence map from `results.npz` when it builds the filtered point-cloud cache for Stage 1. The default config uses a mixed `voxel_or` mode that combines DA3 confidence with voxel-density heuristics.
+
+For a simpler test that only uses DA3 confidence, run Stage 0 prep with one of these modes:
+
+- `--prepare_conf_mode per_frame --prepare_conf_thresh_percentile 80`
+- `--prepare_conf_mode global --prepare_conf_thresh_percentile 80`
+
+The Gradio app exposes these under Stage 0 pre-ICP filtering, with `DA3 Only (Per Frame)` being the simplest direct comparison against Pi-Long-style confidence pruning.
 
 ### Stage 2: Global Optimization
 

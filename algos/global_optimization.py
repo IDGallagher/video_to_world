@@ -13,6 +13,15 @@ from utils.normals import estimate_normals
 from utils.geometry import se3_apply
 
 
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda_error_out_of_memory" in msg
+        or ("tiny-cuda-nn/gpu_memory.h" in msg and "cuda_error_invalid_value" in msg)
+    )
+
+
 def _apply_deformation(
     world_points: torch.Tensor,
     local_deform,
@@ -46,12 +55,34 @@ def _apply_deformation_chunked(
     chunk_size: int,
 ) -> torch.Tensor:
     """Chunked variant of `_apply_deformation` to limit peak memory (TCNN workspace)."""
-    if chunk_size <= 0 or world_points.shape[0] <= chunk_size:
+    total_pts = int(world_points.shape[0])
+    if total_pts == 0:
         return _apply_deformation(world_points, local_deform, global_rigid)
+
+    if chunk_size <= 0:
+        current_chunk = total_pts
+    else:
+        current_chunk = min(int(chunk_size), total_pts)
+
+    cached_chunk = getattr(local_deform, "_safe_deform_chunk_size", None)
+    if isinstance(cached_chunk, int) and cached_chunk > 0:
+        current_chunk = min(current_chunk, cached_chunk)
+
     outs = []
-    for s in range(0, world_points.shape[0], chunk_size):
-        pts = world_points[s : s + chunk_size]
-        outs.append(_apply_deformation(pts, local_deform, global_rigid))
+    s = 0
+    while s < total_pts:
+        e = min(s + current_chunk, total_pts)
+        pts = world_points[s:e]
+        try:
+            outs.append(_apply_deformation(pts, local_deform, global_rigid))
+            s = e
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or pts.shape[0] <= 1:
+                raise
+            current_chunk = max(1, pts.shape[0] // 2)
+            setattr(local_deform, "_safe_deform_chunk_size", current_chunk)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     return torch.cat(outs, dim=0)
 
 
@@ -678,22 +709,22 @@ def global_opt(
         # TV Regularization
         # ---------------------------------------------------------------------
         if tv_reg > 0 and (tv_every_k <= 1 or (it % tv_every_k) == 0):
-            local_modules = [
-                per_frame_local_deform[i]
+            local_module_items = [
+                (i, per_frame_local_deform[i])
                 for i in range(1, num_frames)
                 if isinstance(per_frame_local_deform[i], torch.nn.Module)
             ]
-            if local_modules:
+            if local_module_items:
                 # Subsample to at most 5 modules for efficiency
-                num_to_use = min(5, len(local_modules))
-                if num_to_use < len(local_modules):
-                    perm = torch.randperm(len(local_modules), device=device)[:num_to_use]
-                    selected_modules = [local_modules[int(i)] for i in perm]
+                num_to_use = min(5, len(local_module_items))
+                if num_to_use < len(local_module_items):
+                    perm = torch.randperm(len(local_module_items), device=device)[:num_to_use]
+                    selected_items = [local_module_items[int(i)] for i in perm]
                 else:
-                    selected_modules = local_modules
+                    selected_items = local_module_items
 
                 tv_energies = []
-                for module in selected_modules:
+                for frame_idx, module in selected_items:
                     # Use per-module bbox when available (needed for
                     # c2w convention where each frame's
                     # DeformationGrid has its own camera-space bbox).
@@ -705,6 +736,8 @@ def global_opt(
                         tv_voxel_size,
                         module,
                         sample_ratio=tv_sample_ratio,
+                        input_points=per_frame_world_points[frame_idx],
+                        deform_chunk_size=deform_chunk_size,
                     )
                     tv_energies.append(energy)
 

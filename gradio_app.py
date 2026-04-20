@@ -1,0 +1,4618 @@
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import Optional
+
+try:
+    import gradio as gr
+except ImportError as exc:  # pragma: no cover - exercised at runtime.
+    raise SystemExit(
+        "Gradio is required for this UI. Install it with `pip install gradio` in the active environment."
+    ) from exc
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+VIDEOS_ROOT = (PROJECT_ROOT / "videos").resolve()
+RUNS_ROOT = PROJECT_ROOT / ".gradio_runs"
+UPLOADS_ROOT = VIDEOS_ROOT / "_gradio_uploads"
+PICKER_ROOT = VIDEOS_ROOT if VIDEOS_ROOT.exists() else PROJECT_ROOT.resolve()
+APP_BUILD_TIME = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+APP_VERSION = APP_BUILD_TIME
+WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
+MAX_LOG_LINES = 220
+POLL_INTERVAL_SEC = 1.0
+DEFAULT_STAGE0_MAX_FRAMES = 30
+VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv"}
+IGNORED_VIDEO_DIR_NAMES = {"gs_video", "gs_video_eval"}
+
+ACTIVE_RUNS: dict[str, subprocess.Popen] = {}
+ACTIVE_RUNS_LOCK = threading.Lock()
+
+
+@dataclass
+class SceneArtifacts:
+    scene_root: Path
+    run_dirs: list[Path]
+    latest_run_dir: Optional[Path]
+    da3_videos: list[Path]
+    gs_videos: list[Path]
+    inverse_dirs: list[Path]
+    gs_dirs: list[Path]
+    key_files: list[Path]
+    notes: list[str]
+
+
+def _ensure_workspace_dirs() -> None:
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _prepend_active_python_bin_to_path(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    target_env = env if env is not None else os.environ
+    python_bin = str(Path(sys.executable).resolve().parent)
+    current_path = target_env.get("PATH", "")
+    entries = current_path.split(os.pathsep) if current_path else []
+    if python_bin not in entries:
+        target_env["PATH"] = python_bin if not current_path else f"{python_bin}{os.pathsep}{current_path}"
+    return target_env
+
+
+def _strip_quotes(raw: object) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    return str(raw).strip().strip('"').strip("'")
+
+
+def _normalize_path(raw: object, *, allow_missing: bool = False) -> Path:
+    value = _strip_quotes(raw)
+    if not value:
+        raise ValueError("Path is empty.")
+
+    candidate = Path(value).expanduser()
+    search_paths = []
+    if candidate.is_absolute():
+        search_paths.append(candidate)
+    else:
+        search_paths.append((Path.cwd() / candidate).resolve())
+        search_paths.append((PROJECT_ROOT / candidate).resolve())
+
+    match = WINDOWS_DRIVE_RE.match(value)
+    if match and os.name != "nt":
+        converted = Path("/mnt") / match.group("drive").lower() / match.group("rest").replace("\\", "/")
+        search_paths.append(converted)
+
+    for path in search_paths:
+        if path.exists():
+            return path.resolve()
+
+    if allow_missing:
+        return search_paths[0]
+
+    raise FileNotFoundError(f"Path does not exist: {value}")
+
+
+def _resolve_existing_file(raw: object) -> Path:
+    path = _normalize_path(raw, allow_missing=False)
+    if not path.is_file():
+        raise FileNotFoundError(f"Expected a file, found: {path}")
+    return path
+
+
+def _resolve_existing_dir(raw: object) -> Path:
+    path = _normalize_path(raw, allow_missing=False)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Expected a directory, found: {path}")
+    return path
+
+
+def _safe_stem(name: str) -> str:
+    stem = Path(name).stem
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    return safe or "scene"
+
+
+def _coerce_int(value: object, *, label: str, optional: bool = False) -> Optional[int]:
+    if value in (None, ""):
+        if optional:
+            return None
+        raise ValueError(f"{label} is required.")
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer.") from exc
+
+
+def _coerce_float(value: object, *, label: str, optional: bool = False) -> Optional[float]:
+    if value in (None, ""):
+        if optional:
+            return None
+        raise ValueError(f"{label} is required.")
+    try:
+        return float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a number.") from exc
+
+
+def _append_confidence_filter_args(
+    command: list[str],
+    *,
+    prefix: str,
+    profile: str,
+    percentile: float,
+) -> None:
+    if percentile < 0.0 or percentile > 100.0:
+        raise ValueError("DA3 confidence percentile must be between 0 and 100.")
+
+    normalized = str(profile or "default_mixed").strip().lower()
+    command.extend([f"--{prefix}.conf-thresh-percentile", str(percentile)])
+
+    if normalized == "default_mixed":
+        command.extend(
+            [
+                f"--{prefix}.conf-mode",
+                "voxel_or",
+                f"--{prefix}.conf-global-percentile",
+                "10",
+                f"--{prefix}.conf-local-percentile",
+                "10",
+                f"--{prefix}.conf-voxel-size",
+                "1.0",
+                f"--{prefix}.conf-voxel-min-count-percentile",
+                "50",
+            ]
+        )
+        return
+
+    if normalized == "da3_per_frame":
+        command.extend([f"--{prefix}.conf-mode", "per_frame"])
+        return
+
+    if normalized == "da3_global":
+        command.extend([f"--{prefix}.conf-mode", "global"])
+        return
+
+    if normalized == "da3_per_frame_guided":
+        command.extend(
+            [
+                f"--{prefix}.conf-mode",
+                "per_frame_guided",
+                f"--{prefix}.conf-global-percentile",
+                str(percentile),
+                f"--{prefix}.conf-local-percentile",
+                str(percentile),
+            ]
+        )
+        return
+
+    raise ValueError(f"Unknown confidence profile: {profile}")
+
+
+def _append_depth_edge_args(
+    command: list[str],
+    *,
+    prefix: str,
+    enabled: bool,
+    edge_rtol: Optional[float],
+    edge_atol: Optional[float],
+    edge_kernel_size: int,
+) -> None:
+    if not enabled:
+        return
+    if edge_rtol is None and edge_atol is None:
+        raise ValueError("Depth-edge suppression needs a relative or absolute threshold.")
+    if edge_kernel_size <= 0 or edge_kernel_size % 2 == 0:
+        raise ValueError("Depth-edge kernel must be a positive odd integer.")
+
+    command.append(f"--{prefix}.conf-mask-depth-edges")
+    command.extend([f"--{prefix}.conf-edge-kernel-size", str(edge_kernel_size)])
+    if edge_rtol is not None:
+        command.extend([f"--{prefix}.conf-edge-rtol", str(edge_rtol)])
+    if edge_atol is not None:
+        command.extend([f"--{prefix}.conf-edge-atol", str(edge_atol)])
+
+
+def _append_max_depth_args(
+    command: list[str],
+    *,
+    prefix: str,
+    enabled: bool,
+    max_depth_rtol: Optional[float],
+    max_depth_atol: Optional[float],
+) -> None:
+    if not enabled:
+        return
+    if max_depth_rtol is None and max_depth_atol is None:
+        raise ValueError("Max-depth suppression needs a relative or absolute threshold.")
+
+    command.append(f"--{prefix}.conf-mask-max-depth")
+    if max_depth_rtol is not None:
+        command.extend([f"--{prefix}.conf-max-depth-rtol", str(max_depth_rtol)])
+    if max_depth_atol is not None:
+        command.extend([f"--{prefix}.conf-max-depth-atol", str(max_depth_atol)])
+
+
+def _append_sky_mask_args(
+    command: list[str],
+    *,
+    prefix: str,
+    enabled: bool,
+) -> None:
+    if enabled:
+        command.append(f"--{prefix}.conf-mask-sky")
+
+
+def _append_sky_depth_band_args(
+    command: list[str],
+    *,
+    prefix: str,
+    enabled: bool,
+    band_percent: Optional[float],
+) -> None:
+    if not enabled:
+        return
+    command.append(f"--{prefix}.conf-mask-sky-depth-band")
+    if band_percent is not None:
+        command.extend([f"--{prefix}.conf-sky-depth-band-percent", str(band_percent)])
+
+
+def _append_prepare_alignment_args(
+    command: list[str],
+    *,
+    num_frames: int,
+    stride: int,
+    offset: int,
+    conf_profile: str,
+    conf_percentile: float,
+    conf_mask_sky: bool,
+    conf_mask_sky_depth_band: bool,
+    conf_sky_depth_band_percent: Optional[float],
+    conf_mask_depth_edges: bool,
+    conf_edge_rtol: Optional[float],
+    conf_edge_atol: Optional[float],
+    conf_edge_kernel_size: int,
+    conf_mask_max_depth: bool,
+    conf_max_depth_rtol: Optional[float],
+    conf_max_depth_atol: Optional[float],
+) -> None:
+    command.extend(
+        [
+            "--prepare_stage1_inputs",
+            "--prepare_num_frames",
+            str(num_frames),
+            "--prepare_stride",
+            str(stride),
+            "--prepare_offset",
+            str(offset),
+        ]
+    )
+
+    normalized = str(conf_profile or "default_mixed").strip().lower()
+    command.extend(["--prepare_conf_thresh_percentile", str(conf_percentile)])
+    if normalized == "default_mixed":
+        command.extend(
+            [
+                "--prepare_conf_mode",
+                "voxel_or",
+                "--prepare_conf_global_percentile",
+                "10",
+                "--prepare_conf_local_percentile",
+                "10",
+                "--prepare_conf_voxel_size",
+                "1.0",
+                "--prepare_conf_voxel_min_count_percentile",
+                "50",
+            ]
+        )
+    elif normalized == "da3_per_frame":
+        command.extend(["--prepare_conf_mode", "per_frame"])
+    elif normalized == "da3_global":
+        command.extend(["--prepare_conf_mode", "global"])
+    elif normalized == "da3_per_frame_guided":
+        command.extend(
+            [
+                "--prepare_conf_mode",
+                "per_frame_guided",
+                "--prepare_conf_global_percentile",
+                str(conf_percentile),
+                "--prepare_conf_local_percentile",
+                str(conf_percentile),
+            ]
+        )
+    else:
+        raise ValueError(f"Unknown confidence profile: {conf_profile}")
+
+    if conf_mask_sky:
+        command.append("--prepare_conf_mask_sky")
+    if conf_mask_sky_depth_band:
+        command.append("--prepare_conf_mask_sky_depth_band")
+        if conf_sky_depth_band_percent is not None:
+            command.extend(["--prepare_conf_sky_depth_band_percent", str(conf_sky_depth_band_percent)])
+    if conf_mask_depth_edges:
+        if conf_edge_rtol is None and conf_edge_atol is None:
+            raise ValueError("Depth-edge suppression needs a relative or absolute threshold.")
+        if conf_edge_kernel_size <= 0 or conf_edge_kernel_size % 2 == 0:
+            raise ValueError("Depth-edge kernel must be a positive odd integer.")
+        command.append("--prepare_conf_mask_depth_edges")
+        command.extend(["--prepare_conf_edge_kernel_size", str(conf_edge_kernel_size)])
+        command.extend(["--prepare_conf_edge_rtol", "none" if conf_edge_rtol is None else str(conf_edge_rtol)])
+        command.extend(["--prepare_conf_edge_atol", "none" if conf_edge_atol is None else str(conf_edge_atol)])
+    if conf_mask_max_depth:
+        if conf_max_depth_rtol is None and conf_max_depth_atol is None:
+            raise ValueError("Max-depth suppression needs a relative or absolute threshold.")
+        command.append("--prepare_conf_mask_max_depth")
+        command.extend(
+            ["--prepare_conf_max_depth_rtol", "none" if conf_max_depth_rtol is None else str(conf_max_depth_rtol)]
+        )
+        command.extend(
+            ["--prepare_conf_max_depth_atol", "none" if conf_max_depth_atol is None else str(conf_max_depth_atol)]
+        )
+
+
+def _append_tyro_bool_arg(
+    command: list[str],
+    *,
+    prefix: str,
+    name: str,
+    value: bool,
+    default: bool,
+) -> None:
+    kebab = name.replace("_", "-")
+    if value == default:
+        return
+    if value:
+        command.append(f"--{prefix}.{kebab}")
+    else:
+        command.append(f"--{prefix}.no-{kebab}")
+
+
+def _append_tyro_value_arg(
+    command: list[str],
+    *,
+    prefix: str,
+    name: str,
+    value: object,
+    default: object,
+) -> None:
+    if value is None or value == default:
+        return
+    command.extend([f"--{prefix}.{name.replace('_', '-')}", str(value)])
+
+
+def _append_stage1_extra_args(command: list[str], *, prefix: str, settings: dict[str, object]) -> None:
+    _append_tyro_bool_arg(command, prefix=f"{prefix}.roma", name="use_roma_matching", value=bool(settings["use_roma_matching"]), default=True)
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_version", value=settings["roma_version"], default="v2")
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_model", value=settings["roma_model"], default="indoor")
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_num_samples", value=settings["roma_num_samples"], default=5000)
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_certainty_threshold", value=settings["roma_certainty_threshold"], default=0.5)
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_max_references", value=settings["roma_max_references"], default=20)
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_reference_sampling", value=settings["roma_reference_sampling"], default="recent_and_strided")
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_loss_weight", value=settings["roma_loss_weight"], default=1.0)
+    _append_tyro_value_arg(command, prefix=f"{prefix}.roma", name="roma_max_corr_dist", value=settings["roma_max_corr_dist"], default=1.0)
+    _append_tyro_bool_arg(command, prefix=prefix, name="tensorboard", value=bool(settings["tensorboard"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="knn_backend", value=settings["knn_backend"], default="cpu_kdtree")
+    _append_tyro_value_arg(command, prefix=prefix, name="max_corr_dist", value=settings["max_corr_dist"], default=0.03)
+    _append_tyro_value_arg(command, prefix=prefix, name="merge_voxel_size", value=settings["merge_voxel_size"], default=0.001)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_n_iter", value=settings["icp_n_iter"], default=100)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_early_stopping_patience", value=settings["icp_early_stopping_patience"], default=5)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_early_stopping_min_iters", value=settings["icp_early_stopping_min_iters"], default=25)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_early_stopping_min_delta", value=settings["icp_early_stopping_min_delta"], default=None)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_lr", value=settings["icp_lr"], default=1e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_method", value=settings["icp_method"], default="point2plane")
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_local_twist_reg", value=settings["icp_local_twist_reg"], default=0.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_tv_reg", value=settings["icp_tv_reg"], default=50.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_tv_voxel_size", value=settings["icp_tv_voxel_size"], default=0.01)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_tv_every_k", value=settings["icp_tv_every_k"], default=1)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_tv_sample_ratio", value=settings["icp_tv_sample_ratio"], default=0.1)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_color_icp_weight", value=settings["icp_color_icp_weight"], default=0.02)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_color_icp_max_color_dist", value=settings["icp_color_icp_max_color_dist"], default=0.1)
+    _append_tyro_value_arg(command, prefix=prefix, name="icp_color_icp_k", value=settings["icp_color_icp_k"], default=10)
+    _append_tyro_value_arg(command, prefix=prefix, name="save_intermediate_every", value=settings["save_intermediate_every"], default=10)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_log2_hashmap_size", value=settings["deform_log2_hashmap_size"], default=19)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_num_levels", value=settings["deform_num_levels"], default=24)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_n_neurons", value=settings["deform_n_neurons"], default=64)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_n_hidden_layers", value=settings["deform_n_hidden_layers"], default=4)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_min_res", value=settings["deform_min_res"], default=16)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_max_res", value=settings["deform_max_res"], default=2048)
+    _append_tyro_bool_arg(command, prefix=prefix, name="filter_points", value=bool(settings["filter_points"]), default=False)
+    _append_tyro_value_arg(command, prefix=prefix, name="filter_geom_sigma", value=settings["filter_geom_sigma"], default=2.5)
+    _append_tyro_value_arg(command, prefix=prefix, name="filter_color_sigma", value=settings["filter_color_sigma"], default=1.5)
+    _append_tyro_value_arg(command, prefix=prefix, name="filter_worst_pct", value=settings["filter_worst_pct"], default=0.2)
+    _append_tyro_value_arg(command, prefix=prefix, name="filter_min_frames", value=settings["filter_min_frames"], default=2)
+    _append_tyro_value_arg(command, prefix=prefix, name="filter_base_percentile", value=settings["filter_base_percentile"], default="p75")
+
+
+def _append_stage2_extra_args(command: list[str], *, prefix: str, settings: dict[str, object]) -> None:
+    _append_tyro_bool_arg(command, prefix=prefix, name="tensorboard", value=bool(settings["tensorboard"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="knn_backend", value=settings["knn_backend"], default="cpu_kdtree")
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_loss_weight", value=settings["loo_loss_weight"], default=1.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_k_neighbors", value=settings["loo_k_neighbors"], default=5)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_max_corr_dist", value=settings["loo_max_corr_dist"], default=0.03125)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_normal_k", value=settings["loo_normal_k"], default=20)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_kdtree_rebuild_every", value=settings["loo_kdtree_rebuild_every"], default=50)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_max_pairs_per_iter", value=settings["loo_max_pairs_per_iter"], default=200000)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_pairs_per_src", value=settings["loo_pairs_per_src"], default=1)
+    _append_tyro_value_arg(command, prefix=prefix, name="deform_chunk_size", value=settings["deform_chunk_size"], default=200000)
+    _append_tyro_value_arg(command, prefix=prefix, name="anchor_loss_weight", value=settings["anchor_loss_weight"], default=1000.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="anchor_n_samples", value=settings["anchor_n_samples"], default=4096)
+    _append_tyro_value_arg(command, prefix=prefix, name="tv_reg", value=settings["tv_reg"], default=50.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="tv_voxel_size", value=settings["tv_voxel_size"], default=0.01)
+    _append_tyro_value_arg(command, prefix=prefix, name="tv_every_k", value=settings["tv_every_k"], default=1)
+    _append_tyro_value_arg(command, prefix=prefix, name="tv_sample_ratio", value=settings["tv_sample_ratio"], default=0.1)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_color_icp_weight", value=settings["loo_color_icp_weight"], default=0.02)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_color_icp_k", value=settings["loo_color_icp_k"], default=10)
+    _append_tyro_value_arg(command, prefix=prefix, name="loo_color_icp_max_color_dist", value=settings["loo_color_icp_max_color_dist"], default=0.1)
+    _append_tyro_value_arg(command, prefix=prefix, name="thin_shell_weight", value=settings["thin_shell_weight"], default=1000.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr", value=settings["lr"], default=1e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="n_iters", value=settings["n_iters"], default=150)
+    _append_tyro_value_arg(command, prefix=prefix, name="save_intermediate_every_n", value=settings["save_intermediate_every_n"], default=50)
+
+
+def _append_stage31_extra_args(command: list[str], *, prefix: str, settings: dict[str, object]) -> None:
+    _append_tyro_bool_arg(command, prefix=prefix, name="tensorboard", value=bool(settings["tensorboard"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="knn_backend", value=settings["knn_backend"], default="cpu_kdtree")
+    _append_tyro_value_arg(command, prefix=prefix, name="batch_size", value=settings["batch_size"], default=8192)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr", value=settings["lr"], default=1e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="cycle_weight", value=settings["cycle_weight"], default=0.1)
+    _append_tyro_value_arg(command, prefix=prefix, name="magnitude_weight", value=settings["magnitude_weight"], default=1e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="smoothness_weight", value=settings["smoothness_weight"], default=1e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="num_forward_samples", value=settings["num_forward_samples"], default=10000)
+    _append_tyro_value_arg(command, prefix=prefix, name="num_interp_samples", value=settings["num_interp_samples"], default=5000)
+    _append_tyro_value_arg(command, prefix=prefix, name="regenerate_every", value=settings["regenerate_every"], default=10)
+    _append_tyro_value_arg(command, prefix=prefix, name="view_embed_dim", value=settings["view_embed_dim"], default=32)
+    _append_tyro_value_arg(command, prefix=prefix, name="min_res", value=settings["min_res"], default=16)
+    _append_tyro_value_arg(command, prefix=prefix, name="max_res", value=settings["max_res"], default=2048)
+    _append_tyro_value_arg(command, prefix=prefix, name="num_levels", value=settings["num_levels"], default=16)
+    _append_tyro_value_arg(command, prefix=prefix, name="log2_hashmap_size", value=settings["log2_hashmap_size"], default=19)
+    _append_tyro_value_arg(command, prefix=prefix, name="n_neurons", value=settings["n_neurons"], default=64)
+    _append_tyro_value_arg(command, prefix=prefix, name="n_hidden_layers", value=settings["n_hidden_layers"], default=3)
+    _append_tyro_bool_arg(command, prefix=prefix, name="save_validation_plys", value=bool(settings["save_validation_plys"]), default=True)
+
+
+def _append_gs_extra_args(command: list[str], *, prefix: str, settings: dict[str, object]) -> None:
+    _append_tyro_bool_arg(command, prefix=prefix, name="tensorboard", value=bool(settings["tensorboard"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="sh_degree", value=settings["sh_degree"], default=3)
+    _append_tyro_value_arg(command, prefix=prefix, name="sh_increase_every", value=settings["sh_increase_every"], default=0)
+    _append_tyro_value_arg(command, prefix=prefix, name="sh_full_from_iter", value=settings["sh_full_from_iter"], default=5000)
+    _append_tyro_bool_arg(command, prefix=prefix, name="sh_freeze_means_when_full_sh", value=bool(settings["sh_freeze_means_when_full_sh"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="sh_reg_weight", value=settings["sh_reg_weight"], default=10.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="target_num_points", value=settings["target_num_points"], default=4000000)
+    _append_tyro_bool_arg(command, prefix=prefix, name="optimize_cams", value=bool(settings["optimize_cams"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_cams", value=settings["lr_cams"], default=1e-4)
+    _append_tyro_bool_arg(command, prefix=prefix, name="optimize_positions", value=bool(settings["optimize_positions"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_positions", value=settings["lr_positions"], default=1e-5)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_colors", value=settings["lr_colors"], default=2.5e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_opacities", value=settings["lr_opacities"], default=5e-2)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_scales", value=settings["lr_scales"], default=5e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_quats", value=settings["lr_quats"], default=1e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_sh0", value=settings["lr_sh0"], default=2.5e-3)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_shN", value=settings["lr_shn"], default=2.5e-3 / 20.0)
+    _append_tyro_bool_arg(command, prefix=prefix, name="deform_inverse_rotations", value=bool(settings["deform_inverse_rotations"]), default=True)
+    _append_tyro_value_arg(command, prefix=prefix, name="initial_opacity", value=settings["initial_opacity"], default=0.5)
+    _append_tyro_value_arg(command, prefix=prefix, name="initial_scale", value=settings["initial_scale"], default=0.005)
+    _append_tyro_value_arg(command, prefix=prefix, name="initial_flat_ratio", value=settings["initial_flat_ratio"], default=0.1)
+    _append_tyro_value_arg(command, prefix=prefix, name="scale_init", value=settings["scale_init"], default="knn")
+    _append_tyro_value_arg(command, prefix=prefix, name="knn_neighbors", value=settings["knn_neighbors"], default=4)
+    _append_tyro_value_arg(command, prefix=prefix, name="normal_k", value=settings["normal_k"], default=20)
+    _append_tyro_value_arg(command, prefix=prefix, name="l1_weight", value=settings["l1_weight"], default=0.8)
+    _append_tyro_value_arg(command, prefix=prefix, name="lpips_weight", value=settings["lpips_weight"], default=0.2)
+    _append_tyro_value_arg(command, prefix=prefix, name="opacity_reg_weight", value=settings["opacity_reg_weight"], default=0.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="scale_reg_weight", value=settings["scale_reg_weight"], default=0.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="normal_consistency_weight", value=settings["normal_consistency_weight"], default=0.05)
+    _append_tyro_value_arg(command, prefix=prefix, name="distortion_weight", value=settings["distortion_weight"], default=0.01)
+    _append_tyro_value_arg(command, prefix=prefix, name="alpha_reg_weight", value=settings["alpha_reg_weight"], default=0.0)
+    _append_tyro_value_arg(command, prefix=prefix, name="frames_per_iter", value=settings["frames_per_iter"], default=1)
+    _append_tyro_value_arg(command, prefix=prefix, name="log_every", value=settings["log_every"], default=50)
+    _append_tyro_value_arg(command, prefix=prefix, name="save_every", value=settings["save_every"], default=5000)
+    _append_tyro_value_arg(command, prefix=prefix, name="eval_every", value=settings["eval_every"], default=1000)
+    _append_tyro_value_arg(command, prefix=prefix, name="lr_decay", value=settings["lr_decay"], default=0.1)
+    _append_tyro_bool_arg(command, prefix=prefix, name="auto_eval", value=bool(settings["auto_eval"]), default=True)
+
+
+def _copy_uploaded_video(uploaded_path: str) -> Path:
+    source = _resolve_existing_file(uploaded_path)
+    try:
+        source.relative_to(UPLOADS_ROOT)
+        return source.resolve()
+    except ValueError:
+        pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = UPLOADS_ROOT / f"{stamp}_{uuid.uuid4().hex[:8]}_{_safe_stem(source.name)}{source.suffix.lower()}"
+    shutil.copy2(source, target)
+    return target
+
+
+def _copy_uploaded_frames_dir(frames_dir_path: object) -> Path:
+    source = _resolve_existing_dir(frames_dir_path)
+    try:
+        source.relative_to(UPLOADS_ROOT)
+        return source.resolve()
+    except ValueError:
+        pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = UPLOADS_ROOT / f"{stamp}_{uuid.uuid4().hex[:8]}_{_safe_stem(source.name)}"
+    shutil.copytree(source, target)
+    return target.resolve()
+
+
+def _ensure_unique_scene_root(path: Path) -> Path:
+    candidate = path.resolve()
+    if not candidate.exists():
+        return candidate
+
+    suffix = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    return candidate.with_name(f"{candidate.name}_{suffix}")
+
+
+def _compose_scene_root_override(parent_dir_selection: object, scene_name: str, *, default_stem: str) -> Optional[Path]:
+    parent_dir_text = _strip_quotes(parent_dir_selection)
+    scene_name_text = _strip_quotes(scene_name)
+    if not parent_dir_text and not scene_name_text:
+        return None
+
+    if parent_dir_text:
+        parent_dir = _resolve_existing_dir(parent_dir_text)
+    else:
+        parent_dir = PICKER_ROOT
+
+    final_name = _safe_stem(scene_name_text) if scene_name_text else default_stem
+    return (parent_dir / final_name).resolve()
+
+
+def _cache_uploaded_video_value(uploaded_path: object) -> str:
+    raw_path = _strip_quotes(uploaded_path)
+    if not raw_path:
+        return ""
+    return str(_copy_uploaded_video(raw_path))
+
+
+def _display_path(path: Path, *, root: Optional[Path] = None) -> str:
+    base = (root or PICKER_ROOT).resolve()
+    try:
+        rel = path.resolve().relative_to(base)
+    except ValueError:
+        return str(path.resolve())
+    rel_text = rel.as_posix()
+    if not rel_text or rel_text == ".":
+        return f"{base.name}/"
+    return rel_text
+
+
+def _choice_tuples(paths: list[Path], *, include_empty_label: Optional[str] = None) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    if include_empty_label is not None:
+        choices.append((include_empty_label, ""))
+
+    seen: set[str] = set()
+    for path in paths:
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        choices.append((_display_path(path), resolved))
+    return choices
+
+
+def _update_dropdown_choices(choices: list[tuple[str, str]], current_value: object = None):
+    valid_values = [value for _, value in choices]
+    selected = _strip_quotes(current_value)
+    if selected not in valid_values:
+        if "" in valid_values:
+            selected = ""
+        else:
+            selected = valid_values[0] if valid_values else None
+    return gr.update(choices=choices, value=selected)
+
+
+def _discover_existing_videos() -> list[Path]:
+    if not PICKER_ROOT.is_dir():
+        return []
+
+    candidates: list[Path] = []
+    for path in PICKER_ROOT.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        parts = [part.lower() for part in path.parts]
+        if any(part in IGNORED_VIDEO_DIR_NAMES for part in parts):
+            continue
+        if any(part.startswith("frame_to_model_icp_") for part in path.parts):
+            continue
+        candidates.append(path.resolve())
+
+    return sorted(candidates, key=lambda item: (-item.stat().st_mtime, _display_path(item)))
+
+
+def _discover_scene_roots() -> list[Path]:
+    if not PICKER_ROOT.is_dir():
+        return []
+
+    scene_roots: dict[str, Path] = {}
+    for npz_path in PICKER_ROOT.rglob("results.npz"):
+        try:
+            if npz_path.parent.name != "npz" or npz_path.parent.parent.name != "exports":
+                continue
+            scene_root = npz_path.parents[2].resolve()
+        except IndexError:
+            continue
+        scene_roots[str(scene_root)] = scene_root
+
+    return sorted(scene_roots.values(), key=lambda item: (-item.stat().st_mtime, _display_path(item)))
+
+
+def _discover_output_parent_dirs() -> list[Path]:
+    if not PICKER_ROOT.is_dir():
+        return []
+
+    directories = [PICKER_ROOT.resolve()]
+    directories.extend(sorted([path.resolve() for path in PICKER_ROOT.iterdir() if path.is_dir()], key=_display_path))
+    return directories
+
+
+def _video_dropdown_choices() -> list[tuple[str, str]]:
+    return _choice_tuples(_discover_existing_videos())
+
+
+def _scene_dropdown_choices() -> list[tuple[str, str]]:
+    return _choice_tuples(_discover_scene_roots(), include_empty_label="Select after Stage 0")
+
+
+def _output_parent_dropdown_choices() -> list[tuple[str, str]]:
+    return _choice_tuples(_discover_output_parent_dirs(), include_empty_label="Default (automatic)")
+
+
+def _refresh_pipeline_catalogs(current_video: object, current_scene: object, current_parent: object):
+    return (
+        _update_dropdown_choices(_video_dropdown_choices(), current_video),
+        _update_dropdown_choices(_scene_dropdown_choices(), current_scene),
+        _update_dropdown_choices(_output_parent_dropdown_choices(), current_parent),
+    )
+
+
+def _refresh_stage_catalogs(current_video: object, current_parent: object, current_scene: object):
+    return (
+        _update_dropdown_choices(_video_dropdown_choices(), current_video),
+        _update_dropdown_choices(_output_parent_dropdown_choices(), current_parent),
+        _update_dropdown_choices(_scene_dropdown_choices(), current_scene),
+    )
+
+
+def _refresh_inspect_catalog(current_scene: object):
+    return _update_dropdown_choices(_scene_dropdown_choices(), current_scene)
+
+
+def _sync_catalogs_and_scene_views(
+    preferred_scene_root: object,
+    pipeline_current_video: object,
+    pipeline_current_scene: object,
+    pipeline_current_parent: object,
+    stage_current_video: object,
+    stage_current_parent: object,
+    stage_current_scene: object,
+    inspect_current_scene: object,
+):
+    video_choices = _video_dropdown_choices()
+    scene_choices = _scene_dropdown_choices()
+    output_parent_choices = _output_parent_dropdown_choices()
+
+    pipeline_video_update = _update_dropdown_choices(video_choices, pipeline_current_video)
+    pipeline_parent_update = _update_dropdown_choices(output_parent_choices, pipeline_current_parent)
+    stage_video_update = _update_dropdown_choices(video_choices, stage_current_video)
+    stage_parent_update = _update_dropdown_choices(output_parent_choices, stage_current_parent)
+
+    scene_values = [value for _, value in scene_choices]
+    selected_scene = None
+    preferred_scene_text = _strip_quotes(preferred_scene_root)
+    stage_scene_text = _strip_quotes(stage_current_scene)
+    if preferred_scene_text == "" and stage_scene_text == "" and "" in scene_values:
+        selected_scene = ""
+    for candidate in (
+        preferred_scene_root,
+        stage_current_scene,
+        pipeline_current_scene,
+        inspect_current_scene,
+    ):
+        if selected_scene == "":
+            break
+        value = _strip_quotes(candidate)
+        if value and value in scene_values:
+            selected_scene = value
+            break
+    if selected_scene is None and scene_values:
+        selected_scene = scene_values[0]
+
+    pipeline_scene_update = _update_dropdown_choices(scene_choices, selected_scene)
+    stage_scene_update = _update_dropdown_choices(scene_choices, selected_scene)
+    inspect_scene_update = _update_dropdown_choices(scene_choices, selected_scene)
+
+    empty_dropdown = _empty_dropdown_update()
+    disabled = _stage_button_update(active=False, enabled=False)
+    if not selected_scene:
+        return (
+            pipeline_video_update,
+            pipeline_scene_update,
+            pipeline_parent_update,
+            stage_video_update,
+            stage_parent_update,
+            stage_scene_update,
+            inspect_scene_update,
+            "",
+            "",
+            empty_dropdown,
+            "",
+            empty_dropdown,
+            empty_dropdown,
+            empty_dropdown,
+            "",
+            "**Recommended Next Step**: `Stage 0`\n\nStart from a video to create the scene root, DA3 outputs, filtered point-cloud cache, and pre-ICP merge.",
+            _stage_button_update(active=True, enabled=True),
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+            "",
+            "",
+            "",
+            None,
+            None,
+            [],
+            "Select a scene to inspect existing outputs.",
+        )
+
+    stage_refresh = _refresh_stage_scene(selected_scene)
+    inspect_refresh = _inspect_existing_scene(selected_scene)
+    return (
+        pipeline_video_update,
+        pipeline_scene_update,
+        pipeline_parent_update,
+        stage_video_update,
+        stage_parent_update,
+        stage_scene_update,
+        inspect_scene_update,
+        *stage_refresh,
+        *inspect_refresh,
+    )
+
+
+def _update_pipeline_source_mode(source_mode: str):
+    normalized = str(source_mode or "upload_video").strip().lower()
+    return (
+        gr.update(visible=normalized == "upload_video"),
+        gr.update(visible=normalized == "existing_video"),
+        gr.update(visible=normalized == "existing_scene"),
+        gr.update(visible=normalized != "existing_scene"),
+    )
+
+
+def _update_stage0_source_mode(source_mode: str):
+    normalized = str(source_mode or "upload_video").strip().lower()
+    return (
+        gr.update(visible=normalized == "upload_video"),
+        gr.update(visible=normalized == "existing_video"),
+        gr.update(visible=normalized == "existing_frames"),
+    )
+
+
+def _tail_text(path: Path, *, max_lines: int = MAX_LOG_LINES) -> str:
+    if not path.exists():
+        return ""
+    lines: deque[str] = deque(maxlen=max_lines)
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:d}:{secs:02d}"
+
+
+def _find_run_dirs(scene_root: Path) -> list[Path]:
+    if not scene_root.is_dir():
+        return []
+    return sorted(
+        [path for path in scene_root.iterdir() if path.is_dir() and path.name.startswith("frame_to_model_icp_")],
+        key=lambda path: path.stat().st_mtime,
+    )
+
+
+def _list_inverse_dirs(run_dir: Optional[Path]) -> list[Path]:
+    if run_dir is None or not run_dir.is_dir():
+        return []
+    return sorted(
+        [path for path in run_dir.iterdir() if path.is_dir() and path.name.startswith("inverse_deformation")],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _list_gs_dirs(run_dir: Optional[Path]) -> list[Path]:
+    if run_dir is None or not run_dir.is_dir():
+        return []
+    return sorted(
+        [path for path in run_dir.iterdir() if path.is_dir() and path.name.startswith("gs_")],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _checkpoint_subdir_choices(run_dir: Optional[Path]) -> list[str]:
+    if run_dir is None or not run_dir.is_dir():
+        return []
+    preferred = ["after_global_optimization", "after_non_rigid_icp"]
+    return [name for name in preferred if (run_dir / name).is_dir()]
+
+
+def _default_original_images_dir(scene_root: Path) -> str:
+    frames_dir = scene_root / "frames_subsampled"
+    return str(frames_dir.resolve()) if frames_dir.is_dir() else ""
+
+
+def _collect_scene_artifacts(scene_root: Path) -> SceneArtifacts:
+    notes: list[str] = []
+    run_dirs = _find_run_dirs(scene_root)
+    latest_run_dir = run_dirs[-1] if run_dirs else None
+
+    da3_videos = sorted((scene_root / "gs_video").glob("*.mp4")) if (scene_root / "gs_video").is_dir() else []
+    gs_videos: list[Path] = []
+    gs_dirs: list[Path] = []
+    inverse_dirs: list[Path] = []
+    key_files: list[Path] = []
+
+    results_npz = scene_root / "exports" / "npz" / "results.npz"
+    if results_npz.exists():
+        key_files.append(results_npz)
+    else:
+        notes.append("Stage 0 results.npz not found yet.")
+
+    if latest_run_dir is None:
+        notes.append("No Stage 1 run directory found yet.")
+    else:
+        after_non_rigid = latest_run_dir / "after_non_rigid_icp"
+        after_global = latest_run_dir / "after_global_optimization"
+        if after_non_rigid.is_dir():
+            key_files.append(after_non_rigid / "config.json")
+        else:
+            notes.append("Stage 1 checkpoint directory not found yet.")
+        if after_global.is_dir():
+            key_files.append(after_global / "config.json")
+        else:
+            notes.append("Stage 2 checkpoint directory not found yet.")
+
+        debug_mask_dir = latest_run_dir / "exports" / "ply"
+        debug_mask_paths = sorted(debug_mask_dir.glob("*/debug_masks")) if debug_mask_dir.is_dir() else []
+        if debug_mask_paths:
+            key_files.append(debug_mask_paths[-1])
+
+        inverse_dirs = _list_inverse_dirs(latest_run_dir)
+        for inverse_dir in inverse_dirs:
+            model_path = inverse_dir / "inverse_local.pt"
+            if model_path.exists():
+                key_files.append(model_path)
+
+        gs_dirs = _list_gs_dirs(latest_run_dir)
+        for gs_dir in gs_dirs:
+            gs_videos.extend(sorted((gs_dir / "gs_video_eval").glob("*.mp4")))
+            model_final = gs_dir / "model_final.pt"
+            renderer_name = gs_dir.name.split("_", 1)[1] if "_" in gs_dir.name else gs_dir.name
+            splat_ply = gs_dir / f"splats_{renderer_name}.ply"
+            if model_final.exists():
+                key_files.append(model_final)
+            checkpoint_paths = sorted(gs_dir.glob("checkpoint_*.pt"))
+            if checkpoint_paths:
+                key_files.append(checkpoint_paths[-1])
+            if splat_ply.exists():
+                key_files.append(splat_ply)
+
+    key_files.extend(da3_videos[:1])
+    key_files.extend(gs_videos[:2])
+
+    deduped_key_files: list[Path] = []
+    seen = set()
+    for path in key_files:
+        if not path.exists():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_key_files.append(path.resolve())
+
+    return SceneArtifacts(
+        scene_root=scene_root.resolve(),
+        run_dirs=run_dirs,
+        latest_run_dir=latest_run_dir.resolve() if latest_run_dir else None,
+        da3_videos=[path.resolve() for path in da3_videos],
+        gs_videos=[path.resolve() for path in gs_videos],
+        inverse_dirs=[path.resolve() for path in inverse_dirs],
+        gs_dirs=[path.resolve() for path in gs_dirs],
+        key_files=deduped_key_files[:10],
+        notes=notes,
+    )
+
+
+def _placeholder_artifacts(scene_root: Path) -> SceneArtifacts:
+    return SceneArtifacts(
+        scene_root=scene_root.resolve(),
+        run_dirs=[],
+        latest_run_dir=None,
+        da3_videos=[],
+        gs_videos=[],
+        inverse_dirs=[],
+        gs_dirs=[],
+        key_files=[],
+        notes=["Scene root has not been created yet."],
+    )
+
+
+def _choose_primary_preview(artifacts: SceneArtifacts) -> Optional[str]:
+    if artifacts.gs_videos:
+        return str(artifacts.gs_videos[0])
+    if artifacts.da3_videos:
+        return str(artifacts.da3_videos[0])
+    return None
+
+
+def _choose_secondary_preview(artifacts: SceneArtifacts) -> Optional[str]:
+    if artifacts.gs_videos and artifacts.da3_videos:
+        return str(artifacts.da3_videos[0])
+    if len(artifacts.gs_videos) > 1:
+        return str(artifacts.gs_videos[1])
+    return None
+
+
+def _format_scene_report(artifacts: SceneArtifacts, *, selected_run_name: Optional[str] = None) -> str:
+    lines = [
+        f"Scene root: `{artifacts.scene_root}`",
+        f"Stage 1 runs: `{len(artifacts.run_dirs)}`",
+        f"Latest run: `{artifacts.latest_run_dir}`" if artifacts.latest_run_dir else "Latest run: `not available`",
+        f"DA3 preview videos: `{len(artifacts.da3_videos)}`",
+        f"GS preview videos: `{len(artifacts.gs_videos)}`",
+        f"Inverse deformation dirs: `{len(artifacts.inverse_dirs)}`",
+        f"GS dirs: `{len(artifacts.gs_dirs)}`",
+    ]
+
+    selected_run_dir: Optional[Path] = None
+    if selected_run_name:
+        candidate = artifacts.scene_root / selected_run_name
+        if candidate.is_dir():
+            selected_run_dir = candidate.resolve()
+    elif artifacts.latest_run_dir is not None:
+        selected_run_dir = artifacts.latest_run_dir
+
+    if selected_run_dir is not None:
+        checkpoint_dirs = _checkpoint_subdir_choices(selected_run_dir)
+        inverse_names = [path.name for path in _list_inverse_dirs(selected_run_dir)]
+        gs_names = [path.name for path in _list_gs_dirs(selected_run_dir)]
+        lines.extend(
+            [
+                "",
+                "Selected run:",
+                f"- `{selected_run_dir}`",
+                f"- Checkpoint inputs: `{', '.join(checkpoint_dirs) if checkpoint_dirs else 'none'}`",
+                f"- Inverse dirs: `{', '.join(inverse_names) if inverse_names else 'none'}`",
+                f"- GS dirs: `{', '.join(gs_names) if gs_names else 'none'}`",
+            ]
+        )
+
+    if artifacts.notes:
+        lines.append("")
+        lines.append("Notes:")
+        lines.extend(f"- {note}" for note in artifacts.notes)
+    return "\n".join(lines)
+
+
+def _latest_run_dir_text(artifacts: SceneArtifacts) -> str:
+    return str(artifacts.latest_run_dir) if artifacts.latest_run_dir else ""
+
+
+def _key_files_as_strings(artifacts: SceneArtifacts) -> list[str]:
+    return [str(path) for path in artifacts.key_files]
+
+
+def _detect_current_stage(log_text: str, *, default_stage: str) -> str:
+    if not log_text.strip():
+        return default_stage
+
+    pipeline_lines = [line.strip() for line in log_text.splitlines() if "[PIPELINE]" in line]
+    for line in reversed(pipeline_lines):
+        if "Done! All outputs are in:" in line:
+            return "Complete"
+        if "Stage 3.2" in line:
+            return "Stage 3.2"
+        if "Stage 3.1" in line:
+            return "Stage 3.1"
+        if "Stage 2" in line:
+            return "Stage 2"
+        if "Stage 1" in line:
+            return "Stage 1"
+        if "Stage 0" in line:
+            return "Stage 0"
+
+    lowered = log_text.lower()
+    if "da3 preprocessing complete" in lowered or "results.npz" in lowered:
+        return "Stage 0"
+    if "frame_to_model_icp" in lowered or "non-rigid icp" in lowered:
+        return "Stage 1"
+    if "global optimization" in lowered or "rebuilding knn/normals" in lowered or "estimate_normals" in lowered:
+        return "Stage 2"
+    if "inverse deformation" in lowered or "validation_roundtrip" in lowered:
+        return "Stage 3.1"
+    if "gs training" in lowered or "train_gs" in lowered or "lpips" in lowered:
+        return "Stage 3.2"
+    if "done! all outputs are in:" in lowered:
+        return "Complete"
+    return default_stage
+
+
+def _build_status_markdown(
+    *,
+    state: str,
+    stage: str,
+    elapsed_seconds: float,
+    scene_root: Path,
+    log_path: Path,
+    run_dir: str,
+    command: list[str],
+    extra: Optional[str] = None,
+) -> str:
+    lines = [
+        f"**State**: {state}",
+        f"**Stage**: {stage}",
+        f"**Elapsed**: `{_format_duration(elapsed_seconds)}`",
+        f"**Scene Root**: `{scene_root}`",
+        f"**Latest Run Dir**: `{run_dir or 'not available yet'}`",
+        f"**Log**: `{log_path}`",
+        "",
+        "**Command**",
+        f"`{' '.join(command)}`",
+    ]
+    if extra:
+        lines.extend(["", extra])
+    return "\n".join(lines)
+
+
+def _build_pipeline_command(
+    *,
+    input_video: Optional[Path],
+    existing_scene_root: Optional[Path],
+    scene_root_override: Optional[Path],
+    mode: str,
+    renderer_choice: str,
+    preprocess_overwrite: bool,
+    preprocess_max_frames: int,
+    preprocess_max_stride: int,
+    preprocess_image_ext: str,
+    preprocess_model_name: str,
+    preprocess_process_res: int,
+    preprocess_process_res_method: str,
+    preprocess_export_gs_video: bool,
+    preprocess_export_kinect_rgbd_video: bool,
+    preprocess_kinect_rgbd_video_fps: int,
+    preprocess_use_ray_pose: bool,
+    preprocess_ref_view_strategy: str,
+    alignment_num_frames: int,
+    alignment_stride: int,
+    alignment_offset: int,
+    alignment_conf_profile: str,
+    alignment_conf_percentile: float,
+    conf_mask_sky: bool,
+    conf_mask_sky_depth_band: bool,
+    conf_sky_depth_band_percent: Optional[float],
+    conf_mask_depth_edges: bool,
+    conf_edge_rtol: Optional[float],
+    conf_edge_atol: Optional[float],
+    conf_edge_kernel_size: int,
+    conf_mask_max_depth: bool,
+    conf_max_depth_rtol: Optional[float],
+    conf_max_depth_atol: Optional[float],
+    stage1_extra: dict[str, object],
+    stage2_extra: dict[str, object],
+    stage31_extra: dict[str, object],
+    gs_extra: dict[str, object],
+    inverse_epochs: Optional[int],
+    gs_num_iters: Optional[int],
+    dry_run: bool,
+) -> list[str]:
+    command = [sys.executable, "-u", str(PROJECT_ROOT / "run_reconstruction.py")]
+
+    if existing_scene_root is not None:
+        command += ["--config.root-path", str(existing_scene_root)]
+    elif input_video is not None:
+        command += ["--config.input-video", str(input_video)]
+        if scene_root_override is not None:
+            command += ["--config.scene-root", str(scene_root_override)]
+    else:
+        raise ValueError("Either input_video or existing_scene_root must be provided.")
+
+    command += ["--config.mode", mode]
+    if renderer_choice != "auto":
+        command += ["--config.renderer", renderer_choice]
+
+    command += ["--config.preprocess-max-frames", str(preprocess_max_frames)]
+    command += ["--config.preprocess-max-stride", str(preprocess_max_stride)]
+    command += ["--config.preprocess-image-ext", preprocess_image_ext]
+    command += ["--config.preprocess-model-name", preprocess_model_name]
+    command += ["--config.preprocess-process-res", str(preprocess_process_res)]
+    command += ["--config.preprocess-process-res-method", preprocess_process_res_method]
+    command += ["--config.preprocess-ref-view-strategy", preprocess_ref_view_strategy]
+    if preprocess_export_gs_video:
+        command += ["--config.preprocess-export-gs-video"]
+    if preprocess_export_kinect_rgbd_video:
+        command += ["--config.preprocess-export-kinect-rgbd-video"]
+        command += ["--config.preprocess-kinect-rgbd-video-fps", str(preprocess_kinect_rgbd_video_fps)]
+    if preprocess_use_ray_pose:
+        command += ["--config.preprocess-use-ray-pose"]
+    command += ["--config.stage0-alignment.num-frames", str(alignment_num_frames)]
+    command += ["--config.stage0-alignment.stride", str(alignment_stride)]
+    command += ["--config.stage0-alignment.offset", str(alignment_offset)]
+    _append_confidence_filter_args(
+        command,
+        prefix="config.stage0-alignment",
+        profile=alignment_conf_profile,
+        percentile=alignment_conf_percentile,
+    )
+    _append_sky_mask_args(
+        command,
+        prefix="config.stage0-alignment",
+        enabled=conf_mask_sky,
+    )
+    _append_sky_depth_band_args(
+        command,
+        prefix="config.stage0-alignment",
+        enabled=conf_mask_sky_depth_band,
+        band_percent=conf_sky_depth_band_percent,
+    )
+    _append_depth_edge_args(
+        command,
+        prefix="config.stage0-alignment",
+        enabled=conf_mask_depth_edges,
+        edge_rtol=conf_edge_rtol,
+        edge_atol=conf_edge_atol,
+        edge_kernel_size=conf_edge_kernel_size,
+    )
+    _append_max_depth_args(
+        command,
+        prefix="config.stage0-alignment",
+        enabled=conf_mask_max_depth,
+        max_depth_rtol=conf_max_depth_rtol,
+        max_depth_atol=conf_max_depth_atol,
+    )
+    _append_stage1_extra_args(command, prefix="config.stage1", settings=stage1_extra)
+    _append_stage2_extra_args(command, prefix="config.stage2", settings=stage2_extra)
+    _append_stage31_extra_args(command, prefix="config.stage31", settings=stage31_extra)
+    _append_gs_extra_args(command, prefix="config.gs", settings=gs_extra)
+
+    if preprocess_overwrite:
+        command += ["--config.preprocess-overwrite"]
+    if inverse_epochs is not None:
+        command += ["--config.stage31.n-epochs", str(inverse_epochs)]
+    if gs_num_iters is not None:
+        command += ["--config.gs.num-iters", str(gs_num_iters)]
+    if dry_run:
+        command += ["--config.dry-run"]
+
+    return command
+
+
+def _build_stage0_command(
+    *,
+    input_video: Optional[Path],
+    frames_dir: Optional[Path],
+    scene_root_override: Optional[Path],
+    preprocess_overwrite: bool,
+    preprocess_max_frames: int,
+    preprocess_max_stride: int,
+    preprocess_image_ext: str,
+    preprocess_model_name: str,
+    preprocess_process_res: int = 768,
+    preprocess_process_res_method: str = "upper_bound_resize",
+    preprocess_export_gs_video: bool = False,
+    preprocess_export_kinect_rgbd_video: bool = False,
+    preprocess_kinect_rgbd_video_fps: int = 30,
+    preprocess_use_ray_pose: bool = False,
+    preprocess_ref_view_strategy: str = "first",
+    alignment_num_frames: int = 50,
+    alignment_stride: int = 2,
+    alignment_offset: int = 0,
+    conf_profile: str = "default_mixed",
+    conf_percentile: float = 80.0,
+    conf_mask_sky: bool = False,
+    conf_mask_sky_depth_band: bool = False,
+    conf_sky_depth_band_percent: Optional[float] = None,
+    conf_mask_depth_edges: bool = True,
+    conf_edge_rtol: Optional[float] = 0.03,
+    conf_edge_atol: Optional[float] = None,
+    conf_edge_kernel_size: int = 3,
+    conf_mask_max_depth: bool = False,
+    conf_max_depth_rtol: Optional[float] = 0.001,
+    conf_max_depth_atol: Optional[float] = None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        str(PROJECT_ROOT / "preprocess_video.py"),
+        "--image_ext",
+        preprocess_image_ext,
+        "--model_name",
+        preprocess_model_name,
+        "--process_res",
+        str(preprocess_process_res),
+        "--process_res_method",
+        preprocess_process_res_method,
+        "--ref_view_strategy",
+        preprocess_ref_view_strategy,
+    ]
+    if preprocess_export_gs_video:
+        command += ["--export_gs_video"]
+    if preprocess_export_kinect_rgbd_video:
+        command += ["--export_kinect_rgbd_video", "--kinect_rgbd_video_fps", str(preprocess_kinect_rgbd_video_fps)]
+    if preprocess_use_ray_pose:
+        command += ["--use_ray_pose"]
+    if input_video is not None:
+        command += [
+            "--input_video",
+            str(input_video),
+            "--max_frames",
+            str(preprocess_max_frames),
+            "--max_stride",
+            str(preprocess_max_stride),
+        ]
+    elif frames_dir is not None:
+        command += ["--frames_dir", str(frames_dir)]
+    else:
+        raise ValueError("Stage 0 needs either an input video or a frames directory.")
+    if scene_root_override is not None:
+        command += ["--scene_root", str(scene_root_override)]
+    if preprocess_overwrite:
+        command += ["--overwrite"]
+    _append_prepare_alignment_args(
+        command,
+        num_frames=alignment_num_frames,
+        stride=alignment_stride,
+        offset=alignment_offset,
+        conf_profile=conf_profile,
+        conf_percentile=conf_percentile,
+        conf_mask_sky=conf_mask_sky,
+        conf_mask_sky_depth_band=conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+        conf_mask_depth_edges=conf_mask_depth_edges,
+        conf_edge_rtol=conf_edge_rtol,
+        conf_edge_atol=conf_edge_atol,
+        conf_edge_kernel_size=conf_edge_kernel_size,
+        conf_mask_max_depth=conf_mask_max_depth,
+        conf_max_depth_rtol=conf_max_depth_rtol,
+        conf_max_depth_atol=conf_max_depth_atol,
+    )
+    return command
+
+
+def _build_stage1_command(
+    *,
+    scene_root: Path,
+    run_dir: Path,
+    stage1_extra: dict[str, object],
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "frame_to_model_icp",
+        "--config.root-path",
+        str(scene_root),
+        "--config.out-path",
+        str(run_dir),
+    ]
+    _append_stage1_extra_args(command, prefix="config", settings=stage1_extra)
+    return command
+
+
+def _build_stage2_command(*, scene_root: Path, run_name: str, stage2_extra: dict[str, object]) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "global_optimization",
+        "--config.root-path",
+        str(scene_root),
+        "--config.run",
+        run_name,
+    ]
+    _append_stage2_extra_args(command, prefix="config", settings=stage2_extra)
+    return command
+
+
+def _build_stage31_out_path(run_dir: Path, checkpoint_subdir: str) -> Path:
+    return (run_dir / f"inverse_deformation_{checkpoint_subdir}").resolve()
+
+
+def _build_stage31_command(
+    *,
+    scene_root: Path,
+    run_name: str,
+    run_dir: Path,
+    checkpoint_subdir: str,
+    inverse_epochs: Optional[int],
+    stage31_extra: dict[str, object],
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "train_inverse_deformation",
+        "--config.root-path",
+        str(scene_root),
+        "--config.run",
+        run_name,
+        "--config.checkpoint-subdir",
+        checkpoint_subdir,
+        "--config.out-path",
+        str(_build_stage31_out_path(run_dir, checkpoint_subdir)),
+    ]
+    _append_stage31_extra_args(command, prefix="config", settings=stage31_extra)
+    if inverse_epochs is not None:
+        command += ["--config.n-epochs", str(inverse_epochs)]
+    return command
+
+
+def _build_stage32_out_dir(run_dir: Path, renderer: str, checkpoint_subdir: str) -> Path:
+    return (run_dir / f"gs_{renderer}_{checkpoint_subdir}").resolve()
+
+
+def _build_stage32_command(
+    *,
+    scene_root: Path,
+    run_name: str,
+    run_dir: Path,
+    checkpoint_subdir: str,
+    inverse_dir: Path,
+    renderer: str,
+    gs_num_iters: Optional[int],
+    gs_extra: dict[str, object],
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "train_gs",
+        "--config.root-path",
+        str(scene_root),
+        "--config.run",
+        run_name,
+        "--config.global-opt-subdir",
+        checkpoint_subdir,
+        "--config.inverse-deform-dir",
+        str(inverse_dir),
+        "--config.renderer",
+        renderer,
+        "--config.out-dir",
+        str(_build_stage32_out_dir(run_dir, renderer, checkpoint_subdir)),
+    ]
+    _append_gs_extra_args(command, prefix="config", settings=gs_extra)
+    original_images_dir = _default_original_images_dir(scene_root)
+    if original_images_dir:
+        command += ["--config.original-images-dir", original_images_dir]
+    if gs_num_iters is not None:
+        command += ["--config.num-iters", str(gs_num_iters)]
+    return command
+
+
+def _prepare_pipeline_run(
+    *,
+    source_mode: str,
+    uploaded_video: Optional[str],
+    existing_video_selection: object,
+    existing_scene_root_selection: object,
+    output_parent_selection: object,
+    custom_scene_name: str,
+) -> tuple[Optional[Path], Optional[Path], Optional[Path], Path, str]:
+    normalized = str(source_mode or "").strip().lower()
+
+    if normalized == "upload_video":
+        if not uploaded_video:
+            raise ValueError("Upload a video or choose a different source mode.")
+        input_video = _copy_uploaded_video(uploaded_video)
+        scene_root_override = _compose_scene_root_override(
+            output_parent_selection,
+            custom_scene_name,
+            default_stem=_safe_stem(input_video.name),
+        )
+        scene_root_override = _ensure_unique_scene_root(scene_root_override) if scene_root_override is not None else None
+        effective_scene_root = scene_root_override or _ensure_unique_scene_root(input_video.with_suffix(""))
+        return input_video, None, scene_root_override, effective_scene_root, f"Copied upload to `{input_video}`"
+
+    if normalized == "existing_video":
+        if not _strip_quotes(existing_video_selection):
+            raise ValueError("Choose an existing video or switch source mode.")
+        input_video = _resolve_existing_file(existing_video_selection)
+        scene_root_override = _compose_scene_root_override(
+            output_parent_selection,
+            custom_scene_name,
+            default_stem=_safe_stem(input_video.name),
+        )
+        effective_scene_root = scene_root_override or input_video.with_suffix("")
+        return input_video, None, scene_root_override, effective_scene_root, f"Using existing video `{input_video}`"
+
+    if normalized != "existing_scene":
+        raise ValueError("Choose a source mode: upload video, existing video, or existing scene root.")
+
+    if not _strip_quotes(existing_scene_root_selection):
+        raise ValueError("Choose an existing scene root or switch source mode.")
+    existing_scene_root = _resolve_existing_dir(existing_scene_root_selection)
+    return None, existing_scene_root, None, existing_scene_root, f"Using existing scene root `{existing_scene_root}`"
+
+
+def _prepare_stage0_run(
+    *,
+    source_mode: str,
+    uploaded_video: Optional[str],
+    existing_video_selection: object,
+    existing_frames_dir: object,
+    output_parent_selection: object,
+    custom_scene_name: str,
+) -> tuple[Optional[Path], Optional[Path], Optional[Path], Path, str]:
+    normalized = str(source_mode or "").strip().lower()
+
+    if normalized == "upload_video":
+        if not uploaded_video:
+            raise ValueError("Upload a video or choose a different Stage 0 source mode.")
+        input_video = _copy_uploaded_video(uploaded_video)
+        scene_root_override = _compose_scene_root_override(
+            output_parent_selection,
+            custom_scene_name,
+            default_stem=_safe_stem(input_video.name),
+        )
+        scene_root_override = _ensure_unique_scene_root(scene_root_override) if scene_root_override is not None else None
+        effective_scene_root = scene_root_override or _ensure_unique_scene_root(input_video.with_suffix(""))
+        return input_video, None, scene_root_override, effective_scene_root, f"Copied upload to `{input_video}`"
+
+    if normalized == "existing_video":
+        if not _strip_quotes(existing_video_selection):
+            raise ValueError("Choose an existing video or switch Stage 0 source mode.")
+        input_video = _resolve_existing_file(existing_video_selection)
+        scene_root_override = _compose_scene_root_override(
+            output_parent_selection,
+            custom_scene_name,
+            default_stem=_safe_stem(input_video.name),
+        )
+        effective_scene_root = scene_root_override or input_video.with_suffix("")
+        return input_video, None, scene_root_override, effective_scene_root, f"Using existing video `{input_video}`"
+
+    if normalized != "existing_frames":
+        raise ValueError("Choose a Stage 0 source mode: upload video, existing video, or existing image folder.")
+
+    if not _strip_quotes(existing_frames_dir):
+        raise ValueError("Enter an existing image-folder path or switch Stage 0 source mode.")
+    source_frames_dir = _resolve_existing_dir(existing_frames_dir)
+    frames_dir = _copy_uploaded_frames_dir(source_frames_dir)
+    scene_root_override = _compose_scene_root_override(
+        output_parent_selection,
+        custom_scene_name,
+        default_stem=_safe_stem(frames_dir.name),
+    )
+    effective_scene_root = scene_root_override or _ensure_unique_scene_root(
+        frames_dir.with_name(f"{frames_dir.name}_preprocessed")
+    )
+    return (
+        None,
+        frames_dir,
+        scene_root_override,
+        effective_scene_root,
+        f"Copied image folder `{source_frames_dir}` to `{frames_dir}`",
+    )
+
+
+def _resolve_run(scene_root: Path, run_name: str) -> tuple[str, Path]:
+    run_name_text = _strip_quotes(run_name)
+    if not run_name_text:
+        raise ValueError("Choose a Stage 1 run directory.")
+    run_dir = (scene_root / run_name_text).resolve()
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+    return run_name_text, run_dir
+
+
+def _resolve_checkpoint_subdir(run_dir: Path, checkpoint_subdir: str) -> str:
+    checkpoint_text = _strip_quotes(checkpoint_subdir)
+    if not checkpoint_text:
+        choices = _checkpoint_subdir_choices(run_dir)
+        if not choices:
+            raise ValueError("No checkpoint input directories are available for this run.")
+        return choices[0]
+    checkpoint_dir = run_dir / checkpoint_text
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint input directory not found: {checkpoint_dir}")
+    return checkpoint_text
+
+
+def _resolve_inverse_dir(run_dir: Path, inverse_dir_name: str) -> Path:
+    inverse_name_text = _strip_quotes(inverse_dir_name)
+    if not inverse_name_text:
+        inverse_dirs = _list_inverse_dirs(run_dir)
+        if not inverse_dirs:
+            raise ValueError("No inverse deformation directory is available for this run.")
+        return inverse_dirs[0]
+    inverse_dir = (run_dir / inverse_name_text).resolve()
+    if not inverse_dir.is_dir():
+        raise FileNotFoundError(f"Inverse deformation directory not found: {inverse_dir}")
+    return inverse_dir
+
+
+def _run_command_generator(
+    *,
+    command: list[str],
+    effective_scene_root: Path,
+    input_note: str,
+    stage_hint: str,
+):
+    _ensure_workspace_dirs()
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    log_path = RUNS_ROOT / f"{run_id}.log"
+    started_at = time.time()
+    state = {
+        "run_id": run_id,
+        "log_path": str(log_path),
+        "scene_root": str(effective_scene_root),
+    }
+
+    env = os.environ.copy()
+    _prepend_active_python_bin_to_path(env)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+
+        with ACTIVE_RUNS_LOCK:
+            ACTIVE_RUNS[run_id] = process
+
+        try:
+            while True:
+                artifacts = _collect_scene_artifacts(effective_scene_root) if effective_scene_root.exists() else _placeholder_artifacts(effective_scene_root)
+                log_text = _tail_text(log_path)
+                stage = _detect_current_stage(log_text, default_stage=stage_hint)
+                elapsed = time.time() - started_at
+                current_run_dir = _latest_run_dir_text(artifacts)
+                primary_video = _choose_primary_preview(artifacts)
+                secondary_video = _choose_secondary_preview(artifacts)
+                report = _format_scene_report(artifacts)
+
+                return_code = process.poll()
+                if return_code is None:
+                    status = _build_status_markdown(
+                        state="Running",
+                        stage=stage,
+                        elapsed_seconds=elapsed,
+                        scene_root=effective_scene_root,
+                        log_path=log_path,
+                        run_dir=current_run_dir,
+                        command=command,
+                        extra=input_note,
+                    )
+                    yield (
+                        state,
+                        status,
+                        stage,
+                        str(effective_scene_root),
+                        current_run_dir,
+                        report,
+                        primary_video,
+                        secondary_video,
+                        _key_files_as_strings(artifacts),
+                        log_text,
+                    )
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
+
+                succeeded = return_code == 0
+                final_state = "Finished" if succeeded else f"Exited with code {return_code}"
+                status = _build_status_markdown(
+                    state=final_state,
+                    stage="Complete" if succeeded else stage,
+                    elapsed_seconds=elapsed,
+                    scene_root=effective_scene_root,
+                    log_path=log_path,
+                    run_dir=current_run_dir,
+                    command=command,
+                    extra=input_note,
+                )
+                yield (
+                    state,
+                    status,
+                    "Complete" if succeeded else stage,
+                    str(effective_scene_root),
+                    current_run_dir,
+                    report,
+                    primary_video,
+                    secondary_video,
+                    _key_files_as_strings(artifacts),
+                    log_text,
+                )
+                break
+        finally:
+            with ACTIVE_RUNS_LOCK:
+                ACTIVE_RUNS.pop(run_id, None)
+
+
+def _emit_launch_failure(message: str):
+    empty_state: dict[str, str] = {}
+    yield empty_state, message, "Idle", "", "", "", None, None, [], ""
+
+
+def _run_pipeline_generator(*args, **kwargs):
+    (
+        pipeline_source_mode,
+        uploaded_video,
+        existing_video_selection,
+        existing_scene_root_selection,
+        output_parent_selection,
+        custom_scene_name,
+        mode,
+        renderer_choice,
+        preprocess_overwrite,
+        preprocess_max_frames,
+        preprocess_max_stride,
+        preprocess_image_ext,
+        preprocess_model_name,
+        preprocess_process_res,
+        preprocess_process_res_method,
+        preprocess_export_gs_video,
+        preprocess_export_kinect_rgbd_video,
+        preprocess_kinect_rgbd_video_fps,
+        preprocess_use_ray_pose,
+        preprocess_ref_view_strategy,
+        alignment_num_frames,
+        alignment_stride,
+        alignment_offset,
+        alignment_conf_profile,
+        alignment_conf_percentile,
+        conf_mask_sky,
+        conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent,
+        conf_mask_depth_edges,
+        conf_edge_rtol,
+        conf_edge_atol,
+        conf_edge_kernel_size,
+        conf_mask_max_depth,
+        conf_max_depth_rtol,
+        conf_max_depth_atol,
+        stage1_use_roma_matching,
+        stage1_roma_version,
+        stage1_roma_model,
+        stage1_roma_num_samples,
+        stage1_roma_certainty_threshold,
+        stage1_roma_max_references,
+        stage1_roma_reference_sampling,
+        stage1_roma_loss_weight,
+        stage1_roma_max_corr_dist,
+        stage1_knn_backend,
+        stage1_tensorboard,
+        stage1_max_corr_dist,
+        stage1_merge_voxel_size,
+        stage1_icp_n_iter,
+        stage1_icp_early_stopping_patience,
+        stage1_icp_early_stopping_min_iters,
+        stage1_icp_early_stopping_min_delta,
+        stage1_icp_lr,
+        stage1_icp_method,
+        stage1_icp_local_twist_reg,
+        stage1_icp_tv_reg,
+        stage1_icp_tv_voxel_size,
+        stage1_icp_tv_every_k,
+        stage1_icp_tv_sample_ratio,
+        stage1_icp_color_icp_weight,
+        stage1_icp_color_icp_max_color_dist,
+        stage1_icp_color_icp_k,
+        stage1_save_intermediate_every,
+        stage1_deform_log2_hashmap_size,
+        stage1_deform_num_levels,
+        stage1_deform_n_neurons,
+        stage1_deform_n_hidden_layers,
+        stage1_deform_min_res,
+        stage1_deform_max_res,
+        stage1_filter_points,
+        stage1_filter_geom_sigma,
+        stage1_filter_color_sigma,
+        stage1_filter_worst_pct,
+        stage1_filter_min_frames,
+        stage1_filter_base_percentile,
+        stage2_tensorboard,
+        stage2_knn_backend,
+        stage2_loo_loss_weight,
+        stage2_loo_k_neighbors,
+        stage2_loo_max_corr_dist,
+        stage2_loo_normal_k,
+        stage2_loo_kdtree_rebuild_every,
+        stage2_loo_max_pairs_per_iter,
+        stage2_loo_pairs_per_src,
+        stage2_deform_chunk_size,
+        stage2_anchor_loss_weight,
+        stage2_anchor_n_samples,
+        stage2_tv_reg,
+        stage2_tv_voxel_size,
+        stage2_tv_every_k,
+        stage2_tv_sample_ratio,
+        stage2_loo_color_icp_weight,
+        stage2_loo_color_icp_k,
+        stage2_loo_color_icp_max_color_dist,
+        stage2_thin_shell_weight,
+        stage2_lr,
+        stage2_n_iters,
+        stage2_save_intermediate_every_n,
+        stage31_tensorboard,
+        stage31_knn_backend,
+        inverse_epochs,
+        stage31_batch_size,
+        stage31_lr,
+        stage31_cycle_weight,
+        stage31_magnitude_weight,
+        stage31_smoothness_weight,
+        stage31_num_forward_samples,
+        stage31_num_interp_samples,
+        stage31_regenerate_every,
+        stage31_view_embed_dim,
+        stage31_min_res,
+        stage31_max_res,
+        stage31_num_levels,
+        stage31_log2_hashmap_size,
+        stage31_n_neurons,
+        stage31_n_hidden_layers,
+        stage31_save_validation_plys,
+        gs_tensorboard,
+        gs_num_iters,
+        gs_sh_degree,
+        gs_sh_increase_every,
+        gs_sh_full_from_iter,
+        gs_sh_freeze_means_when_full_sh,
+        gs_sh_reg_weight,
+        gs_target_num_points,
+        gs_optimize_cams,
+        gs_lr_cams,
+        gs_optimize_positions,
+        gs_lr_positions,
+        gs_lr_colors,
+        gs_lr_opacities,
+        gs_lr_scales,
+        gs_lr_quats,
+        gs_lr_sh0,
+        gs_lr_shn,
+        gs_deform_inverse_rotations,
+        gs_initial_opacity,
+        gs_initial_scale,
+        gs_initial_flat_ratio,
+        gs_scale_init,
+        gs_knn_neighbors,
+        gs_normal_k,
+        gs_l1_weight,
+        gs_lpips_weight,
+        gs_opacity_reg_weight,
+        gs_scale_reg_weight,
+        gs_normal_consistency_weight,
+        gs_distortion_weight,
+        gs_alpha_reg_weight,
+        gs_frames_per_iter,
+        gs_log_every,
+        gs_save_every,
+        gs_eval_every,
+        gs_lr_decay,
+        gs_auto_eval,
+        dry_run,
+    ) = args
+
+    try:
+        input_video, existing_scene_root, scene_root_override, effective_scene_root, input_note = _prepare_pipeline_run(
+            source_mode=pipeline_source_mode,
+            uploaded_video=uploaded_video,
+            existing_video_selection=existing_video_selection,
+            existing_scene_root_selection=existing_scene_root_selection,
+            output_parent_selection=output_parent_selection,
+            custom_scene_name=custom_scene_name,
+        )
+        command = _build_pipeline_command(
+            input_video=input_video,
+            existing_scene_root=existing_scene_root,
+            scene_root_override=scene_root_override,
+            mode=mode,
+            renderer_choice=renderer_choice,
+            preprocess_overwrite=preprocess_overwrite,
+            preprocess_max_frames=_coerce_int(preprocess_max_frames, label="Stage 0 Max Frames") or DEFAULT_STAGE0_MAX_FRAMES,
+            preprocess_max_stride=_coerce_int(preprocess_max_stride, label="Stage 0 Max Stride") or 8,
+            preprocess_image_ext=str(preprocess_image_ext or "png"),
+            preprocess_model_name=str(preprocess_model_name or "depth-anything/DA3NESTED-GIANT-LARGE"),
+            preprocess_process_res=_coerce_int(preprocess_process_res, label="DA3 Processing Resolution") or 768,
+            preprocess_process_res_method=str(preprocess_process_res_method or "upper_bound_resize"),
+            preprocess_export_gs_video=bool(preprocess_export_gs_video),
+            preprocess_export_kinect_rgbd_video=bool(preprocess_export_kinect_rgbd_video),
+            preprocess_kinect_rgbd_video_fps=(
+                _coerce_int(preprocess_kinect_rgbd_video_fps, label="Kinect RGBD Video FPS") or 30
+            ),
+            preprocess_use_ray_pose=bool(preprocess_use_ray_pose),
+            preprocess_ref_view_strategy=str(preprocess_ref_view_strategy or "auto"),
+            alignment_num_frames=_coerce_int(alignment_num_frames, label="Stage 0 Prep Num Frames") or 50,
+            alignment_stride=_coerce_int(alignment_stride, label="Stage 0 Prep Stride") or 1,
+            alignment_offset=_coerce_int(alignment_offset, label="Stage 0 Prep Offset") or 0,
+            alignment_conf_profile=str(alignment_conf_profile or "default_mixed"),
+            alignment_conf_percentile=_coerce_float(
+                alignment_conf_percentile,
+                label="DA3 Confidence Percentile",
+            )
+            or 80.0,
+            conf_mask_sky=bool(conf_mask_sky),
+            conf_mask_sky_depth_band=bool(conf_mask_sky_depth_band),
+            conf_sky_depth_band_percent=_coerce_float(
+                conf_sky_depth_band_percent,
+                label="Sky Depth Band Percent",
+                optional=True,
+            ),
+            conf_mask_depth_edges=bool(conf_mask_depth_edges),
+            conf_edge_rtol=_coerce_float(conf_edge_rtol, label="Depth Edge Rel Threshold", optional=True),
+            conf_edge_atol=_coerce_float(conf_edge_atol, label="Depth Edge Abs Threshold", optional=True),
+            conf_edge_kernel_size=_coerce_int(conf_edge_kernel_size, label="Depth Edge Kernel") or 3,
+            conf_mask_max_depth=bool(conf_mask_max_depth),
+            conf_max_depth_rtol=_coerce_float(
+                conf_max_depth_rtol,
+                label="Max Depth Rel Threshold",
+                optional=True,
+            ),
+            conf_max_depth_atol=_coerce_float(
+                conf_max_depth_atol,
+                label="Max Depth Abs Threshold",
+                optional=True,
+            ),
+            stage1_extra={
+                "use_roma_matching": bool(stage1_use_roma_matching),
+                "roma_version": str(stage1_roma_version or "v2"),
+                "roma_model": str(stage1_roma_model or "outdoor"),
+                "roma_num_samples": _coerce_int(stage1_roma_num_samples, label="RoMa Num Samples") or 5000,
+                "roma_certainty_threshold": _coerce_float(stage1_roma_certainty_threshold, label="RoMa Certainty Threshold") or 0.5,
+                "roma_max_references": _coerce_int(stage1_roma_max_references, label="RoMa Max References") or 20,
+                "roma_reference_sampling": str(stage1_roma_reference_sampling or "recent_and_strided"),
+                "roma_loss_weight": _coerce_float(stage1_roma_loss_weight, label="RoMa Loss Weight") or 1.0,
+                "roma_max_corr_dist": _coerce_float(stage1_roma_max_corr_dist, label="RoMa Max Corr Dist", optional=True),
+                "knn_backend": str(stage1_knn_backend or "cpu_kdtree"),
+                "tensorboard": bool(stage1_tensorboard),
+                "max_corr_dist": _coerce_float(stage1_max_corr_dist, label="Stage 1 Max Corr Dist") or 0.03,
+                "merge_voxel_size": _coerce_float(stage1_merge_voxel_size, label="Stage 1 Merge Voxel Size") or 0.001,
+                "icp_n_iter": _coerce_int(stage1_icp_n_iter, label="Stage 1 ICP Iterations") or 100,
+                "icp_early_stopping_patience": _coerce_int(stage1_icp_early_stopping_patience, label="Stage 1 Early Stop Patience", optional=True),
+                "icp_early_stopping_min_iters": _coerce_int(stage1_icp_early_stopping_min_iters, label="Stage 1 Early Stop Min Iters") or 25,
+                "icp_early_stopping_min_delta": _coerce_float(stage1_icp_early_stopping_min_delta, label="Stage 1 Early Stop Min Delta", optional=True),
+                "icp_lr": _coerce_float(stage1_icp_lr, label="Stage 1 ICP LR") or 1e-3,
+                "icp_method": str(stage1_icp_method or "point2plane"),
+                "icp_local_twist_reg": _coerce_float(stage1_icp_local_twist_reg, label="Stage 1 Local Twist Reg") or 0.0,
+                "icp_tv_reg": _coerce_float(stage1_icp_tv_reg, label="Stage 1 TV Reg") or 50.0,
+                "icp_tv_voxel_size": _coerce_float(stage1_icp_tv_voxel_size, label="Stage 1 TV Voxel Size") or 0.01,
+                "icp_tv_every_k": _coerce_int(stage1_icp_tv_every_k, label="Stage 1 TV Every K") or 1,
+                "icp_tv_sample_ratio": _coerce_float(stage1_icp_tv_sample_ratio, label="Stage 1 TV Sample Ratio", optional=True),
+                "icp_color_icp_weight": _coerce_float(stage1_icp_color_icp_weight, label="Stage 1 Color ICP Weight") or 0.02,
+                "icp_color_icp_max_color_dist": _coerce_float(stage1_icp_color_icp_max_color_dist, label="Stage 1 Color ICP Max Color Dist", optional=True),
+                "icp_color_icp_k": _coerce_int(stage1_icp_color_icp_k, label="Stage 1 Color ICP K") or 10,
+                "save_intermediate_every": _coerce_int(stage1_save_intermediate_every, label="Stage 1 Save Intermediate Every") or 10,
+                "deform_log2_hashmap_size": _coerce_int(stage1_deform_log2_hashmap_size, label="Stage 1 Deform Log2 Hashmap") or 19,
+                "deform_num_levels": _coerce_int(stage1_deform_num_levels, label="Stage 1 Deform Num Levels") or 24,
+                "deform_n_neurons": _coerce_int(stage1_deform_n_neurons, label="Stage 1 Deform Neurons") or 64,
+                "deform_n_hidden_layers": _coerce_int(stage1_deform_n_hidden_layers, label="Stage 1 Deform Hidden Layers") or 4,
+                "deform_min_res": _coerce_int(stage1_deform_min_res, label="Stage 1 Deform Min Res") or 16,
+                "deform_max_res": _coerce_int(stage1_deform_max_res, label="Stage 1 Deform Max Res") or 2048,
+                "filter_points": bool(stage1_filter_points),
+                "filter_geom_sigma": _coerce_float(stage1_filter_geom_sigma, label="Stage 1 Filter Geom Sigma") or 2.5,
+                "filter_color_sigma": _coerce_float(stage1_filter_color_sigma, label="Stage 1 Filter Color Sigma") or 1.5,
+                "filter_worst_pct": _coerce_float(stage1_filter_worst_pct, label="Stage 1 Filter Worst Pct") or 0.2,
+                "filter_min_frames": _coerce_int(stage1_filter_min_frames, label="Stage 1 Filter Min Frames") or 2,
+                "filter_base_percentile": str(stage1_filter_base_percentile or "p75"),
+            },
+            stage2_extra={
+                "tensorboard": bool(stage2_tensorboard),
+                "knn_backend": str(stage2_knn_backend or "cpu_kdtree"),
+                "loo_loss_weight": _coerce_float(stage2_loo_loss_weight, label="Stage 2 LOO Loss Weight") or 1.0,
+                "loo_k_neighbors": _coerce_int(stage2_loo_k_neighbors, label="Stage 2 LOO K Neighbors") or 5,
+                "loo_max_corr_dist": _coerce_float(stage2_loo_max_corr_dist, label="Stage 2 LOO Max Corr Dist") or 0.03125,
+                "loo_normal_k": _coerce_int(stage2_loo_normal_k, label="Stage 2 LOO Normal K") or 20,
+                "loo_kdtree_rebuild_every": _coerce_int(stage2_loo_kdtree_rebuild_every, label="Stage 2 KDT Rebuild Every") or 50,
+                "loo_max_pairs_per_iter": _coerce_int(stage2_loo_max_pairs_per_iter, label="Stage 2 Max Pairs Per Iter", optional=True),
+                "loo_pairs_per_src": _coerce_int(stage2_loo_pairs_per_src, label="Stage 2 Pairs Per Src") or 1,
+                "deform_chunk_size": _coerce_int(stage2_deform_chunk_size, label="Stage 2 Deform Chunk Size") or 50000,
+                "anchor_loss_weight": _coerce_float(stage2_anchor_loss_weight, label="Stage 2 Anchor Loss Weight") or 1000.0,
+                "anchor_n_samples": _coerce_int(stage2_anchor_n_samples, label="Stage 2 Anchor Samples") or 4096,
+                "tv_reg": _coerce_float(stage2_tv_reg, label="Stage 2 TV Reg") or 50.0,
+                "tv_voxel_size": _coerce_float(stage2_tv_voxel_size, label="Stage 2 TV Voxel Size") or 0.01,
+                "tv_every_k": _coerce_int(stage2_tv_every_k, label="Stage 2 TV Every K") or 1,
+                "tv_sample_ratio": _coerce_float(stage2_tv_sample_ratio, label="Stage 2 TV Sample Ratio", optional=True),
+                "loo_color_icp_weight": _coerce_float(stage2_loo_color_icp_weight, label="Stage 2 Color ICP Weight") or 0.02,
+                "loo_color_icp_k": _coerce_int(stage2_loo_color_icp_k, label="Stage 2 Color ICP K") or 10,
+                "loo_color_icp_max_color_dist": _coerce_float(stage2_loo_color_icp_max_color_dist, label="Stage 2 Color ICP Max Color Dist", optional=True),
+                "thin_shell_weight": _coerce_float(stage2_thin_shell_weight, label="Stage 2 Thin Shell Weight") or 1000.0,
+                "lr": _coerce_float(stage2_lr, label="Stage 2 LR") or 1e-3,
+                "n_iters": _coerce_int(stage2_n_iters, label="Stage 2 Iterations") or 150,
+                "save_intermediate_every_n": _coerce_int(stage2_save_intermediate_every_n, label="Stage 2 Save Intermediate Every") or 50,
+            },
+            stage31_extra={
+                "tensorboard": bool(stage31_tensorboard),
+                "knn_backend": str(stage31_knn_backend or "cpu_kdtree"),
+                "batch_size": _coerce_int(stage31_batch_size, label="Stage 3.1 Batch Size") or 8192,
+                "lr": _coerce_float(stage31_lr, label="Stage 3.1 LR") or 1e-3,
+                "cycle_weight": _coerce_float(stage31_cycle_weight, label="Stage 3.1 Cycle Weight") or 0.1,
+                "magnitude_weight": _coerce_float(stage31_magnitude_weight, label="Stage 3.1 Magnitude Weight") or 1e-3,
+                "smoothness_weight": _coerce_float(stage31_smoothness_weight, label="Stage 3.1 Smoothness Weight") or 1e-3,
+                "num_forward_samples": _coerce_int(stage31_num_forward_samples, label="Stage 3.1 Forward Samples") or 10000,
+                "num_interp_samples": _coerce_int(stage31_num_interp_samples, label="Stage 3.1 Interp Samples") or 5000,
+                "regenerate_every": _coerce_int(stage31_regenerate_every, label="Stage 3.1 Regenerate Every") or 10,
+                "view_embed_dim": _coerce_int(stage31_view_embed_dim, label="Stage 3.1 View Embed Dim") or 32,
+                "min_res": _coerce_int(stage31_min_res, label="Stage 3.1 Min Res") or 16,
+                "max_res": _coerce_int(stage31_max_res, label="Stage 3.1 Max Res") or 2048,
+                "num_levels": _coerce_int(stage31_num_levels, label="Stage 3.1 Num Levels") or 16,
+                "log2_hashmap_size": _coerce_int(stage31_log2_hashmap_size, label="Stage 3.1 Log2 Hashmap") or 19,
+                "n_neurons": _coerce_int(stage31_n_neurons, label="Stage 3.1 Neurons") or 64,
+                "n_hidden_layers": _coerce_int(stage31_n_hidden_layers, label="Stage 3.1 Hidden Layers") or 3,
+                "save_validation_plys": bool(stage31_save_validation_plys),
+            },
+            gs_extra={
+                "tensorboard": bool(gs_tensorboard),
+                "sh_degree": _coerce_int(gs_sh_degree, label="GS SH Degree") or 3,
+                "sh_increase_every": _coerce_int(gs_sh_increase_every, label="GS SH Increase Every") or 0,
+                "sh_full_from_iter": _coerce_int(gs_sh_full_from_iter, label="GS SH Full From Iter") or 5000,
+                "sh_freeze_means_when_full_sh": bool(gs_sh_freeze_means_when_full_sh),
+                "sh_reg_weight": _coerce_float(gs_sh_reg_weight, label="GS SH Reg Weight") or 10.0,
+                "target_num_points": _coerce_int(gs_target_num_points, label="GS Target Num Points") or 4000000,
+                "optimize_cams": bool(gs_optimize_cams),
+                "lr_cams": _coerce_float(gs_lr_cams, label="GS LR Cams") or 1e-4,
+                "optimize_positions": bool(gs_optimize_positions),
+                "lr_positions": _coerce_float(gs_lr_positions, label="GS LR Positions") or 1e-5,
+                "lr_colors": _coerce_float(gs_lr_colors, label="GS LR Colors") or 2.5e-3,
+                "lr_opacities": _coerce_float(gs_lr_opacities, label="GS LR Opacities") or 5e-2,
+                "lr_scales": _coerce_float(gs_lr_scales, label="GS LR Scales") or 5e-3,
+                "lr_quats": _coerce_float(gs_lr_quats, label="GS LR Quats") or 1e-3,
+                "lr_sh0": _coerce_float(gs_lr_sh0, label="GS LR SH0") or 2.5e-3,
+                "lr_shn": _coerce_float(gs_lr_shn, label="GS LR SHN") or (2.5e-3 / 20.0),
+                "deform_inverse_rotations": bool(gs_deform_inverse_rotations),
+                "initial_opacity": _coerce_float(gs_initial_opacity, label="GS Initial Opacity") or 0.5,
+                "initial_scale": _coerce_float(gs_initial_scale, label="GS Initial Scale") or 0.005,
+                "initial_flat_ratio": _coerce_float(gs_initial_flat_ratio, label="GS Initial Flat Ratio") or 0.1,
+                "scale_init": str(gs_scale_init or "knn"),
+                "knn_neighbors": _coerce_int(gs_knn_neighbors, label="GS KNN Neighbors") or 4,
+                "normal_k": _coerce_int(gs_normal_k, label="GS Normal K") or 20,
+                "l1_weight": _coerce_float(gs_l1_weight, label="GS L1 Weight") or 0.8,
+                "lpips_weight": _coerce_float(gs_lpips_weight, label="GS LPIPS Weight") or 0.2,
+                "opacity_reg_weight": _coerce_float(gs_opacity_reg_weight, label="GS Opacity Reg Weight") or 0.0,
+                "scale_reg_weight": _coerce_float(gs_scale_reg_weight, label="GS Scale Reg Weight") or 0.0,
+                "normal_consistency_weight": _coerce_float(gs_normal_consistency_weight, label="GS Normal Consistency Weight") or 0.05,
+                "distortion_weight": _coerce_float(gs_distortion_weight, label="GS Distortion Weight") or 0.01,
+                "alpha_reg_weight": _coerce_float(gs_alpha_reg_weight, label="GS Alpha Reg Weight") or 0.0,
+                "frames_per_iter": _coerce_int(gs_frames_per_iter, label="GS Frames Per Iter") or 1,
+                "log_every": _coerce_int(gs_log_every, label="GS Log Every") or 50,
+                "save_every": _coerce_int(gs_save_every, label="GS Save Every") or 5000,
+                "eval_every": _coerce_int(gs_eval_every, label="GS Eval Every") or 1000,
+                "lr_decay": _coerce_float(gs_lr_decay, label="GS LR Decay") or 0.1,
+                "auto_eval": bool(gs_auto_eval),
+            },
+            inverse_epochs=_coerce_int(inverse_epochs, label="Stage 3.1 Epoch Override", optional=True),
+            gs_num_iters=_coerce_int(gs_num_iters, label="Stage 3.2 Iter Override", optional=True),
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        yield from _emit_launch_failure(f"**State**: Failed before launch\n\n`{exc}`")
+        return
+
+    yield from _run_command_generator(
+        command=command,
+        effective_scene_root=effective_scene_root,
+        input_note=input_note,
+        stage_hint="Starting",
+    )
+
+
+def _export_depth_volume(
+    scene_root_selection,
+    run_name,
+    ply_dedup_enable,
+    ply_dedup_radius,
+    ply_normals_k,
+    ply_chunk_size,
+    depth_volume_resolution_scale,
+):
+    """Export the reconstructed scene as a DepthImageVolume for Unreal Engine."""
+    import traceback as _tb
+
+    if not scene_root_selection:
+        return "**Error:** No scene selected. Select a scene root first."
+
+    scene_root = scene_root_selection
+    if not run_name:
+        return "**Error:** No run name specified."
+
+    resolution_scale = _coerce_int(depth_volume_resolution_scale, label="Depth Volume Resolution Scale") or 1
+    if resolution_scale < 1:
+        return "**Error:** Depth Volume Resolution Scale must be at least 1."
+
+    output_name = "depth_image_volume_export"
+    if resolution_scale != 1:
+        output_name = f"{output_name}_x{resolution_scale}"
+    output_dir = os.path.join(scene_root, run_name, output_name)
+
+    try:
+        from export_depth_image_volume import export_depth_image_volume
+        result_path = export_depth_image_volume(
+            scene_root=scene_root,
+            run=run_name,
+            output_dir=output_dir,
+            device="cuda",
+            dedup_enable=bool(ply_dedup_enable),
+            dedup_radius=float(ply_dedup_radius or 0.001),
+            normals_k=int(ply_normals_k or 16),
+            normals_chunk_size=int(ply_chunk_size or 50000),
+            resolution_scale=resolution_scale,
+        )
+        return f"**Export complete!** Output at:\n\n`{result_path}`\n\nContains `cameras.json` + depth/color/normal images ready for Unreal Engine import."
+    except Exception as exc:
+        tb = _tb.format_exc()
+        return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
+
+
+def _export_packed_frame_sequence(
+    scene_root_selection,
+    packed_sequence_fps,
+):
+    import traceback as _tb
+
+    if not scene_root_selection:
+        return "**Error:** No scene selected. Select a scene root first."
+
+    try:
+        from export_stage0_kinect_video import export_stage0_kinect_image_sequence
+
+        fps = _coerce_int(packed_sequence_fps, label="Packed Sequence FPS") or 30
+        output_dir = export_stage0_kinect_image_sequence(
+            scene_root=scene_root_selection,
+            fps=int(fps),
+        )
+        frames_dir = os.path.join(output_dir, "frames")
+        sequence_info_path = os.path.join(output_dir, "sequence_info.json")
+        return (
+            f"**Packed frame sequence exported!**\n\n"
+            f"- Root: `{output_dir}`\n"
+            f"- Frames: `{frames_dir}`\n"
+            f"- Sequence info: `{sequence_info_path}`\n\n"
+            "Point `ADepthImageVolumeImageSequenceActor` at the sequence root or `frames/` directory."
+        )
+    except Exception as exc:
+        tb = _tb.format_exc()
+        return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
+
+
+def _export_packed_frame_sequence_depth8(
+    scene_root_selection,
+    packed_sequence_fps,
+):
+    import traceback as _tb
+
+    if not scene_root_selection:
+        return "**Error:** No scene selected. Select a scene root first."
+
+    try:
+        from export_stage0_kinect_video import export_stage0_kinect_image_sequence_depth8
+
+        fps = _coerce_int(packed_sequence_fps, label="Packed Sequence FPS") or 30
+        output_dir = export_stage0_kinect_image_sequence_depth8(
+            scene_root=scene_root_selection,
+            fps=int(fps),
+        )
+        frames_dir = os.path.join(output_dir, "frames")
+        sequence_info_path = os.path.join(output_dir, "sequence_info.json")
+        return (
+            f"**Packed 8-bit depth frame sequence exported!**\n\n"
+            f"- Root: `{output_dir}`\n"
+            f"- Frames: `{frames_dir}`\n"
+            f"- Sequence info: `{sequence_info_path}`\n\n"
+            "Point `ADepthImageVolumeImageSequenceActor` at the sequence root or `frames/` directory."
+        )
+    except Exception as exc:
+        tb = _tb.format_exc()
+        return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
+
+
+def _export_directstorage_stream(
+    scene_root_selection,
+    stream_fps,
+):
+    import traceback as _tb
+
+    if not scene_root_selection:
+        return "**Error:** No scene selected. Select a scene root first."
+
+    try:
+        from export_depth_image_stream_bc7 import export_depth_image_stream_bc7
+
+        fps = _coerce_int(stream_fps, label="DirectStorage Stream FPS") or 30
+        output_path = export_depth_image_stream_bc7(
+            scene_root=scene_root_selection,
+            fps=int(fps),
+            overwrite=True,
+        )
+        return (
+            f"**DirectStorage stream exported!**\n\n"
+            f"- Stream: `{output_path}`\n\n"
+            "Point `ADepthImageVolumeDirectStorageActor` at this `.divstream` file."
+        )
+    except Exception as exc:
+        tb = _tb.format_exc()
+        return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
+
+
+def _export_ply_with_normals(
+    scene_root_selection,
+    run_name,
+    ply_checkpoint_source,
+    ply_filename,
+    ply_dedup_enable,
+    ply_dedup_radius,
+    ply_normals_k,
+    ply_chunk_size,
+):
+    """Export the aligned point cloud as a PLY with voxel dedup and PCA normals."""
+    import traceback as _tb
+
+    if not scene_root_selection:
+        return "**Error:** No scene selected."
+    if not run_name:
+        return "**Error:** No run name specified."
+
+    run_dir = os.path.join(scene_root_selection, run_name)
+    if not os.path.isdir(run_dir):
+        return f"**Error:** Run directory not found: `{run_dir}`"
+
+    # Resolve source PLY
+    source_subdir = str(ply_checkpoint_source or "auto")
+    if source_subdir == "auto":
+        for candidate in ("after_global_optimization", "after_non_rigid_icp"):
+            ply_path = os.path.join(run_dir, candidate, "aligned_points.ply")
+            if os.path.isfile(ply_path):
+                source_subdir = candidate
+                break
+        else:
+            return "**Error:** No `aligned_points.ply` found in `after_global_optimization/` or `after_non_rigid_icp/`."
+    ply_path = os.path.join(run_dir, source_subdir, "aligned_points.ply")
+    if not os.path.isfile(ply_path):
+        return f"**Error:** `{ply_path}` not found."
+
+    try:
+        import numpy as np
+        import open3d as o3d
+        from scipy.spatial import cKDTree
+
+        pcd = o3d.io.read_point_cloud(ply_path)
+        P = np.asarray(pcd.points, dtype=np.float32)
+        has_colors = pcd.has_colors()
+        RGB = (np.asarray(pcd.colors) * 255).astype(np.uint8) if has_colors else np.zeros((len(P), 3), dtype=np.uint8)
+
+        if P.shape[0] == 0:
+            return "**Error:** Source PLY has no points."
+
+        # Filter non-finite
+        finite_mask = np.isfinite(P).all(axis=1)
+        P = P[finite_mask]
+        RGB = RGB[finite_mask]
+
+        # Voxel dedup
+        dedup_radius = float(ply_dedup_radius or 0.001)
+        if ply_dedup_enable and dedup_radius > 0:
+            keys = np.floor(P / dedup_radius).astype(np.int64)
+            keys_view = keys.view([("x", np.int64), ("y", np.int64), ("z", np.int64)])
+            _, uniq_idx = np.unique(keys_view, return_index=True)
+            P = P[uniq_idx]
+            RGB = RGB[uniq_idx]
+
+        M = P.shape[0]
+        if M == 0:
+            return "**Error:** No points remain after deduplication."
+
+        # Normal estimation via PCA
+        K = max(3, int(ply_normals_k or 16))
+        chunk = max(10000, int(ply_chunk_size or 50000))
+        tree = cKDTree(P)
+        normals = np.zeros_like(P, dtype=np.float32)
+
+        # Use centroid as fallback view direction (no per-point camera info)
+        centroid = P.mean(axis=0)
+
+        for s in range(0, M, chunk):
+            e = min(M, s + chunk)
+            _, idx = tree.query(P[s:e], k=K + 1)
+            idx = idx[:, 1:]  # drop self
+            nbrs = P[idx]
+            cent = nbrs.mean(axis=1, keepdims=True)
+            X = nbrs - cent
+            cov = np.einsum("mki,mkj->mij", X, X) / max(1, K - 1)
+            w, v = np.linalg.eigh(cov)
+            n = v[:, :, 0]  # smallest eigenvector
+            # Orient normals toward centroid (outward-facing)
+            view_dir = P[s:e] - centroid
+            sign = np.sign(np.sum(n * view_dir, axis=1, keepdims=True) + 1e-12)
+            n = n * sign
+            normals[s:e] = n.astype(np.float32)
+
+        # Write PLY
+        filename = str(ply_filename or "export_cloud.ply").strip()
+        if not filename.endswith(".ply"):
+            filename += ".ply"
+        out_path = os.path.join(run_dir, source_subdir, filename)
+
+        with open(out_path, "w") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {M}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property float nx\n")
+            f.write("property float ny\n")
+            f.write("property float nz\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for i in range(M):
+                x, y, z = P[i]
+                nx, ny, nz = normals[i]
+                r, g, b = RGB[i]
+                f.write(f"{x:.6f} {y:.6f} {z:.6f} {nx:.6f} {ny:.6f} {nz:.6f} {int(r)} {int(g)} {int(b)}\n")
+
+        return f"**PLY exported!** `{out_path}`\n\n- Source: `{source_subdir}/aligned_points.ply`\n- Points: **{M:,}** (dedup={ply_dedup_enable}, radius={dedup_radius})\n- Normals: k={K}"
+
+    except Exception as exc:
+        tb = _tb.format_exc()
+        return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
+
+
+def _run_stage_generator(*args, **kwargs):
+    (
+        stage_key,
+        stage0_source_mode,
+        stage0_uploaded_video,
+        stage0_existing_video_selection,
+        stage0_existing_frames_dir,
+        stage0_output_parent_selection,
+        stage0_custom_scene_name,
+        stage0_overwrite,
+        stage0_max_frames,
+        stage0_max_stride,
+        stage0_image_ext,
+        stage0_model_name,
+        stage0_process_res,
+        stage0_process_res_method,
+        stage0_export_gs_video,
+        stage0_export_kinect_rgbd_video,
+        stage0_kinect_rgbd_video_fps,
+        stage0_use_ray_pose,
+        stage0_ref_view_strategy,
+        stage_scene_root_selection,
+        stage_run_name,
+        stage1_num_frames,
+        stage1_stride,
+        stage1_offset,
+        stage1_conf_profile,
+        stage1_conf_percentile,
+        stage1_conf_mask_sky,
+        stage1_conf_mask_sky_depth_band,
+        stage1_conf_sky_depth_band_percent,
+        stage1_conf_mask_depth_edges,
+        stage1_conf_edge_rtol,
+        stage1_conf_edge_atol,
+        stage1_conf_edge_kernel_size,
+        stage1_conf_mask_max_depth,
+        stage1_conf_max_depth_rtol,
+        stage1_conf_max_depth_atol,
+        stage1_use_roma_matching,
+        stage1_roma_version,
+        stage1_roma_model,
+        stage1_roma_num_samples,
+        stage1_roma_certainty_threshold,
+        stage1_roma_max_references,
+        stage1_roma_reference_sampling,
+        stage1_roma_loss_weight,
+        stage1_roma_max_corr_dist,
+        stage1_knn_backend,
+        stage1_tensorboard,
+        stage1_max_corr_dist,
+        stage1_merge_voxel_size,
+        stage1_icp_n_iter,
+        stage1_icp_early_stopping_patience,
+        stage1_icp_early_stopping_min_iters,
+        stage1_icp_early_stopping_min_delta,
+        stage1_icp_lr,
+        stage1_icp_method,
+        stage1_icp_local_twist_reg,
+        stage1_icp_tv_reg,
+        stage1_icp_tv_voxel_size,
+        stage1_icp_tv_every_k,
+        stage1_icp_tv_sample_ratio,
+        stage1_icp_color_icp_weight,
+        stage1_icp_color_icp_max_color_dist,
+        stage1_icp_color_icp_k,
+        stage1_save_intermediate_every,
+        stage1_deform_log2_hashmap_size,
+        stage1_deform_num_levels,
+        stage1_deform_n_neurons,
+        stage1_deform_n_hidden_layers,
+        stage1_deform_min_res,
+        stage1_deform_max_res,
+        stage1_filter_points,
+        stage1_filter_geom_sigma,
+        stage1_filter_color_sigma,
+        stage1_filter_worst_pct,
+        stage1_filter_min_frames,
+        stage1_filter_base_percentile,
+        stage2_tensorboard,
+        stage2_knn_backend,
+        stage2_loo_loss_weight,
+        stage2_loo_k_neighbors,
+        stage2_loo_max_corr_dist,
+        stage2_loo_normal_k,
+        stage2_loo_kdtree_rebuild_every,
+        stage2_loo_max_pairs_per_iter,
+        stage2_loo_pairs_per_src,
+        stage2_deform_chunk_size,
+        stage2_anchor_loss_weight,
+        stage2_anchor_n_samples,
+        stage2_tv_reg,
+        stage2_tv_voxel_size,
+        stage2_tv_every_k,
+        stage2_tv_sample_ratio,
+        stage2_loo_color_icp_weight,
+        stage2_loo_color_icp_k,
+        stage2_loo_color_icp_max_color_dist,
+        stage2_thin_shell_weight,
+        stage2_lr,
+        stage2_n_iters,
+        stage2_save_intermediate_every_n,
+        stage31_checkpoint_subdir,
+        stage31_epochs,
+        stage31_tensorboard,
+        stage31_knn_backend,
+        stage31_batch_size,
+        stage31_lr,
+        stage31_cycle_weight,
+        stage31_magnitude_weight,
+        stage31_smoothness_weight,
+        stage31_num_forward_samples,
+        stage31_num_interp_samples,
+        stage31_regenerate_every,
+        stage31_view_embed_dim,
+        stage31_min_res,
+        stage31_max_res,
+        stage31_num_levels,
+        stage31_log2_hashmap_size,
+        stage31_n_neurons,
+        stage31_n_hidden_layers,
+        stage31_save_validation_plys,
+        stage32_checkpoint_subdir,
+        stage32_inverse_dir_name,
+        stage32_renderer,
+        stage32_num_iters,
+        gs_tensorboard,
+        gs_sh_degree,
+        gs_sh_increase_every,
+        gs_sh_full_from_iter,
+        gs_sh_freeze_means_when_full_sh,
+        gs_sh_reg_weight,
+        gs_target_num_points,
+        gs_optimize_cams,
+        gs_lr_cams,
+        gs_optimize_positions,
+        gs_lr_positions,
+        gs_lr_colors,
+        gs_lr_opacities,
+        gs_lr_scales,
+        gs_lr_quats,
+        gs_lr_sh0,
+        gs_lr_shn,
+        gs_deform_inverse_rotations,
+        gs_initial_opacity,
+        gs_initial_scale,
+        gs_initial_flat_ratio,
+        gs_scale_init,
+        gs_knn_neighbors,
+        gs_normal_k,
+        gs_l1_weight,
+        gs_lpips_weight,
+        gs_opacity_reg_weight,
+        gs_scale_reg_weight,
+        gs_normal_consistency_weight,
+        gs_distortion_weight,
+        gs_alpha_reg_weight,
+        gs_frames_per_iter,
+        gs_log_every,
+        gs_save_every,
+        gs_eval_every,
+        gs_lr_decay,
+        gs_auto_eval,
+    ) = args
+
+    try:
+        if stage_key == "stage0":
+            input_video, frames_dir, scene_root_override, effective_scene_root, input_note = _prepare_stage0_run(
+                source_mode=stage0_source_mode,
+                uploaded_video=stage0_uploaded_video,
+                existing_video_selection=stage0_existing_video_selection,
+                existing_frames_dir=stage0_existing_frames_dir,
+                output_parent_selection=stage0_output_parent_selection,
+                custom_scene_name=stage0_custom_scene_name,
+            )
+            command = _build_stage0_command(
+                input_video=input_video,
+                frames_dir=frames_dir,
+                scene_root_override=scene_root_override,
+                preprocess_overwrite=stage0_overwrite,
+                preprocess_max_frames=_coerce_int(stage0_max_frames, label="Stage 0 Max Frames") or DEFAULT_STAGE0_MAX_FRAMES,
+                preprocess_max_stride=_coerce_int(stage0_max_stride, label="Stage 0 Max Stride") or 8,
+                preprocess_image_ext=str(stage0_image_ext or "png"),
+                preprocess_model_name=str(stage0_model_name or "depth-anything/DA3NESTED-GIANT-LARGE"),
+                preprocess_process_res=_coerce_int(stage0_process_res, label="DA3 Processing Resolution") or 768,
+                preprocess_process_res_method=str(stage0_process_res_method or "upper_bound_resize"),
+                preprocess_export_gs_video=bool(stage0_export_gs_video),
+                preprocess_export_kinect_rgbd_video=bool(stage0_export_kinect_rgbd_video),
+                preprocess_kinect_rgbd_video_fps=(
+                    _coerce_int(stage0_kinect_rgbd_video_fps, label="Kinect RGBD Video FPS") or 30
+                ),
+                preprocess_use_ray_pose=bool(stage0_use_ray_pose),
+                preprocess_ref_view_strategy=str(stage0_ref_view_strategy or "auto"),
+                alignment_num_frames=_coerce_int(stage1_num_frames, label="Stage 0 Prep Num Frames") or 50,
+                alignment_stride=_coerce_int(stage1_stride, label="Stage 0 Prep Stride") or 1,
+                alignment_offset=_coerce_int(stage1_offset, label="Stage 0 Prep Offset") or 0,
+                conf_profile=str(stage1_conf_profile or "default_mixed"),
+                conf_percentile=_coerce_float(stage1_conf_percentile, label="DA3 Confidence Percentile") or 80.0,
+                conf_mask_sky=bool(stage1_conf_mask_sky),
+                conf_mask_sky_depth_band=bool(stage1_conf_mask_sky_depth_band),
+                conf_sky_depth_band_percent=_coerce_float(
+                    stage1_conf_sky_depth_band_percent,
+                    label="Sky Depth Band Percent",
+                    optional=True,
+                ),
+                conf_mask_depth_edges=bool(stage1_conf_mask_depth_edges),
+                conf_edge_rtol=_coerce_float(
+                    stage1_conf_edge_rtol,
+                    label="Depth Edge Relative Threshold",
+                    optional=True,
+                ),
+                conf_edge_atol=_coerce_float(
+                    stage1_conf_edge_atol,
+                    label="Depth Edge Absolute Threshold",
+                    optional=True,
+                ),
+                conf_edge_kernel_size=_coerce_int(stage1_conf_edge_kernel_size, label="Depth Edge Kernel") or 3,
+                conf_mask_max_depth=bool(stage1_conf_mask_max_depth),
+                conf_max_depth_rtol=_coerce_float(
+                    stage1_conf_max_depth_rtol,
+                    label="Max Depth Relative Threshold",
+                    optional=True,
+                ),
+                conf_max_depth_atol=_coerce_float(
+                    stage1_conf_max_depth_atol,
+                    label="Max Depth Absolute Threshold",
+                    optional=True,
+                ),
+            )
+            stage_hint = "Stage 0"
+        else:
+            scene_root = _resolve_existing_dir(stage_scene_root_selection)
+            effective_scene_root = scene_root
+            input_note = f"Using existing scene root `{scene_root}`"
+
+            if stage_key == "stage1":
+                run_name, run_dir = _resolve_run(scene_root, stage_run_name)
+                input_note = f"Using existing scene root `{scene_root}` and prepared run `{run_name}`"
+                command = _build_stage1_command(
+                    scene_root=scene_root,
+                    run_dir=run_dir,
+                    stage1_extra={
+                        "use_roma_matching": bool(stage1_use_roma_matching),
+                        "roma_version": str(stage1_roma_version or "v2"),
+                        "roma_model": str(stage1_roma_model or "outdoor"),
+                        "roma_num_samples": _coerce_int(stage1_roma_num_samples, label="RoMa Num Samples") or 5000,
+                        "roma_certainty_threshold": _coerce_float(stage1_roma_certainty_threshold, label="RoMa Certainty Threshold") or 0.5,
+                        "roma_max_references": _coerce_int(stage1_roma_max_references, label="RoMa Max References") or 20,
+                        "roma_reference_sampling": str(stage1_roma_reference_sampling or "recent_and_strided"),
+                        "roma_loss_weight": _coerce_float(stage1_roma_loss_weight, label="RoMa Loss Weight") or 1.0,
+                        "roma_max_corr_dist": _coerce_float(stage1_roma_max_corr_dist, label="RoMa Max Corr Dist", optional=True),
+                        "knn_backend": str(stage1_knn_backend or "cpu_kdtree"),
+                        "tensorboard": bool(stage1_tensorboard),
+                        "max_corr_dist": _coerce_float(stage1_max_corr_dist, label="Stage 1 Max Corr Dist") or 0.03,
+                        "merge_voxel_size": _coerce_float(stage1_merge_voxel_size, label="Stage 1 Merge Voxel Size") or 0.001,
+                        "icp_n_iter": _coerce_int(stage1_icp_n_iter, label="Stage 1 ICP Iterations") or 100,
+                        "icp_early_stopping_patience": _coerce_int(stage1_icp_early_stopping_patience, label="Stage 1 Early Stop Patience", optional=True),
+                        "icp_early_stopping_min_iters": _coerce_int(stage1_icp_early_stopping_min_iters, label="Stage 1 Early Stop Min Iters") or 25,
+                        "icp_early_stopping_min_delta": _coerce_float(stage1_icp_early_stopping_min_delta, label="Stage 1 Early Stop Min Delta", optional=True),
+                        "icp_lr": _coerce_float(stage1_icp_lr, label="Stage 1 ICP LR") or 1e-3,
+                        "icp_method": str(stage1_icp_method or "point2plane"),
+                        "icp_local_twist_reg": _coerce_float(stage1_icp_local_twist_reg, label="Stage 1 Local Twist Reg") or 0.0,
+                        "icp_tv_reg": _coerce_float(stage1_icp_tv_reg, label="Stage 1 TV Reg") or 50.0,
+                        "icp_tv_voxel_size": _coerce_float(stage1_icp_tv_voxel_size, label="Stage 1 TV Voxel Size") or 0.01,
+                        "icp_tv_every_k": _coerce_int(stage1_icp_tv_every_k, label="Stage 1 TV Every K") or 1,
+                        "icp_tv_sample_ratio": _coerce_float(stage1_icp_tv_sample_ratio, label="Stage 1 TV Sample Ratio", optional=True),
+                        "icp_color_icp_weight": _coerce_float(stage1_icp_color_icp_weight, label="Stage 1 Color ICP Weight") or 0.02,
+                        "icp_color_icp_max_color_dist": _coerce_float(stage1_icp_color_icp_max_color_dist, label="Stage 1 Color ICP Max Color Dist", optional=True),
+                        "icp_color_icp_k": _coerce_int(stage1_icp_color_icp_k, label="Stage 1 Color ICP K") or 10,
+                        "save_intermediate_every": _coerce_int(stage1_save_intermediate_every, label="Stage 1 Save Intermediate Every") or 10,
+                        "deform_log2_hashmap_size": _coerce_int(stage1_deform_log2_hashmap_size, label="Stage 1 Deform Log2 Hashmap") or 19,
+                        "deform_num_levels": _coerce_int(stage1_deform_num_levels, label="Stage 1 Deform Num Levels") or 24,
+                        "deform_n_neurons": _coerce_int(stage1_deform_n_neurons, label="Stage 1 Deform Neurons") or 64,
+                        "deform_n_hidden_layers": _coerce_int(stage1_deform_n_hidden_layers, label="Stage 1 Deform Hidden Layers") or 4,
+                        "deform_min_res": _coerce_int(stage1_deform_min_res, label="Stage 1 Deform Min Res") or 16,
+                        "deform_max_res": _coerce_int(stage1_deform_max_res, label="Stage 1 Deform Max Res") or 2048,
+                        "filter_points": bool(stage1_filter_points),
+                        "filter_geom_sigma": _coerce_float(stage1_filter_geom_sigma, label="Stage 1 Filter Geom Sigma") or 2.5,
+                        "filter_color_sigma": _coerce_float(stage1_filter_color_sigma, label="Stage 1 Filter Color Sigma") or 1.5,
+                        "filter_worst_pct": _coerce_float(stage1_filter_worst_pct, label="Stage 1 Filter Worst Pct") or 0.2,
+                        "filter_min_frames": _coerce_int(stage1_filter_min_frames, label="Stage 1 Filter Min Frames") or 2,
+                        "filter_base_percentile": str(stage1_filter_base_percentile or "p75"),
+                    },
+                )
+                stage_hint = "Stage 1"
+            else:
+                run_name, run_dir = _resolve_run(scene_root, stage_run_name)
+                input_note = f"Using existing scene root `{scene_root}` and run `{run_name}`"
+
+                if stage_key == "stage2":
+                    command = _build_stage2_command(
+                        scene_root=scene_root,
+                        run_name=run_name,
+                        stage2_extra={
+                            "tensorboard": bool(stage2_tensorboard),
+                            "knn_backend": str(stage2_knn_backend or "cpu_kdtree"),
+                            "loo_loss_weight": _coerce_float(stage2_loo_loss_weight, label="Stage 2 LOO Loss Weight") or 1.0,
+                            "loo_k_neighbors": _coerce_int(stage2_loo_k_neighbors, label="Stage 2 LOO K Neighbors") or 5,
+                            "loo_max_corr_dist": _coerce_float(stage2_loo_max_corr_dist, label="Stage 2 LOO Max Corr Dist") or 0.03125,
+                            "loo_normal_k": _coerce_int(stage2_loo_normal_k, label="Stage 2 LOO Normal K") or 20,
+                            "loo_kdtree_rebuild_every": _coerce_int(stage2_loo_kdtree_rebuild_every, label="Stage 2 KDT Rebuild Every") or 50,
+                            "loo_max_pairs_per_iter": _coerce_int(stage2_loo_max_pairs_per_iter, label="Stage 2 Max Pairs Per Iter", optional=True),
+                            "loo_pairs_per_src": _coerce_int(stage2_loo_pairs_per_src, label="Stage 2 Pairs Per Src") or 1,
+                            "deform_chunk_size": _coerce_int(stage2_deform_chunk_size, label="Stage 2 Deform Chunk Size") or 50000,
+                            "anchor_loss_weight": _coerce_float(stage2_anchor_loss_weight, label="Stage 2 Anchor Loss Weight") or 1000.0,
+                            "anchor_n_samples": _coerce_int(stage2_anchor_n_samples, label="Stage 2 Anchor Samples") or 4096,
+                            "tv_reg": _coerce_float(stage2_tv_reg, label="Stage 2 TV Reg") or 50.0,
+                            "tv_voxel_size": _coerce_float(stage2_tv_voxel_size, label="Stage 2 TV Voxel Size") or 0.01,
+                            "tv_every_k": _coerce_int(stage2_tv_every_k, label="Stage 2 TV Every K") or 1,
+                            "tv_sample_ratio": _coerce_float(stage2_tv_sample_ratio, label="Stage 2 TV Sample Ratio", optional=True),
+                            "loo_color_icp_weight": _coerce_float(stage2_loo_color_icp_weight, label="Stage 2 Color ICP Weight") or 0.02,
+                            "loo_color_icp_k": _coerce_int(stage2_loo_color_icp_k, label="Stage 2 Color ICP K") or 10,
+                            "loo_color_icp_max_color_dist": _coerce_float(stage2_loo_color_icp_max_color_dist, label="Stage 2 Color ICP Max Color Dist", optional=True),
+                            "thin_shell_weight": _coerce_float(stage2_thin_shell_weight, label="Stage 2 Thin Shell Weight") or 1000.0,
+                            "lr": _coerce_float(stage2_lr, label="Stage 2 LR") or 1e-3,
+                            "n_iters": _coerce_int(stage2_n_iters, label="Stage 2 Iterations") or 150,
+                            "save_intermediate_every_n": _coerce_int(stage2_save_intermediate_every_n, label="Stage 2 Save Intermediate Every") or 50,
+                        },
+                    )
+                    stage_hint = "Stage 2"
+                elif stage_key == "stage31":
+                    checkpoint_subdir = _resolve_checkpoint_subdir(run_dir, stage31_checkpoint_subdir)
+                    command = _build_stage31_command(
+                        scene_root=scene_root,
+                        run_name=run_name,
+                        run_dir=run_dir,
+                        checkpoint_subdir=checkpoint_subdir,
+                        inverse_epochs=_coerce_int(stage31_epochs, label="Stage 3.1 Epoch Override", optional=True),
+                        stage31_extra={
+                            "tensorboard": bool(stage31_tensorboard),
+                            "knn_backend": str(stage31_knn_backend or "cpu_kdtree"),
+                            "batch_size": _coerce_int(stage31_batch_size, label="Stage 3.1 Batch Size") or 8192,
+                            "lr": _coerce_float(stage31_lr, label="Stage 3.1 LR") or 1e-3,
+                            "cycle_weight": _coerce_float(stage31_cycle_weight, label="Stage 3.1 Cycle Weight") or 0.1,
+                            "magnitude_weight": _coerce_float(stage31_magnitude_weight, label="Stage 3.1 Magnitude Weight") or 1e-3,
+                            "smoothness_weight": _coerce_float(stage31_smoothness_weight, label="Stage 3.1 Smoothness Weight") or 1e-3,
+                            "num_forward_samples": _coerce_int(stage31_num_forward_samples, label="Stage 3.1 Forward Samples") or 10000,
+                            "num_interp_samples": _coerce_int(stage31_num_interp_samples, label="Stage 3.1 Interp Samples") or 5000,
+                            "regenerate_every": _coerce_int(stage31_regenerate_every, label="Stage 3.1 Regenerate Every") or 10,
+                            "view_embed_dim": _coerce_int(stage31_view_embed_dim, label="Stage 3.1 View Embed Dim") or 32,
+                            "min_res": _coerce_int(stage31_min_res, label="Stage 3.1 Min Res") or 16,
+                            "max_res": _coerce_int(stage31_max_res, label="Stage 3.1 Max Res") or 2048,
+                            "num_levels": _coerce_int(stage31_num_levels, label="Stage 3.1 Num Levels") or 16,
+                            "log2_hashmap_size": _coerce_int(stage31_log2_hashmap_size, label="Stage 3.1 Log2 Hashmap") or 19,
+                            "n_neurons": _coerce_int(stage31_n_neurons, label="Stage 3.1 Neurons") or 64,
+                            "n_hidden_layers": _coerce_int(stage31_n_hidden_layers, label="Stage 3.1 Hidden Layers") or 3,
+                            "save_validation_plys": bool(stage31_save_validation_plys),
+                        },
+                    )
+                    stage_hint = "Stage 3.1"
+                elif stage_key == "stage32":
+                    checkpoint_subdir = _resolve_checkpoint_subdir(run_dir, stage32_checkpoint_subdir)
+                    inverse_dir = _resolve_inverse_dir(run_dir, stage32_inverse_dir_name)
+                    command = _build_stage32_command(
+                        scene_root=scene_root,
+                        run_name=run_name,
+                        run_dir=run_dir,
+                        checkpoint_subdir=checkpoint_subdir,
+                        inverse_dir=inverse_dir,
+                        renderer=stage32_renderer,
+                        gs_num_iters=_coerce_int(stage32_num_iters, label="Stage 3.2 Iter Override", optional=True),
+                        gs_extra={
+                            "tensorboard": bool(gs_tensorboard),
+                            "sh_degree": _coerce_int(gs_sh_degree, label="GS SH Degree") or 3,
+                            "sh_increase_every": _coerce_int(gs_sh_increase_every, label="GS SH Increase Every") or 0,
+                            "sh_full_from_iter": _coerce_int(gs_sh_full_from_iter, label="GS SH Full From Iter") or 5000,
+                            "sh_freeze_means_when_full_sh": bool(gs_sh_freeze_means_when_full_sh),
+                            "sh_reg_weight": _coerce_float(gs_sh_reg_weight, label="GS SH Reg Weight") or 10.0,
+                            "target_num_points": _coerce_int(gs_target_num_points, label="GS Target Num Points") or 4000000,
+                            "optimize_cams": bool(gs_optimize_cams),
+                            "lr_cams": _coerce_float(gs_lr_cams, label="GS LR Cams") or 1e-4,
+                            "optimize_positions": bool(gs_optimize_positions),
+                            "lr_positions": _coerce_float(gs_lr_positions, label="GS LR Positions") or 1e-5,
+                            "lr_colors": _coerce_float(gs_lr_colors, label="GS LR Colors") or 2.5e-3,
+                            "lr_opacities": _coerce_float(gs_lr_opacities, label="GS LR Opacities") or 5e-2,
+                            "lr_scales": _coerce_float(gs_lr_scales, label="GS LR Scales") or 5e-3,
+                            "lr_quats": _coerce_float(gs_lr_quats, label="GS LR Quats") or 1e-3,
+                            "lr_sh0": _coerce_float(gs_lr_sh0, label="GS LR SH0") or 2.5e-3,
+                            "lr_shn": _coerce_float(gs_lr_shn, label="GS LR SHN") or (2.5e-3 / 20.0),
+                            "deform_inverse_rotations": bool(gs_deform_inverse_rotations),
+                            "initial_opacity": _coerce_float(gs_initial_opacity, label="GS Initial Opacity") or 0.5,
+                            "initial_scale": _coerce_float(gs_initial_scale, label="GS Initial Scale") or 0.005,
+                            "initial_flat_ratio": _coerce_float(gs_initial_flat_ratio, label="GS Initial Flat Ratio") or 0.1,
+                            "scale_init": str(gs_scale_init or "knn"),
+                            "knn_neighbors": _coerce_int(gs_knn_neighbors, label="GS KNN Neighbors") or 4,
+                            "normal_k": _coerce_int(gs_normal_k, label="GS Normal K") or 20,
+                            "l1_weight": _coerce_float(gs_l1_weight, label="GS L1 Weight") or 0.8,
+                            "lpips_weight": _coerce_float(gs_lpips_weight, label="GS LPIPS Weight") or 0.2,
+                            "opacity_reg_weight": _coerce_float(gs_opacity_reg_weight, label="GS Opacity Reg Weight") or 0.0,
+                            "scale_reg_weight": _coerce_float(gs_scale_reg_weight, label="GS Scale Reg Weight") or 0.0,
+                            "normal_consistency_weight": _coerce_float(gs_normal_consistency_weight, label="GS Normal Consistency Weight") or 0.05,
+                            "distortion_weight": _coerce_float(gs_distortion_weight, label="GS Distortion Weight") or 0.01,
+                            "alpha_reg_weight": _coerce_float(gs_alpha_reg_weight, label="GS Alpha Reg Weight") or 0.0,
+                            "frames_per_iter": _coerce_int(gs_frames_per_iter, label="GS Frames Per Iter") or 1,
+                            "log_every": _coerce_int(gs_log_every, label="GS Log Every") or 50,
+                            "save_every": _coerce_int(gs_save_every, label="GS Save Every") or 5000,
+                            "eval_every": _coerce_int(gs_eval_every, label="GS Eval Every") or 1000,
+                            "lr_decay": _coerce_float(gs_lr_decay, label="GS LR Decay") or 0.1,
+                            "auto_eval": bool(gs_auto_eval),
+                        },
+                    )
+                    stage_hint = "Stage 3.2"
+                else:
+                    raise ValueError(f"Unknown stage: {stage_key}")
+    except Exception as exc:
+        yield from _emit_launch_failure(f"**State**: Failed before launch\n\n`{exc}`")
+        return
+
+    yield from _run_command_generator(
+        command=command,
+        effective_scene_root=effective_scene_root,
+        input_note=input_note,
+        stage_hint=stage_hint,
+    )
+
+
+def _stop_active_run(run_state: dict[str, str]):
+    run_id = (run_state or {}).get("run_id", "")
+    if not run_id:
+        return "No active run is registered in the UI state.", run_state
+
+    with ACTIVE_RUNS_LOCK:
+        process = ACTIVE_RUNS.get(run_id)
+
+    if process is None:
+        return f"Run `{run_id}` is not active. It may have already finished.", run_state
+
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+    return f"Stop signal sent to `{run_id}`.", run_state
+
+
+def _inspect_existing_scene(scene_root_selection: object):
+    try:
+        scene_root = _resolve_existing_dir(scene_root_selection)
+        artifacts = _collect_scene_artifacts(scene_root)
+    except Exception as exc:
+        return (
+            f"**Inspect Failed**\n\n`{exc}`",
+            "",
+            "",
+            None,
+            None,
+            [],
+            "",
+        )
+
+    return (
+        _format_scene_report(artifacts),
+        str(artifacts.scene_root),
+        _latest_run_dir_text(artifacts),
+        _choose_primary_preview(artifacts),
+        _choose_secondary_preview(artifacts),
+        _key_files_as_strings(artifacts),
+        "",
+    )
+
+
+def _refresh_stage_scene(scene_root_selection: object):
+    if not _strip_quotes(scene_root_selection):
+        return _blank_stage_scene_outputs()
+
+    empty_dropdown = _empty_dropdown_update()
+    disabled = _stage_button_update(active=False, enabled=False)
+    try:
+        scene_root = _resolve_existing_dir(scene_root_selection)
+        artifacts = _collect_scene_artifacts(scene_root)
+    except Exception as exc:
+        return (
+            f"**Scene Selection Failed**\n\n`{exc}`",
+            "",
+            empty_dropdown,
+            "",
+            empty_dropdown,
+            empty_dropdown,
+            empty_dropdown,
+            "",
+            f"**Recommended Next Step**: `Stage 0`\n\n`{exc}`",
+            _stage_button_update(active=True, enabled=True),
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+        )
+
+    run_names = [path.name for path in artifacts.run_dirs]
+    default_run_name = artifacts.latest_run_dir.name if artifacts.latest_run_dir else None
+    selected_run_dir = (scene_root / default_run_name).resolve() if default_run_name else None
+    checkpoint_choices = _checkpoint_subdir_choices(selected_run_dir)
+    inverse_names = [path.name for path in _list_inverse_dirs(selected_run_dir)]
+
+    recommendation = _recommend_stage_action(str(scene_root.resolve()), default_run_name)
+
+    return (
+        _format_scene_report(artifacts, selected_run_name=default_run_name),
+        str(scene_root.resolve()),
+        _choices_dropdown_update(run_names, default_run_name),
+        str(selected_run_dir) if selected_run_dir and selected_run_dir.is_dir() else "",
+        _choices_dropdown_update(checkpoint_choices),
+        _choices_dropdown_update(checkpoint_choices),
+        _choices_dropdown_update(inverse_names),
+        _default_original_images_dir(scene_root),
+        *recommendation,
+    )
+
+
+def _refresh_stage_run(scene_root_selection: object, run_name: str):
+    if not _strip_quotes(scene_root_selection):
+        return (
+            "",
+            _empty_dropdown_update(),
+            _empty_dropdown_update(),
+            _empty_dropdown_update(),
+            "",
+            _blank_stage_scene_outputs()[0],
+            *_blank_stage_scene_outputs()[8:],
+        )
+
+    empty_dropdown = _empty_dropdown_update()
+    disabled = _stage_button_update(active=False, enabled=False)
+    try:
+        scene_root = _resolve_existing_dir(scene_root_selection)
+        artifacts = _collect_scene_artifacts(scene_root)
+        if not run_name:
+            return (
+                "",
+                empty_dropdown,
+                empty_dropdown,
+                empty_dropdown,
+                _default_original_images_dir(scene_root),
+                _format_scene_report(artifacts),
+                *_recommend_stage_action(str(scene_root.resolve()), None),
+            )
+        _, run_dir = _resolve_run(scene_root, run_name)
+    except Exception as exc:
+        return (
+            "",
+            empty_dropdown,
+            empty_dropdown,
+            empty_dropdown,
+            "",
+            f"**Run Selection Failed**\n\n`{exc}`",
+            f"**Recommended Next Step**: `Stage 1`\n\n`{exc}`",
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+        )
+
+    checkpoint_choices = _checkpoint_subdir_choices(run_dir)
+    inverse_names = [path.name for path in _list_inverse_dirs(run_dir)]
+    return (
+        str(run_dir),
+        _choices_dropdown_update(checkpoint_choices),
+        _choices_dropdown_update(checkpoint_choices),
+        _choices_dropdown_update(inverse_names),
+        _default_original_images_dir(scene_root),
+        _format_scene_report(artifacts, selected_run_name=run_name),
+        *_recommend_stage_action(str(scene_root.resolve()), run_name),
+    )
+
+
+def _stage_button_update(*, active: bool, enabled: bool) -> dict:
+    return gr.update(variant="primary" if active else "secondary", interactive=enabled)
+
+
+def _empty_dropdown_update() -> dict:
+    return gr.update(choices=[""], value="", interactive=False)
+
+
+def _choices_dropdown_update(choices: list[str], value: Optional[str] = None) -> dict:
+    selected = value if value in choices else (choices[0] if choices else "")
+    return gr.update(choices=choices if choices else [""], value=selected, interactive=bool(choices))
+
+
+def _blank_stage_scene_outputs():
+    disabled = _stage_button_update(active=False, enabled=False)
+    return (
+        (
+            "**Stage 0 Source Selected**\n\n"
+            "No scene is selected yet. Run `Stage 0` to create a new scene root and unlock the later stages."
+        ),
+        "",
+        _empty_dropdown_update(),
+        "",
+        _empty_dropdown_update(),
+        _empty_dropdown_update(),
+        _empty_dropdown_update(),
+        "",
+        (
+            "**Recommended Next Step**: `Stage 0`\n\n"
+            "A new source video is selected, so the explicit-stage flow is reset to preprocessing."
+        ),
+        _stage_button_update(active=True, enabled=True),
+        disabled,
+        disabled,
+        disabled,
+        disabled,
+    )
+
+
+def _recommend_stage_action(scene_root_selection: object, run_name: str | None = None):
+    default_note = (
+        "**Recommended Next Step**: `Stage 0`\n\n"
+        "Start from a video to create the scene root, extracted frames, DA3 depth/confidence, the filtered point-cloud cache, and `before_non_rigid_icp.ply`."
+    )
+    disabled = _stage_button_update(active=False, enabled=False)
+
+    try:
+        scene_root = _resolve_existing_dir(scene_root_selection)
+    except Exception:
+        return (
+            default_note,
+            _stage_button_update(active=True, enabled=True),
+            disabled,
+            disabled,
+            disabled,
+            disabled,
+        )
+
+    results_npz = scene_root / "exports" / "npz" / "results.npz"
+    stage0_done = results_npz.exists()
+    run_dirs = _find_run_dirs(scene_root)
+
+    selected_run_dir: Optional[Path] = None
+    if run_name:
+        candidate = scene_root / run_name
+        if candidate.is_dir():
+            selected_run_dir = candidate.resolve()
+    if selected_run_dir is None and run_dirs:
+        selected_run_dir = run_dirs[-1].resolve()
+
+    stage1_done = selected_run_dir is not None and (selected_run_dir / "after_non_rigid_icp").is_dir()
+    stage2_done = selected_run_dir is not None and (selected_run_dir / "after_global_optimization").is_dir()
+    checkpoint_choices = _checkpoint_subdir_choices(selected_run_dir)
+    inverse_dirs = _list_inverse_dirs(selected_run_dir)
+    gs_dirs = _list_gs_dirs(selected_run_dir)
+    stage31_done = bool(inverse_dirs)
+    stage32_done = bool(gs_dirs)
+
+    if not stage0_done:
+        note = (
+            "**Recommended Next Step**: `Stage 0`\n\n"
+            "Create the scene root plus Stage 0 exports: frames, DA3 depth/confidence, intrinsics, extrinsics, the filtered point-cloud cache, and `before_non_rigid_icp.ply`."
+        )
+        next_stage = "stage0"
+    elif not run_dirs:
+        note = (
+            "**Recommended Next Step**: `Stage 0`\n\n"
+            "This scene has DA3 outputs but no prepared Stage 1 run directory yet. Rerun Stage 0 with the desired pre-ICP settings to create the filtered point-cloud cache and `before_non_rigid_icp.ply`."
+        )
+        next_stage = "stage0"
+    elif not stage1_done:
+        note = (
+            "**Recommended Next Step**: `Stage 1`\n\n"
+            "Run non-rigid ICP on the prepared Stage 0 inputs and save `after_non_rigid_icp`."
+        )
+        next_stage = "stage1"
+    elif not stage2_done:
+        note = (
+            "**Recommended Next Step**: `Stage 2`\n\n"
+            "Refine the selected Stage 1 run jointly and write the improved checkpoint to `after_global_optimization`."
+        )
+        next_stage = "stage2"
+    elif not stage31_done:
+        note = (
+            "**Recommended Next Step**: `Stage 3.1`\n\n"
+            "Train the inverse deformation model from the selected checkpoint so Stage 3.2 can render a splat."
+        )
+        next_stage = "stage31"
+    elif not stage32_done:
+        note = (
+            "**Recommended Next Step**: `Stage 3.2`\n\n"
+            "Train the Gaussian splat from the selected checkpoint and inverse deformation directory."
+        )
+        next_stage = "stage32"
+    else:
+        note = (
+            "**Recommended Next Step**: `Complete`\n\n"
+            "This run already has Stage 0, Stage 1, Stage 2, Stage 3.1, and Stage 3.2 outputs."
+        )
+        next_stage = ""
+
+    stage0_enabled = True
+    stage1_enabled = selected_run_dir is not None
+    stage2_enabled = stage1_done
+    stage31_enabled = stage1_done and bool(checkpoint_choices)
+    stage32_enabled = stage31_done and bool(checkpoint_choices)
+
+    return (
+        note,
+        _stage_button_update(active=next_stage == "stage0", enabled=stage0_enabled),
+        _stage_button_update(active=next_stage == "stage1", enabled=stage1_enabled),
+        _stage_button_update(active=next_stage == "stage2", enabled=stage2_enabled),
+        _stage_button_update(active=next_stage == "stage31", enabled=stage31_enabled),
+        _stage_button_update(active=next_stage == "stage32", enabled=stage32_enabled),
+    )
+
+
+def _reset_stage_panel_for_new_source(
+    source_mode: str,
+    uploaded_video: object,
+    existing_video_selection: object,
+    existing_frames_dir: object,
+):
+    empty_dropdown = _empty_dropdown_update()
+    source_name = ""
+
+    normalized_mode = str(source_mode or "").strip().lower()
+    if normalized_mode == "upload_video":
+        raw_path = _strip_quotes(uploaded_video)
+        if raw_path:
+            source_name = Path(raw_path).name
+    elif normalized_mode == "existing_video":
+        raw_path = _strip_quotes(existing_video_selection)
+        if raw_path:
+            source_name = Path(raw_path).name
+    elif normalized_mode == "existing_frames":
+        raw_path = _strip_quotes(existing_frames_dir)
+        if raw_path:
+            source_name = Path(raw_path).name
+
+    source_note = f" for `{source_name}`" if source_name else ""
+    return (
+        _update_dropdown_choices(_scene_dropdown_choices(), ""),
+        (
+            "**Stage 0 Source Selected**\n\n"
+            f"A new Stage 0 input is selected{source_note}. Run `Stage 0` next. "
+            "Downstream scene, run, checkpoint, and inverse-deformation selections will repopulate after preprocessing finishes."
+        ),
+        "",
+        empty_dropdown,
+        "",
+        empty_dropdown,
+        empty_dropdown,
+        empty_dropdown,
+        "",
+        (
+            "**Recommended Next Step**: `Stage 0`\n\n"
+            "A new source video is selected, so the explicit-stage flow is reset to preprocessing."
+        ),
+        _stage_button_update(active=True, enabled=True),
+        _stage_button_update(active=False, enabled=False),
+        _stage_button_update(active=False, enabled=False),
+        _stage_button_update(active=False, enabled=False),
+        _stage_button_update(active=False, enabled=False),
+    )
+
+
+def build_app() -> gr.Blocks:
+    video_choices = _video_dropdown_choices()
+    scene_choices = _scene_dropdown_choices()
+    output_parent_choices = _output_parent_dropdown_choices()
+    default_video = video_choices[0][1] if video_choices else None
+    default_scene = scene_choices[0][1] if scene_choices else None
+
+    with gr.Blocks(title="Video-to-World Studio") as demo:
+        pipeline_run_state = gr.State({})
+        stage_run_state = gr.State({})
+
+        gr.Markdown(
+            f"""
+            # Video-to-World Studio
+            Version: `{APP_VERSION}`
+
+            Launch `video_to_world` from upload and dropdown-based inputs instead of manual path entry.
+
+            Existing videos and scene roots are discovered under `{PICKER_ROOT}`.
+            The explicit stage runner launches the native Stage 0 through Stage 3.2 commands directly.
+            """
+        )
+
+        with gr.Tab("Run Full Pipeline"):
+            gr.Markdown(
+                "Pick one source. Existing videos, scene roots, and downstream stage inputs update automatically on load and after runs."
+            )
+
+            with gr.Row():
+                pipeline_source_mode = gr.Radio(
+                    choices=[
+                        ("Upload Video", "upload_video"),
+                        ("Existing Video", "existing_video"),
+                        ("Existing Scene", "existing_scene"),
+                    ],
+                    value="upload_video",
+                    label="Source Mode",
+                )
+
+            with gr.Row():
+                with gr.Column(scale=6):
+                    with gr.Group(visible=True) as pipeline_upload_group:
+                        uploaded_video = gr.File(
+                            label="Upload Video",
+                            file_types=[".mp4", ".mov", ".avi", ".mkv"],
+                            type="filepath",
+                        )
+                        uploaded_video_cached = gr.State("")
+                    with gr.Group(visible=False) as pipeline_existing_video_group:
+                        existing_video_selection = gr.Dropdown(
+                            label="Existing Video",
+                            choices=video_choices,
+                            value=default_video,
+                            info="Discovered under the videos workspace.",
+                        )
+                    with gr.Group(visible=False) as pipeline_existing_scene_group:
+                        existing_scene_root_selection = gr.Dropdown(
+                            label="Existing Scene Root",
+                            choices=scene_choices,
+                            value=default_scene,
+                            info="Only scene roots with Stage 0 outputs are listed.",
+                        )
+
+                with gr.Column(scale=4):
+                    with gr.Group(visible=True) as pipeline_output_group:
+                        output_parent_selection = gr.Dropdown(
+                            label="Output Parent Directory",
+                            choices=output_parent_choices,
+                            value="",
+                            info="Leave on automatic unless you want a custom destination.",
+                        )
+                        custom_scene_name = gr.Textbox(
+                            label="Custom Scene Name",
+                            placeholder="Optional. If blank, the video filename is used.",
+                        )
+                    mode = gr.Radio(["fast", "extensive"], value="fast", label="Mode")
+                    renderer_choice = gr.Dropdown(
+                        choices=["auto", "2dgs", "3dgs", "both"],
+                        value="auto",
+                        label="Renderer",
+                    )
+                    preprocess_overwrite = gr.Checkbox(label="Overwrite Stage 0 Outputs", value=False)
+                    dry_run = gr.Checkbox(label="Dry Run", value=False)
+
+            with gr.Accordion("Advanced", open=False):
+                with gr.Accordion("Stage 0", open=False):
+                    with gr.Row():
+                        preprocess_max_frames = gr.Number(
+                            label="DA3 Input Max Frames",
+                            value=DEFAULT_STAGE0_MAX_FRAMES,
+                            precision=0,
+                            info="Maximum raw video frames Stage 0 will send to DA3.",
+                        )
+                        preprocess_max_stride = gr.Number(
+                            label="DA3 Input Max Stride",
+                            value=8,
+                            precision=0,
+                            info="Upper bound on raw-video frame spacing during Stage 0 subsampling.",
+                        )
+                        preprocess_image_ext = gr.Textbox(label="Image Extension", value="png")
+                    preprocess_model_name = gr.Textbox(label="DA3 Model Name", value="depth-anything/DA3NESTED-GIANT-LARGE")
+                    preprocess_process_res = gr.Number(
+                        label="DA3 Processing Resolution",
+                        value=768,
+                        precision=0,
+                        info="Longest side is resized to this before DA3 runs. Higher = denser points, more VRAM. VRAM scales as (res/504)^2. Common: 504 (low), 768 (medium), 1024 (high).",
+                    )
+                    with gr.Row():
+                        preprocess_process_res_method = gr.Dropdown(
+                            choices=["upper_bound_resize", "upper_bound_crop"],
+                            value="upper_bound_resize",
+                            label="DA3 Resolution Method",
+                            info="Resize policy before DA3 inference.",
+                        )
+                        preprocess_ref_view_strategy = gr.Dropdown(
+                            choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
+                            value="first",
+                            label="DA3 Reference View",
+                            info="Default is `first` for this project.",
+                        )
+                        preprocess_export_gs_video = gr.Checkbox(
+                            label="Export DA3 GS Preview Video",
+                            value=False,
+                            info="Opt-in preview export. Leave off for a faster Stage 0.",
+                        )
+                        preprocess_export_kinect_rgbd_video = gr.Checkbox(
+                            label="Export Kinect RGBD Video",
+                            value=False,
+                            info="Write a packed `[metadata|color|depth]` lossless video after Stage 0.",
+                        )
+                    with gr.Row():
+                        preprocess_kinect_rgbd_video_fps = gr.Number(
+                            label="Kinect RGBD Video FPS",
+                            value=30,
+                            precision=0,
+                            info="Frame rate used when assembling the packed Stage 0 RGBD video.",
+                        )
+                        preprocess_use_ray_pose = gr.Checkbox(
+                            label="Use DA3 Ray Pose",
+                            value=False,
+                            info="Use ray-based pose estimation instead of the camera decoder.",
+                        )
+                    gr.Markdown(
+                        "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus "
+                        "`before_non_rigid_icp.ply` for the selected pre-ICP settings. Both the DA3 GS preview video and the packed Kinect-layout RGBD video are optional."
+                    )
+                    gr.Markdown(
+                        "Reference-view note: this app now defaults DA3 to `first`. "
+                        "The original code path used DA3's default `saddle_balanced`."
+                    )
+                    gr.Markdown(
+                        "Example: raw `500` frames with `DA3 Input Max Frames=30`, `DA3 Input Max Stride=8` usually gives about every 8th raw frame. "
+                        "Raw `5000` frames with the same settings clamps to stride 8 and only covers the earlier part of the clip."
+                    )
+                    gr.Markdown(
+                        "When available, Stage 0 also stores DA3's sky mask in `results.npz`. The pre-ICP filtering controls below use it to drop sky pixels before the non-rigid ICP stage."
+                    )
+                with gr.Accordion("Stage 0 Pre-ICP Filtering", open=False):
+                    with gr.Row():
+                        alignment_num_frames = gr.Number(
+                            label="Prep Num Frames",
+                            value=50,
+                            precision=0,
+                            info="Maximum number of Stage 0 frames to prepare for the non-rigid ICP stage.",
+                        )
+                        alignment_stride = gr.Number(
+                            label="Prep Stride",
+                            value=1,
+                            precision=0,
+                            info="Stride over the Stage 0 frame set, not over the raw video.",
+                        )
+                        alignment_offset = gr.Number(label="Prep Offset", value=0, precision=0)
+                    gr.Markdown(
+                        "Stage 0 applies `Prep Stride` first over the DA3 frame set, then truncates to `Prep Num Frames` when preparing the pre-ICP caches. "
+                        "Example: if Stage 0 produced `100` DA3 frames, then `Prep Stride=3`, `Prep Num Frames=20` takes frames `0, 3, 6, ...` and stops after 20 selected frames."
+                    )
+                    with gr.Row():
+                        alignment_conf_profile = gr.Dropdown(
+                            choices=[
+                                ("Default Mixed (voxel + DA3)", "default_mixed"),
+                                ("DA3 Only (Per Frame)", "da3_per_frame"),
+                                ("DA3 Only (Global)", "da3_global"),
+                                ("DA3 Only (Per Frame Guided)", "da3_per_frame_guided"),
+                            ],
+                            value="default_mixed",
+                            label="Confidence Mode",
+                        )
+                        alignment_conf_percentile = gr.Number(label="DA3 Confidence Percentile", value=1.0)
+                        stage1_knn_backend = gr.Dropdown(choices=["cpu_kdtree", "gpu_kdtree"], value="cpu_kdtree", label="KNN Backend")
+                    with gr.Row():
+                        conf_mask_sky = gr.Checkbox(
+                            label="Use DA3 Sky Mask",
+                            value=True,
+                            info="Requires Stage 0 sky output. Excludes DA3 sky pixels before point-cloud generation.",
+                        )
+                        conf_mask_sky_depth_band = gr.Checkbox(
+                            label="Expand Sky By Depth Band",
+                            value=True,
+                            info="After sky masking, also drop pixels in the top x% depth band of the sky depth plateau.",
+                        )
+                        conf_sky_depth_band_percent = gr.Number(label="Sky Depth Band Percent", value=50.0)
+                        conf_mask_depth_edges = gr.Checkbox(label="Suppress Depth Edges", value=True)
+                        conf_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.03)
+                        conf_edge_atol = gr.Number(label="Depth Edge Abs Threshold", value=None)
+                        conf_edge_kernel_size = gr.Number(label="Depth Edge Kernel", value=3, precision=0)
+                    with gr.Row():
+                        conf_mask_max_depth = gr.Checkbox(label="Suppress Max DA3 Depth Plateau", value=False)
+                        conf_max_depth_rtol = gr.Number(label="Max Depth Rel Threshold", value=0.001)
+                        conf_max_depth_atol = gr.Number(label="Max Depth Abs Threshold", value=None)
+                    gr.Markdown(
+                        "If `Use DA3 Sky Mask` is enabled, Stage 0 prep also writes debug PNGs under "
+                        "`exports/ply/<active-filter>/debug_masks/{sky,kept}/` so you can inspect the raw DA3 sky mask and the final kept-pixel mask."
+                    )
+                    gr.Markdown(
+                        "`Expand Sky By Depth Band` uses the masked sky depth plateau as a reference and removes any pixel within the top `x%` of that depth range."
+                    )
+                with gr.Accordion("Stage 1 RoMa Matching", open=False):
+                    gr.Markdown("RoMa is the cross-frame matcher used to add correspondence constraints during Stage 1.")
+                    with gr.Row():
+                        stage1_use_roma_matching = gr.Checkbox(label="Use RoMa Matching", value=True)
+                        stage1_roma_version = gr.Dropdown(choices=["v2", "v1"], value="v2", label="RoMa Version")
+                        stage1_roma_model = gr.Dropdown(choices=["indoor", "outdoor", "tiny"], value="outdoor", label="RoMa Model")
+                    with gr.Row():
+                        stage1_roma_num_samples = gr.Number(label="RoMa Samples Per Pair", value=5000, precision=0)
+                        stage1_roma_certainty_threshold = gr.Number(label="RoMa Certainty Threshold", value=0.5)
+                        stage1_roma_max_references = gr.Number(label="RoMa Max References", value=20, precision=0)
+                    with gr.Row():
+                        stage1_roma_reference_sampling = gr.Dropdown(choices=["recent_and_strided", "recent", "strided", "all_previous"], value="recent_and_strided", label="RoMa Reference Sampling")
+                        stage1_roma_loss_weight = gr.Number(label="RoMa Loss Weight", value=1.0)
+                        stage1_roma_max_corr_dist = gr.Number(label="RoMa Max Corr Dist", value=1.0)
+                with gr.Accordion("Stage 1 ICP / Deformation", open=False):
+                    with gr.Row():
+                        stage1_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        stage1_max_corr_dist = gr.Number(label="Max Corr Dist", value=0.03)
+                        stage1_merge_voxel_size = gr.Number(
+                            label="Merge Voxel Size",
+                            value=0.001,
+                            info="Voxel grid size for spatial dedup when merging frame points into the model. Smaller = denser clouds. Pi-Long uses 0.001, original default was 0.05.",
+                        )
+                        stage1_icp_n_iter = gr.Number(label="ICP Iterations", value=100, precision=0)
+                        stage1_icp_method = gr.Dropdown(choices=["point2plane", "point2point"], value="point2plane", label="ICP Method")
+                    with gr.Row():
+                        stage1_icp_early_stopping_patience = gr.Number(label="Early Stop Patience", value=5, precision=0)
+                        stage1_icp_early_stopping_min_iters = gr.Number(label="Early Stop Min Iters", value=25, precision=0)
+                        stage1_icp_early_stopping_min_delta = gr.Number(label="Early Stop Min Delta", value=None)
+                        stage1_icp_lr = gr.Number(label="ICP LR", value=1e-3)
+                    with gr.Row():
+                        stage1_icp_local_twist_reg = gr.Number(label="Local Twist Reg", value=0.0)
+                        stage1_icp_tv_reg = gr.Number(label="TV Reg", value=50.0)
+                        stage1_icp_tv_voxel_size = gr.Number(label="TV Voxel Size", value=0.01)
+                        stage1_icp_tv_every_k = gr.Number(label="TV Every K", value=1, precision=0)
+                        stage1_icp_tv_sample_ratio = gr.Number(label="TV Sample Ratio", value=0.1)
+                    with gr.Row():
+                        stage1_icp_color_icp_weight = gr.Number(label="Color ICP Weight", value=0.02)
+                        stage1_icp_color_icp_max_color_dist = gr.Number(label="Color ICP Max Color Dist", value=0.1)
+                        stage1_icp_color_icp_k = gr.Number(label="Color ICP K", value=10, precision=0)
+                        stage1_save_intermediate_every = gr.Number(label="Save Intermediate Every", value=10, precision=0)
+                    with gr.Row():
+                        stage1_deform_log2_hashmap_size = gr.Number(label="Deform Log2 Hashmap", value=19, precision=0)
+                        stage1_deform_num_levels = gr.Number(label="Deform Num Levels", value=24, precision=0)
+                        stage1_deform_n_neurons = gr.Number(label="Deform Neurons", value=64, precision=0)
+                        stage1_deform_n_hidden_layers = gr.Number(label="Deform Hidden Layers", value=4, precision=0)
+                        stage1_deform_min_res = gr.Number(label="Deform Min Res", value=16, precision=0)
+                        stage1_deform_max_res = gr.Number(label="Deform Max Res", value=2048, precision=0)
+                with gr.Accordion("Stage 1 Point Filtering", open=False):
+                    with gr.Row():
+                        stage1_filter_points = gr.Checkbox(label="Filter Points", value=False)
+                        stage1_filter_geom_sigma = gr.Number(label="Geom Sigma", value=2.5)
+                        stage1_filter_color_sigma = gr.Number(label="Color Sigma", value=1.5)
+                        stage1_filter_worst_pct = gr.Number(label="Worst Percent", value=0.2)
+                        stage1_filter_min_frames = gr.Number(label="Min Frames", value=2, precision=0)
+                        stage1_filter_base_percentile = gr.Dropdown(choices=["p75", "p90", "p95", "p99"], value="p75", label="Base Percentile")
+                with gr.Accordion("Stage 2", open=False):
+                    with gr.Row():
+                        stage2_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        stage2_knn_backend = gr.Dropdown(choices=["cpu_kdtree", "gpu_kdtree"], value="cpu_kdtree", label="KNN Backend")
+                        stage2_n_iters = gr.Number(label="Iterations", value=150, precision=0)
+                        stage2_lr = gr.Number(label="LR", value=1e-3)
+                    with gr.Row():
+                        stage2_loo_loss_weight = gr.Number(label="LOO Loss Weight", value=1.0)
+                        stage2_loo_k_neighbors = gr.Number(label="LOO K Neighbors", value=5, precision=0)
+                        stage2_loo_max_corr_dist = gr.Number(label="LOO Max Corr Dist", value=0.03125)
+                        stage2_loo_normal_k = gr.Number(label="LOO Normal K", value=20, precision=0)
+                        stage2_loo_kdtree_rebuild_every = gr.Number(label="KDT Rebuild Every", value=50, precision=0)
+                    with gr.Row():
+                        stage2_loo_max_pairs_per_iter = gr.Number(label="Max Pairs Per Iter", value=200000, precision=0)
+                        stage2_loo_pairs_per_src = gr.Number(label="Pairs Per Src", value=1, precision=0)
+                        stage2_deform_chunk_size = gr.Number(label="Deform Chunk Size", value=50000, precision=0)
+                        stage2_anchor_loss_weight = gr.Number(label="Anchor Loss Weight", value=1000.0)
+                        stage2_anchor_n_samples = gr.Number(label="Anchor Samples", value=4096, precision=0)
+                    with gr.Row():
+                        stage2_tv_reg = gr.Number(label="TV Reg", value=50.0)
+                        stage2_tv_voxel_size = gr.Number(label="TV Voxel Size", value=0.01)
+                        stage2_tv_every_k = gr.Number(label="TV Every K", value=1, precision=0)
+                        stage2_tv_sample_ratio = gr.Number(label="TV Sample Ratio", value=0.1)
+                        stage2_loo_color_icp_weight = gr.Number(label="Color ICP Weight", value=0.02)
+                        stage2_loo_color_icp_k = gr.Number(label="Color ICP K", value=10, precision=0)
+                    with gr.Row():
+                        stage2_loo_color_icp_max_color_dist = gr.Number(label="Color ICP Max Color Dist", value=0.1)
+                        stage2_thin_shell_weight = gr.Number(label="Thin Shell Weight", value=1000.0)
+                        stage2_save_intermediate_every_n = gr.Number(label="Save Intermediate Every", value=50, precision=0)
+                with gr.Accordion("Stage 3.1", open=False):
+                    with gr.Row():
+                        inverse_epochs = gr.Number(label="Epoch Override", value=None, precision=0)
+                        stage31_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        stage31_knn_backend = gr.Dropdown(choices=["cpu_kdtree", "gpu_kdtree"], value="cpu_kdtree", label="KNN Backend")
+                        stage31_batch_size = gr.Number(label="Batch Size", value=8192, precision=0)
+                        stage31_lr = gr.Number(label="LR", value=1e-3)
+                    with gr.Row():
+                        stage31_cycle_weight = gr.Number(label="Cycle Weight", value=0.1)
+                        stage31_magnitude_weight = gr.Number(label="Magnitude Weight", value=1e-3)
+                        stage31_smoothness_weight = gr.Number(label="Smoothness Weight", value=1e-3)
+                        stage31_num_forward_samples = gr.Number(label="Forward Samples", value=10000, precision=0)
+                        stage31_num_interp_samples = gr.Number(label="Interp Samples", value=5000, precision=0)
+                        stage31_regenerate_every = gr.Number(label="Regenerate Every", value=10, precision=0)
+                    with gr.Row():
+                        stage31_view_embed_dim = gr.Number(label="View Embed Dim", value=32, precision=0)
+                        stage31_min_res = gr.Number(label="Min Res", value=16, precision=0)
+                        stage31_max_res = gr.Number(label="Max Res", value=2048, precision=0)
+                        stage31_num_levels = gr.Number(label="Num Levels", value=16, precision=0)
+                        stage31_log2_hashmap_size = gr.Number(label="Log2 Hashmap", value=19, precision=0)
+                        stage31_n_neurons = gr.Number(label="Neurons", value=64, precision=0)
+                        stage31_n_hidden_layers = gr.Number(label="Hidden Layers", value=3, precision=0)
+                        stage31_save_validation_plys = gr.Checkbox(label="Save Validation PLYs", value=True)
+                with gr.Accordion("Stage 3.2", open=False):
+                    with gr.Row():
+                        gs_num_iters = gr.Number(label="Iter Override", value=None, precision=0)
+                        gs_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        gs_target_num_points = gr.Number(label="Target Num Points", value=4000000, precision=0)
+                        gs_frames_per_iter = gr.Number(label="Frames Per Iter", value=1, precision=0)
+                    with gr.Row():
+                        gs_sh_degree = gr.Number(label="SH Degree", value=3, precision=0)
+                        gs_sh_increase_every = gr.Number(label="SH Increase Every", value=0, precision=0)
+                        gs_sh_full_from_iter = gr.Number(label="SH Full From Iter", value=5000, precision=0)
+                        gs_sh_freeze_means_when_full_sh = gr.Checkbox(label="Freeze Means When Full SH", value=True)
+                        gs_sh_reg_weight = gr.Number(label="SH Reg Weight", value=10.0)
+                    with gr.Row():
+                        gs_optimize_cams = gr.Checkbox(label="Optimize Cams", value=True)
+                        gs_lr_cams = gr.Number(label="LR Cams", value=1e-4)
+                        gs_optimize_positions = gr.Checkbox(label="Optimize Positions", value=True)
+                        gs_lr_positions = gr.Number(label="LR Positions", value=1e-5)
+                        gs_lr_colors = gr.Number(label="LR Colors", value=2.5e-3)
+                        gs_lr_opacities = gr.Number(label="LR Opacities", value=5e-2)
+                    with gr.Row():
+                        gs_lr_scales = gr.Number(label="LR Scales", value=5e-3)
+                        gs_lr_quats = gr.Number(label="LR Quats", value=1e-3)
+                        gs_lr_sh0 = gr.Number(label="LR SH0", value=2.5e-3)
+                        gs_lr_shn = gr.Number(label="LR SHN", value=2.5e-3 / 20.0)
+                        gs_deform_inverse_rotations = gr.Checkbox(label="Deform Inverse Rotations", value=True)
+                        gs_initial_opacity = gr.Number(label="Initial Opacity", value=0.5)
+                        gs_initial_scale = gr.Number(label="Initial Scale", value=0.005)
+                    with gr.Row():
+                        gs_initial_flat_ratio = gr.Number(label="Initial Flat Ratio", value=0.1)
+                        gs_scale_init = gr.Dropdown(choices=["knn", "fixed"], value="knn", label="Scale Init")
+                        gs_knn_neighbors = gr.Number(label="KNN Neighbors", value=4, precision=0)
+                        gs_normal_k = gr.Number(label="Normal K", value=20, precision=0)
+                        gs_l1_weight = gr.Number(label="L1 Weight", value=0.8)
+                        gs_lpips_weight = gr.Number(label="LPIPS Weight", value=0.2)
+                    with gr.Row():
+                        gs_opacity_reg_weight = gr.Number(label="Opacity Reg Weight", value=0.0)
+                        gs_scale_reg_weight = gr.Number(label="Scale Reg Weight", value=0.0)
+                        gs_normal_consistency_weight = gr.Number(label="Normal Consistency Weight", value=0.05)
+                        gs_distortion_weight = gr.Number(label="Distortion Weight", value=0.01)
+                        gs_alpha_reg_weight = gr.Number(label="Alpha Reg Weight", value=0.0)
+                    with gr.Row():
+                        gs_log_every = gr.Number(label="Log Every", value=50, precision=0)
+                        gs_save_every = gr.Number(label="Save Every", value=5000, precision=0)
+                        gs_eval_every = gr.Number(label="Eval Every", value=1000, precision=0)
+                        gs_lr_decay = gr.Number(label="LR Decay", value=0.1)
+                        gs_auto_eval = gr.Checkbox(label="Auto Eval", value=True)
+
+            with gr.Row():
+                run_pipeline_button = gr.Button("Start Full Pipeline", variant="primary")
+                stop_pipeline_button = gr.Button("Stop Active Run", variant="stop")
+
+            pipeline_stop_feedback = gr.Markdown()
+            pipeline_status_md = gr.Markdown()
+
+            with gr.Row():
+                pipeline_stage_text = gr.Textbox(label="Current Stage", interactive=False)
+                pipeline_scene_root_text = gr.Textbox(label="Resolved Scene Root", interactive=False)
+                pipeline_latest_run_dir_text = gr.Textbox(label="Latest Run Dir", interactive=False)
+
+            pipeline_scene_report_md = gr.Markdown()
+
+            with gr.Row():
+                pipeline_primary_preview = gr.Video(label="Primary Preview", interactive=False)
+                pipeline_secondary_preview = gr.Video(label="Secondary Preview", interactive=False)
+
+            pipeline_key_files = gr.Files(label="Key Files")
+            pipeline_live_log = gr.Textbox(label="Live Log", lines=24, interactive=False)
+
+            pipeline_source_mode.change(
+                fn=_update_pipeline_source_mode,
+                inputs=[pipeline_source_mode],
+                outputs=[
+                    pipeline_upload_group,
+                    pipeline_existing_video_group,
+                    pipeline_existing_scene_group,
+                    pipeline_output_group,
+                ],
+            )
+            pipeline_uploaded_event = uploaded_video.upload(
+                fn=_cache_uploaded_video_value,
+                inputs=[uploaded_video],
+                outputs=[uploaded_video_cached],
+            )
+            pipeline_run_event = run_pipeline_button.click(
+                fn=_run_pipeline_generator,
+                inputs=[
+                    pipeline_source_mode,
+                    uploaded_video_cached,
+                    existing_video_selection,
+                    existing_scene_root_selection,
+                    output_parent_selection,
+                    custom_scene_name,
+                    mode,
+                    renderer_choice,
+                    preprocess_overwrite,
+                    preprocess_max_frames,
+                    preprocess_max_stride,
+                    preprocess_image_ext,
+                    preprocess_model_name,
+                    preprocess_process_res,
+                    preprocess_process_res_method,
+                    preprocess_export_gs_video,
+                    preprocess_export_kinect_rgbd_video,
+                    preprocess_kinect_rgbd_video_fps,
+                    preprocess_use_ray_pose,
+                    preprocess_ref_view_strategy,
+                    alignment_num_frames,
+                    alignment_stride,
+                    alignment_offset,
+                    alignment_conf_profile,
+                    alignment_conf_percentile,
+                    conf_mask_sky,
+                    conf_mask_sky_depth_band,
+                    conf_sky_depth_band_percent,
+                    conf_mask_depth_edges,
+                    conf_edge_rtol,
+                    conf_edge_atol,
+                    conf_edge_kernel_size,
+                    conf_mask_max_depth,
+                    conf_max_depth_rtol,
+                    conf_max_depth_atol,
+                    stage1_use_roma_matching,
+                    stage1_roma_version,
+                    stage1_roma_model,
+                    stage1_roma_num_samples,
+                    stage1_roma_certainty_threshold,
+                    stage1_roma_max_references,
+                    stage1_roma_reference_sampling,
+                    stage1_roma_loss_weight,
+                    stage1_roma_max_corr_dist,
+                    stage1_knn_backend,
+                    stage1_tensorboard,
+                    stage1_max_corr_dist,
+                    stage1_merge_voxel_size,
+                    stage1_icp_n_iter,
+                    stage1_icp_early_stopping_patience,
+                    stage1_icp_early_stopping_min_iters,
+                    stage1_icp_early_stopping_min_delta,
+                    stage1_icp_lr,
+                    stage1_icp_method,
+                    stage1_icp_local_twist_reg,
+                    stage1_icp_tv_reg,
+                    stage1_icp_tv_voxel_size,
+                    stage1_icp_tv_every_k,
+                    stage1_icp_tv_sample_ratio,
+                    stage1_icp_color_icp_weight,
+                    stage1_icp_color_icp_max_color_dist,
+                    stage1_icp_color_icp_k,
+                    stage1_save_intermediate_every,
+                    stage1_deform_log2_hashmap_size,
+                    stage1_deform_num_levels,
+                    stage1_deform_n_neurons,
+                    stage1_deform_n_hidden_layers,
+                    stage1_deform_min_res,
+                    stage1_deform_max_res,
+                    stage1_filter_points,
+                    stage1_filter_geom_sigma,
+                    stage1_filter_color_sigma,
+                    stage1_filter_worst_pct,
+                    stage1_filter_min_frames,
+                    stage1_filter_base_percentile,
+                    stage2_tensorboard,
+                    stage2_knn_backend,
+                    stage2_loo_loss_weight,
+                    stage2_loo_k_neighbors,
+                    stage2_loo_max_corr_dist,
+                    stage2_loo_normal_k,
+                    stage2_loo_kdtree_rebuild_every,
+                    stage2_loo_max_pairs_per_iter,
+                    stage2_loo_pairs_per_src,
+                    stage2_deform_chunk_size,
+                    stage2_anchor_loss_weight,
+                    stage2_anchor_n_samples,
+                    stage2_tv_reg,
+                    stage2_tv_voxel_size,
+                    stage2_tv_every_k,
+                    stage2_tv_sample_ratio,
+                    stage2_loo_color_icp_weight,
+                    stage2_loo_color_icp_k,
+                    stage2_loo_color_icp_max_color_dist,
+                    stage2_thin_shell_weight,
+                    stage2_lr,
+                    stage2_n_iters,
+                    stage2_save_intermediate_every_n,
+                    stage31_tensorboard,
+                    stage31_knn_backend,
+                    inverse_epochs,
+                    stage31_batch_size,
+                    stage31_lr,
+                    stage31_cycle_weight,
+                    stage31_magnitude_weight,
+                    stage31_smoothness_weight,
+                    stage31_num_forward_samples,
+                    stage31_num_interp_samples,
+                    stage31_regenerate_every,
+                    stage31_view_embed_dim,
+                    stage31_min_res,
+                    stage31_max_res,
+                    stage31_num_levels,
+                    stage31_log2_hashmap_size,
+                    stage31_n_neurons,
+                    stage31_n_hidden_layers,
+                    stage31_save_validation_plys,
+                    gs_tensorboard,
+                    gs_num_iters,
+                    gs_sh_degree,
+                    gs_sh_increase_every,
+                    gs_sh_full_from_iter,
+                    gs_sh_freeze_means_when_full_sh,
+                    gs_sh_reg_weight,
+                    gs_target_num_points,
+                    gs_optimize_cams,
+                    gs_lr_cams,
+                    gs_optimize_positions,
+                    gs_lr_positions,
+                    gs_lr_colors,
+                    gs_lr_opacities,
+                    gs_lr_scales,
+                    gs_lr_quats,
+                    gs_lr_sh0,
+                    gs_lr_shn,
+                    gs_deform_inverse_rotations,
+                    gs_initial_opacity,
+                    gs_initial_scale,
+                    gs_initial_flat_ratio,
+                    gs_scale_init,
+                    gs_knn_neighbors,
+                    gs_normal_k,
+                    gs_l1_weight,
+                    gs_lpips_weight,
+                    gs_opacity_reg_weight,
+                    gs_scale_reg_weight,
+                    gs_normal_consistency_weight,
+                    gs_distortion_weight,
+                    gs_alpha_reg_weight,
+                    gs_frames_per_iter,
+                    gs_log_every,
+                    gs_save_every,
+                    gs_eval_every,
+                    gs_lr_decay,
+                    gs_auto_eval,
+                    dry_run,
+                ],
+                outputs=[
+                    pipeline_run_state,
+                    pipeline_status_md,
+                    pipeline_stage_text,
+                    pipeline_scene_root_text,
+                    pipeline_latest_run_dir_text,
+                    pipeline_scene_report_md,
+                    pipeline_primary_preview,
+                    pipeline_secondary_preview,
+                    pipeline_key_files,
+                    pipeline_live_log,
+                ],
+            )
+
+            stop_pipeline_button.click(
+                fn=_stop_active_run,
+                inputs=[pipeline_run_state],
+                outputs=[pipeline_stop_feedback, pipeline_run_state],
+            )
+
+        with gr.Tab("Run Explicit Stage"):
+            gr.Markdown(
+                "Run the native stage commands directly. Stage 0 starts from a video. Stages 1 through 3.2 follow the currently selected scene automatically."
+            )
+
+            with gr.Accordion("Stage 0 Source", open=True):
+                with gr.Row():
+                    stage0_source_mode = gr.Radio(
+                        choices=[
+                            ("Upload Video", "upload_video"),
+                            ("Existing Video", "existing_video"),
+                            ("Existing Image Folder", "existing_frames"),
+                        ],
+                        value="upload_video",
+                        label="Stage 0 Source Mode",
+                    )
+                with gr.Row():
+                    with gr.Group(visible=True) as stage0_upload_group:
+                        stage0_uploaded_video = gr.File(
+                            label="Upload Video",
+                            file_types=[".mp4", ".mov", ".avi", ".mkv"],
+                            type="filepath",
+                        )
+                        stage0_uploaded_video_cached = gr.State("")
+                    with gr.Group(visible=False) as stage0_existing_video_group:
+                        stage0_existing_video_selection = gr.Dropdown(
+                            label="Existing Video",
+                            choices=video_choices,
+                            value=default_video,
+                            info="Discovered under the videos workspace.",
+                        )
+                    with gr.Group(visible=False) as stage0_existing_frames_group:
+                        stage0_existing_frames_dir = gr.Textbox(
+                            label="Existing Image Folder",
+                            placeholder=r"Absolute or project-relative path to a folder of images",
+                            info="Stage 0 will use these images directly with `--frames_dir`.",
+                        )
+                with gr.Row():
+                    stage0_output_parent_selection = gr.Dropdown(
+                        label="Output Parent Directory",
+                        choices=output_parent_choices,
+                        value="",
+                        info="Leave on automatic unless you want a custom destination.",
+                    )
+                    stage0_custom_scene_name = gr.Textbox(
+                        label="Custom Scene Name",
+                        placeholder="Optional. If blank, the video filename is used.",
+                    )
+                with gr.Row():
+                    stage0_overwrite = gr.Checkbox(label="Overwrite Stage 0 Outputs", value=False)
+                    stage0_max_frames = gr.Number(
+                        label="DA3 Input Max Frames",
+                        value=DEFAULT_STAGE0_MAX_FRAMES,
+                        precision=0,
+                        info="Maximum raw video frames Stage 0 will send to DA3.",
+                    )
+                    stage0_max_stride = gr.Number(
+                        label="DA3 Input Max Stride",
+                        value=8,
+                        precision=0,
+                        info="Upper bound on raw-video frame spacing during Stage 0 subsampling.",
+                    )
+                    stage0_image_ext = gr.Textbox(label="Image Extension", value="png")
+                    stage0_model_name = gr.Textbox(label="DA3 Model Name", value="depth-anything/DA3NESTED-GIANT-LARGE")
+                    stage0_process_res = gr.Number(
+                        label="DA3 Processing Resolution",
+                        value=768,
+                        precision=0,
+                        info="Longest side is resized to this before DA3 runs. Higher = denser points, more VRAM. VRAM scales as (res/504)^2. Common: 504 (low), 768 (medium), 1024 (high).",
+                    )
+                with gr.Row():
+                    stage0_process_res_method = gr.Dropdown(
+                        choices=["upper_bound_resize", "upper_bound_crop"],
+                        value="upper_bound_resize",
+                        label="DA3 Resolution Method",
+                        info="Resize policy before DA3 inference.",
+                    )
+                    stage0_ref_view_strategy = gr.Dropdown(
+                        choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
+                        value="first",
+                        label="DA3 Reference View",
+                        info="Default is `first` for this project.",
+                    )
+                    stage0_export_gs_video = gr.Checkbox(
+                        label="Export DA3 GS Preview Video",
+                        value=False,
+                        info="Opt-in preview export. Leave off for a faster Stage 0.",
+                    )
+                    stage0_export_kinect_rgbd_video = gr.Checkbox(
+                        label="Export Kinect RGBD Video",
+                        value=False,
+                        info="Write a packed `[metadata|color|depth]` lossless video after Stage 0.",
+                    )
+                with gr.Row():
+                    stage0_kinect_rgbd_video_fps = gr.Number(
+                        label="Kinect RGBD Video FPS",
+                        value=30,
+                        precision=0,
+                        info="Frame rate used when assembling the packed Stage 0 RGBD video.",
+                    )
+                    stage0_use_ray_pose = gr.Checkbox(
+                        label="Use DA3 Ray Pose",
+                        value=False,
+                        info="Use ray-based pose estimation instead of the camera decoder.",
+                    )
+                    gr.Markdown(
+                        "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus `before_non_rigid_icp.ply`. "
+                        "Example: raw `500` frames with `DA3 Input Max Frames=30`, `DA3 Input Max Stride=8` usually gives about every 8th raw frame. "
+                        "Raw `5000` frames with those settings clamps to stride 8 and only covers the earlier part of the clip. "
+                        "If `Stage 0 Source Mode` is `Existing Image Folder`, the app first copies that folder into `videos/_gradio_uploads/<unique-folder>/`, then runs Stage 0 from the copied images and ignores `DA3 Input Max Frames` plus `DA3 Input Max Stride`. "
+                        "The optional DA3 GS preview video and packed Kinect-layout RGBD video are both skipped by default."
+                    )
+                gr.Markdown(
+                    "Reference-view note: this app now defaults DA3 to `first`. "
+                    "The original code path used DA3's default `saddle_balanced`."
+                )
+
+            with gr.Accordion("Existing Scene / Run", open=True):
+                with gr.Row():
+                    stage_scene_root_selection = gr.Dropdown(
+                        label="Existing Scene Root",
+                        choices=scene_choices,
+                        value=default_scene,
+                        info="Only scene roots with Stage 0 outputs are listed.",
+                    )
+                stage_scene_report_md = gr.Markdown()
+
+                with gr.Row():
+                    stage_scene_root_text = gr.Textbox(label="Resolved Scene Root", interactive=False)
+                    stage_selected_run_dir_text = gr.Textbox(label="Selected Run Directory", interactive=False)
+
+                stage_run_name = gr.Dropdown(choices=[], label="Prepared Stage 1 Run")
+
+            with gr.Accordion("Stage Parameters", open=False):
+                with gr.Accordion("Stage 0 Pre-ICP Filtering", open=False):
+                    with gr.Row():
+                        stage1_num_frames = gr.Number(
+                            label="Prep Num Frames",
+                            value=50,
+                            precision=0,
+                            info="Maximum number of Stage 0 frames to prepare for the non-rigid ICP stage.",
+                        )
+                        stage1_stride = gr.Number(
+                            label="Prep Stride",
+                            value=1,
+                            precision=0,
+                            info="Stride over the Stage 0 frame set, not over the raw video.",
+                        )
+                        stage1_offset = gr.Number(label="Prep Offset", value=0, precision=0)
+                    gr.Markdown(
+                        "Stage 0 applies `Prep Stride` first over the DA3 frame set, then truncates to `Prep Num Frames` when preparing the pre-ICP caches. "
+                        "Example: if Stage 0 produced `100` DA3 frames, then `Prep Stride=3`, `Prep Num Frames=20` takes frames `0, 3, 6, ...` and stops after 20 selected frames."
+                    )
+                    with gr.Row():
+                        stage1_conf_profile = gr.Dropdown(
+                            choices=[
+                                ("Default Mixed (voxel + DA3)", "default_mixed"),
+                                ("DA3 Only (Per Frame)", "da3_per_frame"),
+                                ("DA3 Only (Global)", "da3_global"),
+                                ("DA3 Only (Per Frame Guided)", "da3_per_frame_guided"),
+                            ],
+                            value="default_mixed",
+                            label="Confidence Mode",
+                        )
+                        stage1_conf_percentile = gr.Number(label="DA3 Confidence Percentile", value=1.0)
+                        stage1_knn_backend = gr.Dropdown(choices=["cpu_kdtree", "gpu_kdtree"], value="cpu_kdtree", label="KNN Backend")
+                    with gr.Row():
+                        stage1_conf_mask_sky = gr.Checkbox(
+                            label="Use DA3 Sky Mask",
+                            value=True,
+                            info="Requires Stage 0 sky output. Excludes DA3 sky pixels before point-cloud generation.",
+                        )
+                        stage1_conf_mask_sky_depth_band = gr.Checkbox(
+                            label="Expand Sky By Depth Band",
+                            value=True,
+                            info="After sky masking, also drop pixels in the top x% depth band of the sky depth plateau.",
+                        )
+                        stage1_conf_sky_depth_band_percent = gr.Number(label="Sky Depth Band Percent", value=50.0)
+                        stage1_conf_mask_depth_edges = gr.Checkbox(label="Suppress Depth Edges", value=True)
+                        stage1_conf_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.03)
+                        stage1_conf_edge_atol = gr.Number(label="Depth Edge Abs Threshold", value=None)
+                        stage1_conf_edge_kernel_size = gr.Number(label="Depth Edge Kernel", value=3, precision=0)
+                    with gr.Row():
+                        stage1_conf_mask_max_depth = gr.Checkbox(label="Suppress Max DA3 Depth Plateau", value=False)
+                        stage1_conf_max_depth_rtol = gr.Number(label="Max Depth Rel Threshold", value=0.001)
+                        stage1_conf_max_depth_atol = gr.Number(label="Max Depth Abs Threshold", value=None)
+                    gr.Markdown(
+                        "If `Use DA3 Sky Mask` is enabled, Stage 0 prep also writes debug PNGs under "
+                        "`exports/ply/<active-filter>/debug_masks/{sky,kept}/` so you can inspect the raw DA3 sky mask and the final kept-pixel mask."
+                    )
+                    gr.Markdown(
+                        "`Expand Sky By Depth Band` uses the masked sky depth plateau as a reference and removes any pixel within the top `x%` of that depth range."
+                    )
+                with gr.Accordion("Stage 1 RoMa Matching", open=False):
+                    gr.Markdown("RoMa is the cross-frame matcher used to add correspondence constraints during Stage 1.")
+                    with gr.Row():
+                        stage1_use_roma_matching = gr.Checkbox(label="Use RoMa Matching", value=True)
+                        stage1_roma_version = gr.Dropdown(choices=["v2", "v1"], value="v2", label="RoMa Version")
+                        stage1_roma_model = gr.Dropdown(choices=["indoor", "outdoor", "tiny"], value="outdoor", label="RoMa Model")
+                    with gr.Row():
+                        stage1_roma_num_samples = gr.Number(label="RoMa Samples Per Pair", value=5000, precision=0)
+                        stage1_roma_certainty_threshold = gr.Number(label="RoMa Certainty Threshold", value=0.5)
+                        stage1_roma_max_references = gr.Number(label="RoMa Max References", value=20, precision=0)
+                    with gr.Row():
+                        stage1_roma_reference_sampling = gr.Dropdown(choices=["recent_and_strided", "recent", "strided", "all_previous"], value="recent_and_strided", label="RoMa Reference Sampling")
+                        stage1_roma_loss_weight = gr.Number(label="RoMa Loss Weight", value=1.0)
+                        stage1_roma_max_corr_dist = gr.Number(label="RoMa Max Corr Dist", value=1.0)
+                with gr.Accordion("Stage 1 ICP / Deformation", open=False):
+                    with gr.Row():
+                        stage1_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        stage1_max_corr_dist = gr.Number(label="Max Corr Dist", value=0.03)
+                        stage1_merge_voxel_size = gr.Number(
+                            label="Merge Voxel Size",
+                            value=0.001,
+                            info="Voxel grid size for spatial dedup when merging frame points into the model. Smaller = denser clouds. Pi-Long uses 0.001, original default was 0.05.",
+                        )
+                        stage1_icp_n_iter = gr.Number(label="ICP Iterations", value=100, precision=0)
+                        stage1_icp_method = gr.Dropdown(choices=["point2plane", "point2point"], value="point2plane", label="ICP Method")
+                    with gr.Row():
+                        stage1_icp_early_stopping_patience = gr.Number(label="Early Stop Patience", value=5, precision=0)
+                        stage1_icp_early_stopping_min_iters = gr.Number(label="Early Stop Min Iters", value=25, precision=0)
+                        stage1_icp_early_stopping_min_delta = gr.Number(label="Early Stop Min Delta", value=None)
+                        stage1_icp_lr = gr.Number(label="ICP LR", value=1e-3)
+                    with gr.Row():
+                        stage1_icp_local_twist_reg = gr.Number(label="Local Twist Reg", value=0.0)
+                        stage1_icp_tv_reg = gr.Number(label="TV Reg", value=50.0)
+                        stage1_icp_tv_voxel_size = gr.Number(label="TV Voxel Size", value=0.01)
+                        stage1_icp_tv_every_k = gr.Number(label="TV Every K", value=1, precision=0)
+                        stage1_icp_tv_sample_ratio = gr.Number(label="TV Sample Ratio", value=0.1)
+                    with gr.Row():
+                        stage1_icp_color_icp_weight = gr.Number(label="Color ICP Weight", value=0.02)
+                        stage1_icp_color_icp_max_color_dist = gr.Number(label="Color ICP Max Color Dist", value=0.1)
+                        stage1_icp_color_icp_k = gr.Number(label="Color ICP K", value=10, precision=0)
+                        stage1_save_intermediate_every = gr.Number(label="Save Intermediate Every", value=10, precision=0)
+                    with gr.Row():
+                        stage1_deform_log2_hashmap_size = gr.Number(label="Deform Log2 Hashmap", value=19, precision=0)
+                        stage1_deform_num_levels = gr.Number(label="Deform Num Levels", value=24, precision=0)
+                        stage1_deform_n_neurons = gr.Number(label="Deform Neurons", value=64, precision=0)
+                        stage1_deform_n_hidden_layers = gr.Number(label="Deform Hidden Layers", value=4, precision=0)
+                        stage1_deform_min_res = gr.Number(label="Deform Min Res", value=16, precision=0)
+                        stage1_deform_max_res = gr.Number(label="Deform Max Res", value=2048, precision=0)
+                with gr.Accordion("Stage 1 Point Filtering", open=False):
+                    with gr.Row():
+                        stage1_filter_points = gr.Checkbox(label="Filter Points", value=False)
+                        stage1_filter_geom_sigma = gr.Number(label="Geom Sigma", value=2.5)
+                        stage1_filter_color_sigma = gr.Number(label="Color Sigma", value=1.5)
+                        stage1_filter_worst_pct = gr.Number(label="Worst Percent", value=0.2)
+                        stage1_filter_min_frames = gr.Number(label="Min Frames", value=2, precision=0)
+                        stage1_filter_base_percentile = gr.Dropdown(choices=["p75", "p90", "p95", "p99"], value="p75", label="Base Percentile")
+                with gr.Accordion("Stage 2", open=False):
+                    with gr.Row():
+                        stage2_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        stage2_knn_backend = gr.Dropdown(choices=["cpu_kdtree", "gpu_kdtree"], value="cpu_kdtree", label="KNN Backend")
+                        stage2_n_iters = gr.Number(label="Iterations", value=150, precision=0)
+                        stage2_lr = gr.Number(label="LR", value=1e-3)
+                    with gr.Row():
+                        stage2_loo_loss_weight = gr.Number(label="LOO Loss Weight", value=1.0)
+                        stage2_loo_k_neighbors = gr.Number(label="LOO K Neighbors", value=5, precision=0)
+                        stage2_loo_max_corr_dist = gr.Number(label="LOO Max Corr Dist", value=0.03125)
+                        stage2_loo_normal_k = gr.Number(label="LOO Normal K", value=20, precision=0)
+                        stage2_loo_kdtree_rebuild_every = gr.Number(label="KDT Rebuild Every", value=50, precision=0)
+                    with gr.Row():
+                        stage2_loo_max_pairs_per_iter = gr.Number(label="Max Pairs Per Iter", value=200000, precision=0)
+                        stage2_loo_pairs_per_src = gr.Number(label="Pairs Per Src", value=1, precision=0)
+                        stage2_deform_chunk_size = gr.Number(label="Deform Chunk Size", value=50000, precision=0)
+                        stage2_anchor_loss_weight = gr.Number(label="Anchor Loss Weight", value=1000.0)
+                        stage2_anchor_n_samples = gr.Number(label="Anchor Samples", value=4096, precision=0)
+                    with gr.Row():
+                        stage2_tv_reg = gr.Number(label="TV Reg", value=50.0)
+                        stage2_tv_voxel_size = gr.Number(label="TV Voxel Size", value=0.01)
+                        stage2_tv_every_k = gr.Number(label="TV Every K", value=1, precision=0)
+                        stage2_tv_sample_ratio = gr.Number(label="TV Sample Ratio", value=0.1)
+                        stage2_loo_color_icp_weight = gr.Number(label="Color ICP Weight", value=0.02)
+                        stage2_loo_color_icp_k = gr.Number(label="Color ICP K", value=10, precision=0)
+                    with gr.Row():
+                        stage2_loo_color_icp_max_color_dist = gr.Number(label="Color ICP Max Color Dist", value=0.1)
+                        stage2_thin_shell_weight = gr.Number(label="Thin Shell Weight", value=1000.0)
+                        stage2_save_intermediate_every_n = gr.Number(label="Save Intermediate Every", value=50, precision=0)
+                with gr.Accordion("Stage 3.1", open=False):
+                    with gr.Row():
+                        stage31_checkpoint_subdir = gr.Dropdown(choices=[], label="Checkpoint Input")
+                        stage31_epochs = gr.Number(label="Epoch Override", value=None, precision=0)
+                        stage31_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        stage31_knn_backend = gr.Dropdown(choices=["cpu_kdtree", "gpu_kdtree"], value="cpu_kdtree", label="KNN Backend")
+                    with gr.Row():
+                        stage31_batch_size = gr.Number(label="Batch Size", value=8192, precision=0)
+                        stage31_lr = gr.Number(label="LR", value=1e-3)
+                        stage31_cycle_weight = gr.Number(label="Cycle Weight", value=0.1)
+                        stage31_magnitude_weight = gr.Number(label="Magnitude Weight", value=1e-3)
+                        stage31_smoothness_weight = gr.Number(label="Smoothness Weight", value=1e-3)
+                    with gr.Row():
+                        stage31_num_forward_samples = gr.Number(label="Forward Samples", value=10000, precision=0)
+                        stage31_num_interp_samples = gr.Number(label="Interp Samples", value=5000, precision=0)
+                        stage31_regenerate_every = gr.Number(label="Regenerate Every", value=10, precision=0)
+                        stage31_view_embed_dim = gr.Number(label="View Embed Dim", value=32, precision=0)
+                        stage31_min_res = gr.Number(label="Min Res", value=16, precision=0)
+                        stage31_max_res = gr.Number(label="Max Res", value=2048, precision=0)
+                    with gr.Row():
+                        stage31_num_levels = gr.Number(label="Num Levels", value=16, precision=0)
+                        stage31_log2_hashmap_size = gr.Number(label="Log2 Hashmap", value=19, precision=0)
+                        stage31_n_neurons = gr.Number(label="Neurons", value=64, precision=0)
+                        stage31_n_hidden_layers = gr.Number(label="Hidden Layers", value=3, precision=0)
+                        stage31_save_validation_plys = gr.Checkbox(label="Save Validation PLYs", value=True)
+                with gr.Accordion("Stage 3.2", open=False):
+                    with gr.Row():
+                        stage32_checkpoint_subdir = gr.Dropdown(choices=[], label="Checkpoint Input")
+                        stage32_inverse_dir_name = gr.Dropdown(choices=[], label="Inverse Deformation Dir")
+                        stage32_renderer = gr.Dropdown(choices=["2dgs", "3dgs"], value="3dgs", label="Renderer")
+                        stage32_num_iters = gr.Number(label="Iter Override", value=None, precision=0)
+                    with gr.Row():
+                        gs_tensorboard = gr.Checkbox(label="TensorBoard", value=True)
+                        gs_target_num_points = gr.Number(label="Target Num Points", value=4000000, precision=0)
+                        gs_frames_per_iter = gr.Number(label="Frames Per Iter", value=1, precision=0)
+                        gs_sh_degree = gr.Number(label="SH Degree", value=3, precision=0)
+                        gs_sh_increase_every = gr.Number(label="SH Increase Every", value=0, precision=0)
+                        gs_sh_full_from_iter = gr.Number(label="SH Full From Iter", value=5000, precision=0)
+                    with gr.Row():
+                        gs_sh_freeze_means_when_full_sh = gr.Checkbox(label="Freeze Means When Full SH", value=True)
+                        gs_sh_reg_weight = gr.Number(label="SH Reg Weight", value=10.0)
+                        gs_optimize_cams = gr.Checkbox(label="Optimize Cams", value=True)
+                        gs_lr_cams = gr.Number(label="LR Cams", value=1e-4)
+                        gs_optimize_positions = gr.Checkbox(label="Optimize Positions", value=True)
+                        gs_lr_positions = gr.Number(label="LR Positions", value=1e-5)
+                    with gr.Row():
+                        gs_lr_colors = gr.Number(label="LR Colors", value=2.5e-3)
+                        gs_lr_opacities = gr.Number(label="LR Opacities", value=5e-2)
+                        gs_lr_scales = gr.Number(label="LR Scales", value=5e-3)
+                        gs_lr_quats = gr.Number(label="LR Quats", value=1e-3)
+                        gs_lr_sh0 = gr.Number(label="LR SH0", value=2.5e-3)
+                        gs_lr_shn = gr.Number(label="LR SHN", value=2.5e-3 / 20.0)
+                    with gr.Row():
+                        gs_deform_inverse_rotations = gr.Checkbox(label="Deform Inverse Rotations", value=True)
+                        gs_initial_opacity = gr.Number(label="Initial Opacity", value=0.5)
+                        gs_initial_scale = gr.Number(label="Initial Scale", value=0.005)
+                        gs_initial_flat_ratio = gr.Number(label="Initial Flat Ratio", value=0.1)
+                        gs_scale_init = gr.Dropdown(choices=["knn", "fixed"], value="knn", label="Scale Init")
+                        gs_knn_neighbors = gr.Number(label="KNN Neighbors", value=4, precision=0)
+                        gs_normal_k = gr.Number(label="Normal K", value=20, precision=0)
+                    with gr.Row():
+                        gs_l1_weight = gr.Number(label="L1 Weight", value=0.8)
+                        gs_lpips_weight = gr.Number(label="LPIPS Weight", value=0.2)
+                        gs_opacity_reg_weight = gr.Number(label="Opacity Reg Weight", value=0.0)
+                        gs_scale_reg_weight = gr.Number(label="Scale Reg Weight", value=0.0)
+                        gs_normal_consistency_weight = gr.Number(label="Normal Consistency Weight", value=0.05)
+                    with gr.Row():
+                        gs_distortion_weight = gr.Number(label="Distortion Weight", value=0.01)
+                        gs_alpha_reg_weight = gr.Number(label="Alpha Reg Weight", value=0.0)
+                        gs_log_every = gr.Number(label="Log Every", value=50, precision=0)
+                        gs_save_every = gr.Number(label="Save Every", value=5000, precision=0)
+                        gs_eval_every = gr.Number(label="Eval Every", value=1000, precision=0)
+                        gs_lr_decay = gr.Number(label="LR Decay", value=0.1)
+                        gs_auto_eval = gr.Checkbox(label="Auto Eval", value=True)
+                stage32_original_images_dir = gr.Textbox(
+                    label="Stage 3.2 Original Images Dir",
+                    interactive=False,
+                    placeholder="Auto-resolved from <scene_root>/frames_subsampled when present.",
+                )
+
+            stage_button_guide_md = gr.Markdown(
+                "\n".join(
+                    [
+                        "**Stage Guide**",
+                        "- `Stage 0`: extract frames, run DA3 preprocessing, build the filtered point-cloud cache, and write `before_non_rigid_icp.ply`.",
+                        "- `Stage 1`: run non-rigid ICP on the prepared Stage 0 inputs and write `after_non_rigid_icp`.",
+                        "- `Stage 2`: jointly refine that run into `after_global_optimization`.",
+                        "- `Stage 3.1`: train the inverse deformation model from the selected checkpoint.",
+                        "- `Stage 3.2`: train the Gaussian splat from the selected checkpoint plus inverse deformation output.",
+                    ]
+                )
+            )
+            stage_next_step_md = gr.Markdown(
+                "**Recommended Next Step**: `Stage 0`\n\nStart from a video to create the scene root, DA3 outputs, filtered point-cloud cache, and pre-ICP merge."
+            )
+
+            with gr.Row():
+                run_stage0_button = gr.Button("Run Stage 0", variant="primary")
+                run_stage1_button = gr.Button("Run Stage 1")
+                run_stage2_button = gr.Button("Run Stage 2")
+                run_stage31_button = gr.Button("Run Stage 3.1")
+                run_stage32_button = gr.Button("Run Stage 3.2")
+                stop_stage_button = gr.Button("Stop Active Run", variant="stop")
+            with gr.Row():
+                export_div_button = gr.Button("Export Depth Volume", variant="secondary")
+                export_divstream_button = gr.Button("Export DirectStorage Stream", variant="secondary")
+                export_packed_sequence_button = gr.Button("Export Packed Frame Sequence", variant="secondary")
+                export_packed_sequence_depth8_button = gr.Button("Export Packed Frame Sequence (8-bit Depth)", variant="secondary")
+                export_ply_button = gr.Button("Export PLY", variant="secondary")
+
+            with gr.Accordion("PLY Export Settings", open=False):
+                with gr.Row():
+                    ply_checkpoint_source = gr.Dropdown(
+                        choices=["auto", "after_global_optimization", "after_non_rigid_icp"],
+                        value="auto",
+                        label="Source Checkpoint",
+                        info="Which aligned_points.ply to use. 'auto' prefers Stage 2 if available, else Stage 1.",
+                    )
+                    ply_filename = gr.Textbox(label="Output Filename", value="export_cloud.ply")
+                with gr.Row():
+                    ply_dedup_enable = gr.Checkbox(label="Voxel Dedup", value=True)
+                    ply_dedup_radius = gr.Number(label="Dedup Radius", value=0.001, info="Voxel grid size. Smaller = denser. Pi-Long default is 0.001.")
+                    ply_normals_k = gr.Number(label="Normals K", value=16, precision=0, info="Number of neighbors for PCA normal estimation.")
+                    ply_chunk_size = gr.Number(label="Chunk Size", value=50000, precision=0, info="Points processed per batch during normal estimation.")
+                    depth_volume_resolution_scale = gr.Dropdown(
+                        choices=["1", "2", "4"],
+                        value="1",
+                        label="Depth Volume Scale",
+                        info="Scales export resolution and intrinsics. Higher reduces pixel rounding and collisions.",
+                    )
+
+            stage_stop_feedback = gr.Markdown()
+            stage_status_md = gr.Markdown()
+
+            with gr.Row():
+                stage_live_stage = gr.Textbox(label="Current Stage", interactive=False)
+                stage_live_scene_root = gr.Textbox(label="Resolved Scene Root", interactive=False)
+                stage_live_latest_run_dir = gr.Textbox(label="Latest Run Dir", interactive=False)
+
+            with gr.Row():
+                stage_primary_preview = gr.Video(label="Primary Preview", interactive=False)
+                stage_secondary_preview = gr.Video(label="Secondary Preview", interactive=False)
+
+            stage_key_files = gr.Files(label="Key Files")
+            stage_live_log = gr.Textbox(label="Live Log", lines=24, interactive=False)
+
+            stage0_source_mode.change(
+                fn=_update_stage0_source_mode,
+                inputs=[stage0_source_mode],
+                outputs=[stage0_upload_group, stage0_existing_video_group, stage0_existing_frames_group],
+            )
+            stage0_uploaded_event = stage0_uploaded_video.upload(
+                fn=_cache_uploaded_video_value,
+                inputs=[stage0_uploaded_video],
+                outputs=[stage0_uploaded_video_cached],
+            )
+            stage_scene_inputs = [
+                stage0_source_mode,
+                stage0_uploaded_video_cached,
+                stage0_existing_video_selection,
+                stage0_existing_frames_dir,
+                stage0_output_parent_selection,
+                stage0_custom_scene_name,
+                stage0_overwrite,
+                stage0_max_frames,
+                stage0_max_stride,
+                stage0_image_ext,
+                stage0_model_name,
+                stage0_process_res,
+                stage0_process_res_method,
+                stage0_export_gs_video,
+                stage0_export_kinect_rgbd_video,
+                stage0_kinect_rgbd_video_fps,
+                stage0_use_ray_pose,
+                stage0_ref_view_strategy,
+                stage_scene_root_selection,
+                stage_run_name,
+                stage1_num_frames,
+                stage1_stride,
+                stage1_offset,
+                stage1_conf_profile,
+                stage1_conf_percentile,
+                stage1_conf_mask_sky,
+                stage1_conf_mask_sky_depth_band,
+                stage1_conf_sky_depth_band_percent,
+                stage1_conf_mask_depth_edges,
+                stage1_conf_edge_rtol,
+                stage1_conf_edge_atol,
+                stage1_conf_edge_kernel_size,
+                stage1_conf_mask_max_depth,
+                stage1_conf_max_depth_rtol,
+                stage1_conf_max_depth_atol,
+                stage1_use_roma_matching,
+                stage1_roma_version,
+                stage1_roma_model,
+                stage1_roma_num_samples,
+                stage1_roma_certainty_threshold,
+                stage1_roma_max_references,
+                stage1_roma_reference_sampling,
+                stage1_roma_loss_weight,
+                stage1_roma_max_corr_dist,
+                stage1_knn_backend,
+                stage1_tensorboard,
+                stage1_max_corr_dist,
+                stage1_merge_voxel_size,
+                stage1_icp_n_iter,
+                stage1_icp_early_stopping_patience,
+                stage1_icp_early_stopping_min_iters,
+                stage1_icp_early_stopping_min_delta,
+                stage1_icp_lr,
+                stage1_icp_method,
+                stage1_icp_local_twist_reg,
+                stage1_icp_tv_reg,
+                stage1_icp_tv_voxel_size,
+                stage1_icp_tv_every_k,
+                stage1_icp_tv_sample_ratio,
+                stage1_icp_color_icp_weight,
+                stage1_icp_color_icp_max_color_dist,
+                stage1_icp_color_icp_k,
+                stage1_save_intermediate_every,
+                stage1_deform_log2_hashmap_size,
+                stage1_deform_num_levels,
+                stage1_deform_n_neurons,
+                stage1_deform_n_hidden_layers,
+                stage1_deform_min_res,
+                stage1_deform_max_res,
+                stage1_filter_points,
+                stage1_filter_geom_sigma,
+                stage1_filter_color_sigma,
+                stage1_filter_worst_pct,
+                stage1_filter_min_frames,
+                stage1_filter_base_percentile,
+                stage2_tensorboard,
+                stage2_knn_backend,
+                stage2_loo_loss_weight,
+                stage2_loo_k_neighbors,
+                stage2_loo_max_corr_dist,
+                stage2_loo_normal_k,
+                stage2_loo_kdtree_rebuild_every,
+                stage2_loo_max_pairs_per_iter,
+                stage2_loo_pairs_per_src,
+                stage2_deform_chunk_size,
+                stage2_anchor_loss_weight,
+                stage2_anchor_n_samples,
+                stage2_tv_reg,
+                stage2_tv_voxel_size,
+                stage2_tv_every_k,
+                stage2_tv_sample_ratio,
+                stage2_loo_color_icp_weight,
+                stage2_loo_color_icp_k,
+                stage2_loo_color_icp_max_color_dist,
+                stage2_thin_shell_weight,
+                stage2_lr,
+                stage2_n_iters,
+                stage2_save_intermediate_every_n,
+                stage31_checkpoint_subdir,
+                stage31_epochs,
+                stage31_tensorboard,
+                stage31_knn_backend,
+                stage31_batch_size,
+                stage31_lr,
+                stage31_cycle_weight,
+                stage31_magnitude_weight,
+                stage31_smoothness_weight,
+                stage31_num_forward_samples,
+                stage31_num_interp_samples,
+                stage31_regenerate_every,
+                stage31_view_embed_dim,
+                stage31_min_res,
+                stage31_max_res,
+                stage31_num_levels,
+                stage31_log2_hashmap_size,
+                stage31_n_neurons,
+                stage31_n_hidden_layers,
+                stage31_save_validation_plys,
+                stage32_checkpoint_subdir,
+                stage32_inverse_dir_name,
+                stage32_renderer,
+                stage32_num_iters,
+                gs_tensorboard,
+                gs_sh_degree,
+                gs_sh_increase_every,
+                gs_sh_full_from_iter,
+                gs_sh_freeze_means_when_full_sh,
+                gs_sh_reg_weight,
+                gs_target_num_points,
+                gs_optimize_cams,
+                gs_lr_cams,
+                gs_optimize_positions,
+                gs_lr_positions,
+                gs_lr_colors,
+                gs_lr_opacities,
+                gs_lr_scales,
+                gs_lr_quats,
+                gs_lr_sh0,
+                gs_lr_shn,
+                gs_deform_inverse_rotations,
+                gs_initial_opacity,
+                gs_initial_scale,
+                gs_initial_flat_ratio,
+                gs_scale_init,
+                gs_knn_neighbors,
+                gs_normal_k,
+                gs_l1_weight,
+                gs_lpips_weight,
+                gs_opacity_reg_weight,
+                gs_scale_reg_weight,
+                gs_normal_consistency_weight,
+                gs_distortion_weight,
+                gs_alpha_reg_weight,
+                gs_frames_per_iter,
+                gs_log_every,
+                gs_save_every,
+                gs_eval_every,
+                gs_lr_decay,
+                gs_auto_eval,
+            ]
+            stage_scene_outputs = [
+                stage_run_state,
+                stage_status_md,
+                stage_live_stage,
+                stage_live_scene_root,
+                stage_live_latest_run_dir,
+                stage_scene_report_md,
+                stage_primary_preview,
+                stage_secondary_preview,
+                stage_key_files,
+                stage_live_log,
+            ]
+
+            stage0_run_event = run_stage0_button.click(
+                fn=partial(_run_stage_generator, "stage0"),
+                inputs=stage_scene_inputs,
+                outputs=stage_scene_outputs,
+            )
+            stage1_run_event = run_stage1_button.click(
+                fn=partial(_run_stage_generator, "stage1"),
+                inputs=stage_scene_inputs,
+                outputs=stage_scene_outputs,
+            )
+            stage2_run_event = run_stage2_button.click(
+                fn=partial(_run_stage_generator, "stage2"),
+                inputs=stage_scene_inputs,
+                outputs=stage_scene_outputs,
+            )
+            stage31_run_event = run_stage31_button.click(
+                fn=partial(_run_stage_generator, "stage31"),
+                inputs=stage_scene_inputs,
+                outputs=stage_scene_outputs,
+            )
+            stage32_run_event = run_stage32_button.click(
+                fn=partial(_run_stage_generator, "stage32"),
+                inputs=stage_scene_inputs,
+                outputs=stage_scene_outputs,
+            )
+
+            stop_stage_button.click(
+                fn=_stop_active_run,
+                inputs=[stage_run_state],
+                outputs=[stage_stop_feedback, stage_run_state],
+            )
+
+            export_div_button.click(
+                fn=_export_depth_volume,
+                inputs=[
+                    stage_scene_root_selection,
+                    stage_run_name,
+                    ply_dedup_enable,
+                    ply_dedup_radius,
+                    ply_normals_k,
+                    ply_chunk_size,
+                    depth_volume_resolution_scale,
+                ],
+                outputs=[stage_status_md],
+            )
+
+            export_packed_sequence_button.click(
+                fn=_export_packed_frame_sequence,
+                inputs=[
+                    stage_scene_root_selection,
+                    stage0_kinect_rgbd_video_fps,
+                ],
+                outputs=[stage_status_md],
+            )
+
+            export_divstream_button.click(
+                fn=_export_directstorage_stream,
+                inputs=[
+                    stage_scene_root_selection,
+                    stage0_kinect_rgbd_video_fps,
+                ],
+                outputs=[stage_status_md],
+            )
+
+            export_packed_sequence_depth8_button.click(
+                fn=_export_packed_frame_sequence_depth8,
+                inputs=[
+                    stage_scene_root_selection,
+                    stage0_kinect_rgbd_video_fps,
+                ],
+                outputs=[stage_status_md],
+            )
+
+            export_ply_button.click(
+                fn=_export_ply_with_normals,
+                inputs=[
+                    stage_scene_root_selection,
+                    stage_run_name,
+                    ply_checkpoint_source,
+                    ply_filename,
+                    ply_dedup_enable,
+                    ply_dedup_radius,
+                    ply_normals_k,
+                    ply_chunk_size,
+                ],
+                outputs=[stage_status_md],
+            )
+
+            stage_reset_outputs = [
+                stage_scene_root_selection,
+                stage_scene_report_md,
+                stage_scene_root_text,
+                stage_run_name,
+                stage_selected_run_dir_text,
+                stage31_checkpoint_subdir,
+                stage32_checkpoint_subdir,
+                stage32_inverse_dir_name,
+                stage32_original_images_dir,
+                stage_next_step_md,
+                run_stage0_button,
+                run_stage1_button,
+                run_stage2_button,
+                run_stage31_button,
+                run_stage32_button,
+            ]
+
+            scene_choice_outputs = [
+                stage_scene_report_md,
+                stage_scene_root_text,
+                stage_run_name,
+                stage_selected_run_dir_text,
+                stage31_checkpoint_subdir,
+                stage32_checkpoint_subdir,
+                stage32_inverse_dir_name,
+                stage32_original_images_dir,
+                stage_next_step_md,
+                run_stage0_button,
+                run_stage1_button,
+                run_stage2_button,
+                run_stage31_button,
+                run_stage32_button,
+            ]
+
+            stage_scene_root_selection.change(
+                fn=_refresh_stage_scene,
+                inputs=[stage_scene_root_selection],
+                outputs=scene_choice_outputs,
+            )
+            stage0_source_mode.change(
+                fn=_reset_stage_panel_for_new_source,
+                inputs=[stage0_source_mode, stage0_uploaded_video_cached, stage0_existing_video_selection, stage0_existing_frames_dir],
+                outputs=stage_reset_outputs,
+            )
+            stage0_existing_video_selection.change(
+                fn=_reset_stage_panel_for_new_source,
+                inputs=[stage0_source_mode, stage0_uploaded_video_cached, stage0_existing_video_selection, stage0_existing_frames_dir],
+                outputs=stage_reset_outputs,
+            )
+            stage0_existing_frames_dir.change(
+                fn=_reset_stage_panel_for_new_source,
+                inputs=[stage0_source_mode, stage0_uploaded_video_cached, stage0_existing_video_selection, stage0_existing_frames_dir],
+                outputs=stage_reset_outputs,
+            )
+            stage_run_name.change(
+                fn=_refresh_stage_run,
+                inputs=[stage_scene_root_selection, stage_run_name],
+                outputs=[
+                    stage_selected_run_dir_text,
+                    stage31_checkpoint_subdir,
+                    stage32_checkpoint_subdir,
+                    stage32_inverse_dir_name,
+                    stage32_original_images_dir,
+                    stage_scene_report_md,
+                    stage_next_step_md,
+                    run_stage0_button,
+                    run_stage1_button,
+                    run_stage2_button,
+                    run_stage31_button,
+                    run_stage32_button,
+                ],
+            )
+
+        with gr.Tab("Inspect Existing Scene"):
+            with gr.Row():
+                inspect_scene_root_selection = gr.Dropdown(
+                    label="Existing Scene Root",
+                    choices=scene_choices,
+                    value=default_scene,
+                    info="Only scene roots with Stage 0 outputs are listed.",
+                )
+            inspect_report_md = gr.Markdown()
+
+            with gr.Row():
+                inspect_scene_root_out = gr.Textbox(label="Resolved Scene Root", interactive=False)
+                inspect_latest_run_out = gr.Textbox(label="Latest Run Dir", interactive=False)
+
+            with gr.Row():
+                inspect_primary_preview = gr.Video(label="Primary Preview", interactive=False)
+                inspect_secondary_preview = gr.Video(label="Secondary Preview", interactive=False)
+
+            inspect_key_files = gr.Files(label="Key Files")
+            inspect_notes = gr.Textbox(
+                label="Notes",
+                lines=2,
+                interactive=False,
+                value="This tab summarizes existing outputs. Live logs are shown on the pipeline and stage tabs.",
+            )
+
+            inspect_scene_root_selection.change(
+                fn=_inspect_existing_scene,
+                inputs=[inspect_scene_root_selection],
+                outputs=[
+                    inspect_report_md,
+                    inspect_scene_root_out,
+                    inspect_latest_run_out,
+                    inspect_primary_preview,
+                    inspect_secondary_preview,
+                    inspect_key_files,
+                    inspect_notes,
+                ],
+            )
+
+            auto_sync_outputs = [
+                existing_video_selection,
+                existing_scene_root_selection,
+                output_parent_selection,
+                stage0_existing_video_selection,
+                stage0_output_parent_selection,
+                stage_scene_root_selection,
+                inspect_scene_root_selection,
+                stage_scene_report_md,
+                stage_scene_root_text,
+                stage_run_name,
+                stage_selected_run_dir_text,
+                stage31_checkpoint_subdir,
+                stage32_checkpoint_subdir,
+                stage32_inverse_dir_name,
+                stage32_original_images_dir,
+                stage_next_step_md,
+                run_stage0_button,
+                run_stage1_button,
+                run_stage2_button,
+                run_stage31_button,
+                run_stage32_button,
+                inspect_report_md,
+                inspect_scene_root_out,
+                inspect_latest_run_out,
+                inspect_primary_preview,
+                inspect_secondary_preview,
+                inspect_key_files,
+                inspect_notes,
+            ]
+
+            pipeline_sync_inputs = [
+                pipeline_scene_root_text,
+                existing_video_selection,
+                existing_scene_root_selection,
+                output_parent_selection,
+                stage0_existing_video_selection,
+                stage0_output_parent_selection,
+                stage_scene_root_selection,
+                inspect_scene_root_selection,
+            ]
+            stage_sync_inputs = [
+                stage_live_scene_root,
+                existing_video_selection,
+                existing_scene_root_selection,
+                output_parent_selection,
+                stage0_existing_video_selection,
+                stage0_output_parent_selection,
+                stage_scene_root_selection,
+                inspect_scene_root_selection,
+            ]
+
+            demo.load(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=pipeline_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            pipeline_uploaded_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=pipeline_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage0_uploaded_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            ).then(
+                fn=_reset_stage_panel_for_new_source,
+                inputs=[stage0_source_mode, stage0_uploaded_video_cached, stage0_existing_video_selection, stage0_existing_frames_dir],
+                outputs=stage_reset_outputs,
+            )
+            pipeline_scene_root_text.change(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=pipeline_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage_live_scene_root.change(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            existing_scene_root_selection.change(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=[
+                    existing_scene_root_selection,
+                    existing_video_selection,
+                    existing_scene_root_selection,
+                    output_parent_selection,
+                    stage0_existing_video_selection,
+                    stage0_output_parent_selection,
+                    stage_scene_root_selection,
+                    inspect_scene_root_selection,
+                ],
+                outputs=auto_sync_outputs,
+            )
+            stage_scene_root_selection.change(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=[
+                    stage_scene_root_selection,
+                    existing_video_selection,
+                    existing_scene_root_selection,
+                    output_parent_selection,
+                    stage0_existing_video_selection,
+                    stage0_output_parent_selection,
+                    stage_scene_root_selection,
+                    inspect_scene_root_selection,
+                ],
+                outputs=auto_sync_outputs,
+            )
+            inspect_scene_root_selection.change(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=[
+                    inspect_scene_root_selection,
+                    existing_video_selection,
+                    existing_scene_root_selection,
+                    output_parent_selection,
+                    stage0_existing_video_selection,
+                    stage0_output_parent_selection,
+                    stage_scene_root_selection,
+                    inspect_scene_root_selection,
+                ],
+                outputs=auto_sync_outputs,
+            )
+            pipeline_run_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=pipeline_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage0_run_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage1_run_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage2_run_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage31_run_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+            stage32_run_event.then(
+                fn=_sync_catalogs_and_scene_views,
+                inputs=stage_sync_inputs,
+                outputs=auto_sync_outputs,
+            )
+
+    return demo
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Launch the Gradio UI for video_to_world.")
+    parser.add_argument("--server-name", default="0.0.0.0", help="Bind address for the Gradio server.")
+    parser.add_argument("--server-port", type=int, default=7860, help="Port for the Gradio server.")
+    parser.add_argument("--share", action="store_true", help="Enable a Gradio share link.")
+    parser.add_argument("--inbrowser", action="store_true", help="Open the UI in a browser on launch.")
+    args = parser.parse_args()
+
+    _ensure_workspace_dirs()
+    app = build_app()
+    app.queue(default_concurrency_limit=2).launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
+        inbrowser=args.inbrowser,
+    )
+
+
+if __name__ == "__main__":
+    main()

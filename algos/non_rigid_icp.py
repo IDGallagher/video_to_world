@@ -187,8 +187,11 @@ def non_rigid_icp(
                 },
             )
 
-    # compute normals if using point-to-plane
-    if method == "point2plane" and ref_normals is None:
+    # compute normals if required by the geometric term or color-ICP term
+    use_color_icp = (
+        color_icp_weight is not None and color_icp_weight > 0.0 and ref_colors is not None and src_colors is not None
+    )
+    if (method == "point2plane" or use_color_icp) and ref_normals is None:
         if progress_callback is not None:
             progress_callback(0, {"stage": "estimate_normals_start", "k": int(normal_k), "num_ref": int(ref_flat.shape[0])})
         ref_normals, _ = estimate_normals(ref_flat, k=normal_k, backend=knn_backend)
@@ -196,9 +199,6 @@ def non_rigid_icp(
             progress_callback(0, {"stage": "estimate_normals_end"})
 
     # Precompute color gradients on the (fixed) reference, if requested.
-    use_color_icp = (
-        color_icp_weight is not None and color_icp_weight > 0.0 and ref_colors is not None and src_colors is not None
-    )
     ref_color_grad = None
     ref_intensity = None
     src_intensity = None
@@ -341,13 +341,13 @@ def non_rigid_icp(
             tgt_used = ref_flat[idxs[mask]]
             d2_used = d2[mask]
             perc_used = 100.0 * (mask.sum().item() / mask.shape[0])
-            if method == "point2plane":
+            if method == "point2plane" or use_color_icp:
                 normals_used = ref_normals[idxs[mask]]
         else:
             src_used = src_transformed
             tgt_used = ref_flat[idxs]
             d2_used = d2
-            if method == "point2plane":
+            if method == "point2plane" or use_color_icp:
                 normals_used = ref_normals[idxs]
 
         if method == "point2point":

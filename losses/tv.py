@@ -7,6 +7,53 @@ from __future__ import annotations
 import torch
 
 
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda_error_out_of_memory" in msg
+        or ("tiny-cuda-nn/gpu_memory.h" in msg and "cuda_error_invalid_value" in msg)
+    )
+
+
+def _eval_deform_chunked(
+    deform,
+    pts: torch.Tensor,
+    *,
+    chunk_size: int | None,
+) -> torch.Tensor:
+    """Evaluate a deformation field in chunks to cap TCNN workspace usage."""
+    total_pts = int(pts.shape[0])
+    if total_pts == 0:
+        return deform(pts)
+
+    if chunk_size is None or int(chunk_size) <= 0:
+        current_chunk = total_pts
+    else:
+        current_chunk = min(int(chunk_size), total_pts)
+
+    cached_chunk = getattr(deform, "_safe_deform_chunk_size", None)
+    if isinstance(cached_chunk, int) and cached_chunk > 0:
+        current_chunk = min(current_chunk, cached_chunk)
+
+    outs = []
+    s = 0
+    while s < total_pts:
+        e = min(s + current_chunk, total_pts)
+        chunk = pts[s:e]
+        try:
+            outs.append(deform(chunk))
+            s = e
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or chunk.shape[0] <= 1:
+                raise
+            current_chunk = max(1, chunk.shape[0] // 2)
+            setattr(deform, "_safe_deform_chunk_size", current_chunk)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    return torch.cat(outs, dim=0)
+
+
 def build_voxel_grid(bounds_min: torch.Tensor, bounds_max: torch.Tensor, voxel_size: float):
     """
     Build a regular voxel grid of sample points.
@@ -93,6 +140,7 @@ def tv_loss(
     input_points: torch.Tensor | None = None,
     num_jittered_points: int = 0,
     jitter_scale: float | None = None,
+    deform_chunk_size: int | None = None,
 ) -> torch.Tensor:
     """
     TV-style regularizer on a continuous SE(3) deformation field.
@@ -186,7 +234,11 @@ def tv_loss(
         all_sample_pts = torch.cat([center_pts, neighbor_pts], dim=0)  # (N_center + N_center*6, 3)
 
         # Evaluate deformation at all sample points
-        twist_all = deform(all_sample_pts)  # (N_center + N_center*6, 6)
+        twist_all = _eval_deform_chunked(
+            deform,
+            all_sample_pts,
+            chunk_size=deform_chunk_size,
+        )  # (N_center + N_center*6, 6)
 
         # Split twists into center and neighbor twists
         twist_center = twist_all[:N_center]  # (N_center, 6)
@@ -272,7 +324,11 @@ def tv_loss(
         dim=-1,
     )  # (U,3)
 
-    twist_uniq = deform(pts_uniq)  # (U,6)
+    twist_uniq = _eval_deform_chunked(
+        deform,
+        pts_uniq,
+        chunk_size=deform_chunk_size,
+    )  # (U,6)
 
     # Map original voxel indices -> compact [0..U-1] indices
     map_full = torch.full((N,), -1, device=device, dtype=torch.long)

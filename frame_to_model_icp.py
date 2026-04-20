@@ -41,6 +41,7 @@ from utils.logging import get_logger, try_create_tensorboard_writer, tb_log_hpar
 from utils.normals import estimate_normals
 from utils.geometry import se3_apply, se3_exp, se3_log
 from utils.pointcloud import merge_new_points_with_model, merge_point_clouds
+from utils.stage1_preparation import load_stage0_prep_alignment, resolve_stage1_out_path
 
 from configs.stage1_align import FrameToModelICPConfig
 
@@ -150,16 +151,22 @@ def main(config: FrameToModelICPConfig):
     logger.info("Using device: %s", device)
 
     # Set out_path if not specified
-    out_path = config.out_path
-    if out_path is None:
-        out_path = os.path.join(
-            config.root_path,
-            (
-                f"frame_to_model_icp_{config.alignment.num_frames}_{config.alignment.stride}"
-                f"_offset{config.alignment.offset}{config.out_suffix if config.out_suffix else ''}"
-            ),
-        )
+    out_path = resolve_stage1_out_path(
+        config.root_path,
+        config.alignment,
+        out_path=config.out_path,
+        out_suffix=config.out_suffix,
+    )
     os.makedirs(out_path, exist_ok=True)
+
+    prep_alignment = load_stage0_prep_alignment(out_path)
+    if prep_alignment is not None:
+        if prep_alignment != config.alignment:
+            logger.info(
+                "Using Stage 0 prep alignment from %s instead of the Stage 1 CLI alignment settings.",
+                out_path,
+            )
+        config = replace(config, alignment=prep_alignment, out_path=out_path)
 
     # Persist Stage-1-produced config for downstream stages.
     # Canonical location (per repo convention): after_non_rigid_icp/config.json
@@ -208,6 +215,16 @@ def main(config: FrameToModelICPConfig):
         conf_global_percentile=config.alignment.conf_global_percentile,
         voxel_size=config.alignment.conf_voxel_size,
         voxel_min_count_percentile=config.alignment.conf_voxel_min_count_percentile,
+        conf_mask_sky=config.alignment.conf_mask_sky,
+        conf_mask_sky_depth_band=config.alignment.conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent=config.alignment.conf_sky_depth_band_percent,
+        conf_mask_depth_edges=config.alignment.conf_mask_depth_edges,
+        conf_edge_rtol=config.alignment.conf_edge_rtol,
+        conf_edge_atol=config.alignment.conf_edge_atol,
+        conf_edge_kernel_size=config.alignment.conf_edge_kernel_size,
+        conf_mask_max_depth=config.alignment.conf_mask_max_depth,
+        conf_max_depth_rtol=config.alignment.conf_max_depth_rtol,
+        conf_max_depth_atol=config.alignment.conf_max_depth_atol,
         offset=config.alignment.offset,
     )
 
@@ -295,7 +312,12 @@ def main(config: FrameToModelICPConfig):
     # save downsampled merge of all pcls
     merged = merge_point_clouds(pcls)
     # merged = merged.voxel_down_sample(voxel_size=0.01)
-    o3d.io.write_point_cloud(os.path.join(out_path, "before_non_rigid_icp.ply"), merged)
+    before_non_rigid_path = os.path.join(out_path, "before_non_rigid_icp.ply")
+    if not os.path.exists(before_non_rigid_path):
+        o3d.io.write_point_cloud(before_non_rigid_path, merged)
+        logger.info("Wrote pre-ICP merged point cloud to %s", before_non_rigid_path)
+    else:
+        logger.info("Reusing pre-ICP merged point cloud at %s", before_non_rigid_path)
 
     # Calculate world-space bbox from merged point cloud (used for normal
     # estimation & merge logic; DeformationGrid bbox is per-frame in camera space).
@@ -316,7 +338,7 @@ def main(config: FrameToModelICPConfig):
     # The canonical model lives in world space = se3_apply(c2w_0, camera_pts_0).
     model = se3_apply(per_frame_c2w_se3[0], per_frame_camera_pts[0])
     model_colors = per_frame_camera_colors[0].clone()
-    voxel_size = 0.05  # keep consistent voxel size across the pipeline
+    voxel_size = config.merge_voxel_size
     # Initial normals for the canonical model
     model_normals, model_kd_tree = estimate_normals(model.reshape(-1, 3), backend=config.knn_backend)
 

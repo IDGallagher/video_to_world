@@ -32,10 +32,10 @@ class FrameToModelICPConfig(TensorboardConfig, KnnBackendConfig):
     icp_method: str = "point2plane"
     icp_local_twist_reg: float = 0.0
     icp_tv_reg: float = 50.0
-    icp_tv_voxel_size: float = 0.05
+    icp_tv_voxel_size: float = 0.01
     icp_tv_every_k: int = 1
     icp_tv_sample_ratio: Optional[float] = 0.1
-    icp_color_icp_weight: float = 0.05
+    icp_color_icp_weight: float = 0.02
     icp_color_icp_max_color_dist: Optional[float] = 0.1
     icp_color_icp_k: int = 10
 
@@ -43,14 +43,19 @@ class FrameToModelICPConfig(TensorboardConfig, KnnBackendConfig):
 
     # ---- DeformationGrid capacity parameters ----
     deform_log2_hashmap_size: int = 19
-    deform_num_levels: int = 16
+    deform_num_levels: int = 24
     deform_n_neurons: int = 64
-    deform_n_hidden_layers: int = 2
+    deform_n_hidden_layers: int = 4
     deform_min_res: int = 16
     deform_max_res: int = 2048
 
+    # ---- Merge voxel size (deduplication during frame-to-model merging) ----
+    merge_voxel_size: float = 0.001
+    """Voxel grid size for spatial deduplication when merging new frame points into the
+    canonical model. Smaller values keep more points (denser clouds). Pi-Long uses 0.001."""
+
     # ---- Point filtering (post-ICP, pre-merge) ----
-    filter_points: bool = True
+    filter_points: bool = False
     filter_geom_sigma: float = 2.5
     filter_color_sigma: float = 1.5
     filter_worst_pct: float = 0.2

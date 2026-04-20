@@ -15,6 +15,8 @@ from typing import Optional
 
 import torch
 
+from utils.third_party_bootstrap import prepend_local_third_party_paths
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +59,7 @@ class RoMaMatcherWrapper:
     def _init_romav2(self, device: str):
         """Initialize RoMaV2 model."""
         logger.info("Loading RoMaV2 model...")
+        prepend_local_third_party_paths("romav2")
 
         try:
             from romav2 import RoMaV2

@@ -112,13 +112,26 @@ def main(config: GSConfig):
         conf_global_percentile=align_params.conf_global_percentile,
         voxel_size=align_params.conf_voxel_size,
         voxel_min_count_percentile=align_params.conf_voxel_min_count_percentile,
+        conf_mask_sky=align_params.conf_mask_sky,
+        conf_mask_sky_depth_band=align_params.conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent=align_params.conf_sky_depth_band_percent,
+        conf_mask_depth_edges=align_params.conf_mask_depth_edges,
+        conf_edge_rtol=align_params.conf_edge_rtol,
+        conf_edge_atol=align_params.conf_edge_atol,
+        conf_edge_kernel_size=align_params.conf_edge_kernel_size,
+        conf_mask_max_depth=align_params.conf_mask_max_depth,
+        conf_max_depth_rtol=align_params.conf_max_depth_rtol,
+        conf_max_depth_atol=align_params.conf_max_depth_atol,
         offset=align_params.offset,
     )
     logger.info(
         "Using alignment data params for GS training: "
         "num_frames=%d, stride=%d, offset=%d, conf_thresh_percentile=%.1f, "
         "conf_mode=%s, conf_local_percentile=%s, conf_global_percentile=%s, "
-        "conf_voxel_size=%.4f, conf_voxel_min_count_percentile=%s",
+        "conf_voxel_size=%.4f, conf_voxel_min_count_percentile=%s, "
+        "conf_mask_sky=%s, conf_mask_sky_depth_band=%s, conf_sky_depth_band_percent=%s, "
+        "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d, "
+        "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s",
         align_params.num_frames,
         align_params.stride,
         align_params.offset,
@@ -128,6 +141,16 @@ def main(config: GSConfig):
         str(align_params.conf_global_percentile),
         align_params.conf_voxel_size,
         str(align_params.conf_voxel_min_count_percentile),
+        str(align_params.conf_mask_sky),
+        str(align_params.conf_mask_sky_depth_band),
+        str(align_params.conf_sky_depth_band_percent),
+        str(align_params.conf_mask_depth_edges),
+        str(align_params.conf_edge_rtol),
+        str(align_params.conf_edge_atol),
+        align_params.conf_edge_kernel_size,
+        str(align_params.conf_mask_max_depth),
+        str(align_params.conf_max_depth_rtol),
+        str(align_params.conf_max_depth_atol),
     )
 
     (
@@ -343,6 +366,13 @@ def main(config: GSConfig):
                 "num_frames": align_params.num_frames,
                 "stride": align_params.stride,
                 "conf_thresh_percentile": align_params.conf_thresh_percentile,
+                "conf_mask_sky": align_params.conf_mask_sky,
+                "conf_mask_sky_depth_band": align_params.conf_mask_sky_depth_band,
+                "conf_sky_depth_band_percent": align_params.conf_sky_depth_band_percent,
+                "conf_mask_depth_edges": align_params.conf_mask_depth_edges,
+                "conf_edge_rtol": align_params.conf_edge_rtol,
+                "conf_edge_atol": align_params.conf_edge_atol,
+                "conf_edge_kernel_size": align_params.conf_edge_kernel_size,
             },
             step=0,
         )

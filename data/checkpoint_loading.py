@@ -17,6 +17,31 @@ logger = logging.getLogger(__name__)
 FirstLocalMode = Literal["none", "dummy"]
 
 
+def _load_saved_deformation_grid_kwargs(checkpoint_dir: str) -> dict:
+    """Load Stage 1 deformation-grid architecture kwargs from the saved config."""
+    cfg_path = os.path.join(checkpoint_dir, "config.json")
+    cfg = load_json_config(cfg_path, required=False)
+    if not cfg:
+        return {}
+
+    key_map = {
+        "deform_min_res": "min_res",
+        "deform_max_res": "max_res",
+        "deform_num_levels": "num_levels",
+        "deform_log2_hashmap_size": "log2_hashmap_size",
+        "deform_n_neurons": "n_neurons",
+        "deform_n_hidden_layers": "n_hidden_layers",
+    }
+
+    grid_kwargs = {}
+    for cfg_key, grid_key in key_map.items():
+        value = cfg.get(cfg_key)
+        if value is not None:
+            grid_kwargs[grid_key] = int(value)
+
+    return grid_kwargs
+
+
 def write_point_cloud_ply(
     path: str,
     points: torch.Tensor,
@@ -96,6 +121,14 @@ def load_deformation_checkpoints(
 
     bbox_min: torch.Tensor | None = None
     bbox_max: torch.Tensor | None = None
+    deform_grid_kwargs = _load_saved_deformation_grid_kwargs(checkpoint_dir)
+    if deform_grid_kwargs:
+        logger.info("Using saved Stage 1 deformation grid config for load: %s", deform_grid_kwargs)
+    else:
+        logger.warning(
+            "No Stage 1 deformation grid config found at %s; falling back to DeformationGrid defaults.",
+            os.path.join(checkpoint_dir, "config.json"),
+        )
 
     i = 1
     while True:
@@ -111,8 +144,14 @@ def load_deformation_checkpoints(
             bbox_min = state_dict["bbox_min"].to(device)
             bbox_max = state_dict["bbox_max"].to(device)
 
-        deform_grid = DeformationGrid(bbox_min, bbox_max, max_res=2048).to(device)
-        deform_grid.load_state_dict(state_dict)
+        deform_grid = DeformationGrid(bbox_min, bbox_max, **deform_grid_kwargs).to(device)
+        try:
+            deform_grid.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load deformation checkpoint '{path}' with grid config {deform_grid_kwargs or 'defaults'}. "
+                f"This usually means the saved Stage 1 deformation architecture does not match the loader config."
+            ) from exc
         per_frame_local_deform.append(deform_grid)
         i += 1
 
@@ -277,11 +316,38 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
     if conf_voxel_min_count_percentile is not None:
         conf_voxel_min_count_percentile = float(conf_voxel_min_count_percentile)
 
+    conf_mask_sky = bool(a.get("conf_mask_sky", False))
+    conf_mask_sky_depth_band = bool(a.get("conf_mask_sky_depth_band", False))
+    conf_sky_depth_band_percent = float(a.get("conf_sky_depth_band_percent", 2.0))
+    conf_mask_depth_edges = bool(a.get("conf_mask_depth_edges", False))
+
+    conf_edge_rtol = a.get("conf_edge_rtol", None)
+    if conf_edge_rtol is not None:
+        conf_edge_rtol = float(conf_edge_rtol)
+
+    conf_edge_atol = a.get("conf_edge_atol", None)
+    if conf_edge_atol is not None:
+        conf_edge_atol = float(conf_edge_atol)
+
+    conf_edge_kernel_size = int(a.get("conf_edge_kernel_size", 3))
+    conf_mask_max_depth = bool(a.get("conf_mask_max_depth", False))
+
+    conf_max_depth_rtol = a.get("conf_max_depth_rtol", None)
+    if conf_max_depth_rtol is not None:
+        conf_max_depth_rtol = float(conf_max_depth_rtol)
+
+    conf_max_depth_atol = a.get("conf_max_depth_atol", None)
+    if conf_max_depth_atol is not None:
+        conf_max_depth_atol = float(conf_max_depth_atol)
+
     logger.info(
         "Loaded alignment data params for run '%s': "
         "num_frames=%d, stride=%d, offset=%d, conf_thresh_percentile=%.1f, "
         "conf_mode=%s, conf_local_percentile=%s, conf_global_percentile=%s, "
-        "conf_voxel_size=%.4f, conf_voxel_min_count_percentile=%s",
+        "conf_voxel_size=%.4f, conf_voxel_min_count_percentile=%s, "
+        "conf_mask_sky=%s, conf_mask_sky_depth_band=%s, conf_sky_depth_band_percent=%s, "
+        "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d, "
+        "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s",
         run,
         num_frames,
         stride,
@@ -292,6 +358,16 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         str(conf_global_percentile),
         conf_voxel_size,
         str(conf_voxel_min_count_percentile),
+        str(conf_mask_sky),
+        str(conf_mask_sky_depth_band),
+        str(conf_sky_depth_band_percent),
+        str(conf_mask_depth_edges),
+        str(conf_edge_rtol),
+        str(conf_edge_atol),
+        conf_edge_kernel_size,
+        str(conf_mask_max_depth),
+        str(conf_max_depth_rtol),
+        str(conf_max_depth_atol),
     )
 
     return AlignmentDataParams(
@@ -304,6 +380,16 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         conf_global_percentile=conf_global_percentile,
         conf_voxel_size=conf_voxel_size,
         conf_voxel_min_count_percentile=conf_voxel_min_count_percentile,
+        conf_mask_sky=conf_mask_sky,
+        conf_mask_sky_depth_band=conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+        conf_mask_depth_edges=conf_mask_depth_edges,
+        conf_edge_rtol=conf_edge_rtol,
+        conf_edge_atol=conf_edge_atol,
+        conf_edge_kernel_size=conf_edge_kernel_size,
+        conf_mask_max_depth=conf_mask_max_depth,
+        conf_max_depth_rtol=conf_max_depth_rtol,
+        conf_max_depth_atol=conf_max_depth_atol,
     )
 
 

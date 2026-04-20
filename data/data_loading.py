@@ -6,6 +6,7 @@ import json
 import numpy as np
 import open3d as o3d
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from PIL import Image
@@ -14,6 +15,270 @@ from torchvision.transforms import ToTensor
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _depth_edge_suffix(
+    *,
+    enabled: bool,
+    edge_rtol: float | None,
+    edge_atol: float | None,
+    edge_kernel_size: int,
+) -> str:
+    if not enabled:
+        return ""
+
+    parts = [f"edge_k{int(edge_kernel_size)}"]
+    if edge_rtol is not None:
+        parts.append(f"r{float(edge_rtol):.4f}")
+    if edge_atol is not None:
+        parts.append(f"a{float(edge_atol):.4f}")
+    return "_" + "_".join(parts)
+
+
+def _max_depth_suffix(
+    *,
+    enabled: bool,
+    max_depth_rtol: float | None,
+    max_depth_atol: float | None,
+) -> str:
+    if not enabled:
+        return ""
+
+    parts = ["maxdepth"]
+    if max_depth_rtol is not None:
+        parts.append(f"r{float(max_depth_rtol):.6f}")
+    if max_depth_atol is not None:
+        parts.append(f"a{float(max_depth_atol):.6f}")
+    return "_" + "_".join(parts)
+
+
+def _sky_depth_band_suffix(*, enabled: bool, band_percent: float) -> str:
+    if not enabled:
+        return ""
+    return f"_skyband_p{float(band_percent):.3f}"
+
+
+def _sky_mask_suffix(*, enabled: bool) -> str:
+    return "_sky" if enabled else ""
+
+
+def _write_boolean_mask_png(path: str, mask: np.ndarray) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    image = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+    image.save(path)
+
+
+def _write_debug_mask_pngs(
+    *,
+    output_dir: str,
+    depth_shape: tuple[int, int, int],
+    sky_mask: np.ndarray | None,
+    valid_flat_indices_all: list[np.ndarray],
+) -> None:
+    num_frames, height, width = depth_shape
+    if len(valid_flat_indices_all) != num_frames:
+        raise ValueError(
+            f"Expected valid indices for {num_frames} frames, got {len(valid_flat_indices_all)}."
+        )
+
+    sky_dir = os.path.join(output_dir, "sky")
+    kept_dir = os.path.join(output_dir, "kept")
+    os.makedirs(kept_dir, exist_ok=True)
+    if sky_mask is not None:
+        os.makedirs(sky_dir, exist_ok=True)
+
+    for i in range(num_frames):
+        kept_mask = np.zeros((height, width), dtype=bool)
+        flat_indices = valid_flat_indices_all[i]
+        if flat_indices.size > 0:
+            kept_mask.reshape(-1)[flat_indices.astype(np.int64)] = True
+        _write_boolean_mask_png(os.path.join(kept_dir, f"frame_{i:05d}.png"), kept_mask)
+
+        if sky_mask is not None:
+            _write_boolean_mask_png(os.path.join(sky_dir, f"frame_{i:05d}.png"), sky_mask[i].astype(bool, copy=False))
+
+
+def _apply_sky_mask_suppression(
+    depth: np.ndarray,
+    conf: np.ndarray,
+    *,
+    sky_mask: np.ndarray | None,
+    enabled: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    base_valid = np.isfinite(depth) & (depth > 0)
+    if not enabled:
+        return conf, base_valid
+    if sky_mask is None:
+        logger.warning("Sky-mask suppression requested, but results.npz does not contain a 'sky' array. Skipping.")
+        return conf, base_valid
+    if sky_mask.shape != depth.shape:
+        raise ValueError(f"Sky mask shape {sky_mask.shape} does not match depth shape {depth.shape}.")
+
+    conf_filtered = conf.copy()
+    sky_mask = sky_mask.astype(bool, copy=False)
+    conf_filtered[sky_mask] = 0.0
+    valid_filtered = base_valid & (~sky_mask)
+    return conf_filtered, valid_filtered
+
+
+def _apply_sky_depth_band_suppression(
+    depth: np.ndarray,
+    conf: np.ndarray,
+    *,
+    sky_mask: np.ndarray | None,
+    enabled: bool,
+    band_percent: float,
+    base_valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    base_valid = base_valid_mask if base_valid_mask is not None else (np.isfinite(depth) & (depth > 0))
+    if not enabled:
+        return conf, base_valid
+    if sky_mask is None:
+        logger.warning(
+            "Sky-depth-band suppression requested, but results.npz does not contain a 'sky' array. Skipping."
+        )
+        return conf, base_valid
+    if sky_mask.shape != depth.shape:
+        raise ValueError(f"Sky mask shape {sky_mask.shape} does not match depth shape {depth.shape}.")
+    if band_percent < 0.0 or band_percent > 100.0:
+        raise ValueError(f"Sky depth band percent must be between 0 and 100, got {band_percent}.")
+
+    conf_filtered = conf.copy()
+    valid_filtered = base_valid.copy()
+    band_ratio = float(band_percent) / 100.0
+
+    for i in range(depth.shape[0]):
+        vm = base_valid[i]
+        depth_valid = np.isfinite(depth[i]) & (depth[i] > 0)
+        sm = sky_mask[i].astype(bool, copy=False) & depth_valid
+        if not np.any(sm):
+            continue
+        frame_depth = depth[i]
+        sky_depth_ref = float(frame_depth[sm].min())
+        threshold = sky_depth_ref * max(0.0, 1.0 - band_ratio)
+        band_mask = vm & (frame_depth >= threshold)
+        conf_filtered[i][band_mask] = 0.0
+        valid_filtered[i][band_mask] = False
+
+    return conf_filtered, valid_filtered
+
+
+def _compute_depth_edge_mask(
+    depth: np.ndarray,
+    *,
+    edge_rtol: float | None,
+    edge_atol: float | None,
+    edge_kernel_size: int,
+    valid_mask: np.ndarray | None,
+) -> np.ndarray:
+    # Treat zero/negative tolerances as disabled (atol=0 would flag every pixel
+    # with any depth variation; rtol=0 is similarly degenerate).
+    if edge_atol is not None and edge_atol <= 0:
+        edge_atol = None
+    if edge_rtol is not None and edge_rtol <= 0:
+        edge_rtol = None
+    if edge_rtol is None and edge_atol is None:
+        return np.zeros_like(depth, dtype=bool)
+
+    depth_t = torch.from_numpy(depth.astype(np.float32, copy=False))
+    depth_t = depth_t.reshape(-1, 1, *depth_t.shape[-2:])
+
+    mask_t = None
+    if valid_mask is not None:
+        mask_t = torch.from_numpy(valid_mask.astype(bool, copy=False))
+        mask_t = mask_t.reshape(-1, 1, *mask_t.shape[-2:])
+
+    if mask_t is None:
+        diff = F.max_pool2d(depth_t, edge_kernel_size, stride=1, padding=edge_kernel_size // 2) + F.max_pool2d(
+            -depth_t, edge_kernel_size, stride=1, padding=edge_kernel_size // 2
+        )
+    else:
+        neg_inf = torch.full_like(depth_t, float("-inf"))
+        diff = F.max_pool2d(
+            torch.where(mask_t, depth_t, neg_inf),
+            edge_kernel_size,
+            stride=1,
+            padding=edge_kernel_size // 2,
+        ) + F.max_pool2d(
+            torch.where(mask_t, -depth_t, neg_inf),
+            edge_kernel_size,
+            stride=1,
+            padding=edge_kernel_size // 2,
+        )
+
+    edge = torch.zeros_like(depth_t, dtype=torch.bool)
+    if edge_atol is not None:
+        edge |= diff > float(edge_atol)
+    if edge_rtol is not None:
+        edge |= (diff / depth_t.abs().clamp_min(1e-12)).nan_to_num_() > float(edge_rtol)
+    if mask_t is not None:
+        edge &= mask_t
+
+    return edge.reshape(depth.shape).cpu().numpy()
+
+
+def _apply_depth_edge_suppression(
+    depth: np.ndarray,
+    conf: np.ndarray,
+    *,
+    enabled: bool,
+    edge_rtol: float | None,
+    edge_atol: float | None,
+    edge_kernel_size: int,
+    base_valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    base_valid = base_valid_mask if base_valid_mask is not None else (np.isfinite(depth) & (depth > 0))
+    if not enabled:
+        return conf, base_valid
+    if int(edge_kernel_size) <= 0 or int(edge_kernel_size) % 2 == 0:
+        raise ValueError(f"conf_edge_kernel_size must be a positive odd integer, got {edge_kernel_size}")
+
+    edge_mask = _compute_depth_edge_mask(
+        depth,
+        edge_rtol=edge_rtol,
+        edge_atol=edge_atol,
+        edge_kernel_size=edge_kernel_size,
+        valid_mask=base_valid,
+    )
+    conf_filtered = conf.copy()
+    conf_filtered[edge_mask] = 0.0
+    valid_filtered = base_valid & (~edge_mask)
+    return conf_filtered, valid_filtered
+
+
+def _apply_max_depth_suppression(
+    depth: np.ndarray,
+    conf: np.ndarray,
+    *,
+    enabled: bool,
+    max_depth_rtol: float | None,
+    max_depth_atol: float | None,
+    base_valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    base_valid = base_valid_mask if base_valid_mask is not None else (np.isfinite(depth) & (depth > 0))
+    if not enabled:
+        return conf, base_valid
+    if max_depth_rtol is None and max_depth_atol is None:
+        raise ValueError("Max-depth suppression needs a relative or absolute threshold.")
+
+    conf_filtered = conf.copy()
+    valid_filtered = base_valid.copy()
+
+    rtol = float(max_depth_rtol) if max_depth_rtol is not None else 0.0
+    atol = float(max_depth_atol) if max_depth_atol is not None else 0.0
+
+    for i in range(depth.shape[0]):
+        vm = base_valid[i]
+        if not np.any(vm):
+            continue
+        frame_depth = depth[i]
+        frame_max = float(frame_depth[vm].max())
+        tol = max(atol, abs(frame_max) * rtol)
+        plateau_mask = vm & (frame_depth >= (frame_max - tol))
+        conf_filtered[i][plateau_mask] = 0.0
+        valid_filtered[i][plateau_mask] = False
+
+    return conf_filtered, valid_filtered
 
 
 def _find_preprocess_frames_dir(root_path: str) -> str:
@@ -177,6 +442,7 @@ def _voxelized_conf_filter_da3(
     local_percentile: float,
     global_percentile: float | None = None,
     min_count_percentile: float | None = None,
+    valid_mask: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """
     Compute per-voxel confidence thresholds in world space and filter points.
@@ -188,7 +454,7 @@ def _voxelized_conf_filter_da3(
     """
     N_total, H, W = all_depth.shape
     # First, back-project all *depth-valid* pixels using the shared helper.
-    depth_valid = np.isfinite(all_depth) & (all_depth > 0)
+    depth_valid = valid_mask if valid_mask is not None else (np.isfinite(all_depth) & (all_depth > 0))
     pts3d_per_frame, colors_per_frame = depths_to_world_points_with_colors(
         all_depth,
         all_intrinsics,
@@ -321,6 +587,16 @@ def load_data(
     conf_global_percentile: float | None = None,
     voxel_size: float = 0.1,
     voxel_min_count_percentile: float | None = None,
+    conf_mask_sky: bool = False,
+    conf_mask_sky_depth_band: bool = False,
+    conf_sky_depth_band_percent: float = 2.0,
+    conf_mask_depth_edges: bool = False,
+    conf_edge_rtol: float | None = 0.03,
+    conf_edge_atol: float | None = None,
+    conf_edge_kernel_size: int = 3,
+    conf_mask_max_depth: bool = False,
+    conf_max_depth_rtol: float | None = 0.001,
+    conf_max_depth_atol: float | None = None,
     offset: int = 0,
     load_original_images_and_intrinsics: bool = False,
 ):
@@ -337,6 +613,67 @@ def load_data(
     # Load depth and conf for computing valid pixel indices
     all_depth = predictions["depth"]  # (N_total, H, W)
     all_conf = predictions["conf"]  # (N_total, H, W)
+    sky_mask = predictions["sky"] if "sky" in predictions.files else None
+    all_conf_filtered, base_valid_mask = _apply_sky_mask_suppression(
+        all_depth,
+        all_conf,
+        sky_mask=sky_mask,
+        enabled=conf_mask_sky,
+    )
+    if conf_mask_sky and sky_mask is not None:
+        masked_pixels = int((np.isfinite(all_depth) & (all_depth > 0) & sky_mask.astype(bool)).sum())
+        logger.info("Sky-mask suppression removed %d pixels before confidence filtering", masked_pixels)
+    all_conf_filtered, base_valid_mask = _apply_sky_depth_band_suppression(
+        all_depth,
+        all_conf_filtered,
+        sky_mask=sky_mask,
+        enabled=conf_mask_sky_depth_band,
+        band_percent=conf_sky_depth_band_percent,
+        base_valid_mask=base_valid_mask,
+    )
+    if conf_mask_sky_depth_band and sky_mask is not None:
+        masked_pixels = int((np.isfinite(all_depth) & (all_depth > 0) & (~base_valid_mask)).sum())
+        logger.info(
+            "Sky-depth-band suppression removed %d pixels before confidence filtering (band_percent=%s)",
+            masked_pixels,
+            str(conf_sky_depth_band_percent),
+        )
+
+    all_conf_filtered, base_valid_mask = _apply_max_depth_suppression(
+        all_depth,
+        all_conf_filtered,
+        enabled=conf_mask_max_depth,
+        max_depth_rtol=conf_max_depth_rtol,
+        max_depth_atol=conf_max_depth_atol,
+        base_valid_mask=base_valid_mask,
+    )
+    if conf_mask_max_depth:
+        masked_pixels = int((np.isfinite(all_depth) & (all_depth > 0) & (~base_valid_mask)).sum())
+        logger.info(
+            "Max-depth suppression removed %d pixels before confidence filtering (rtol=%s, atol=%s)",
+            masked_pixels,
+            str(conf_max_depth_rtol),
+            str(conf_max_depth_atol),
+        )
+
+    all_conf_filtered, base_valid_mask = _apply_depth_edge_suppression(
+        all_depth,
+        all_conf_filtered,
+        enabled=conf_mask_depth_edges,
+        edge_rtol=conf_edge_rtol,
+        edge_atol=conf_edge_atol,
+        edge_kernel_size=conf_edge_kernel_size,
+        base_valid_mask=base_valid_mask,
+    )
+    if conf_mask_depth_edges:
+        masked_pixels = int((np.isfinite(all_depth) & (all_depth > 0) & (~base_valid_mask)).sum())
+        logger.info(
+            "Depth-edge suppression removed %d pixels before confidence filtering (kernel=%d, rtol=%s, atol=%s)",
+            masked_pixels,
+            int(conf_edge_kernel_size),
+            str(conf_edge_rtol),
+            str(conf_edge_atol),
+        )
 
     pcl_folder = os.path.join(root_path, "exports", "ply")
     if not os.path.exists(pcl_folder):
@@ -396,6 +733,31 @@ def load_data(
             name += f"_min{voxel_min_count_percentile}"
         pcl_conf_folder = os.path.join(pcl_folder, name)
 
+    edge_suffix = _depth_edge_suffix(
+        enabled=conf_mask_depth_edges,
+        edge_rtol=conf_edge_rtol,
+        edge_atol=conf_edge_atol,
+        edge_kernel_size=conf_edge_kernel_size,
+    )
+    if edge_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{edge_suffix}"
+    max_depth_suffix = _max_depth_suffix(
+        enabled=conf_mask_max_depth,
+        max_depth_rtol=conf_max_depth_rtol,
+        max_depth_atol=conf_max_depth_atol,
+    )
+    if max_depth_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{max_depth_suffix}"
+    sky_suffix = _sky_mask_suffix(enabled=conf_mask_sky)
+    if sky_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{sky_suffix}"
+    sky_depth_band_suffix = _sky_depth_band_suffix(
+        enabled=conf_mask_sky_depth_band,
+        band_percent=conf_sky_depth_band_percent,
+    )
+    if sky_depth_band_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{sky_depth_band_suffix}"
+
     if not os.path.exists(pcl_conf_folder):
         os.makedirs(pcl_conf_folder, exist_ok=True)
 
@@ -410,8 +772,8 @@ def load_data(
         valid_flat_indices_all: list[np.ndarray]
 
         if conf_mode == "global":
-            conf_thresh = np.percentile(all_conf, conf_thresh_percentile)
-            valid_mask = np.isfinite(all_depth) & (all_depth > 0) & (all_conf >= conf_thresh)
+            conf_thresh = np.percentile(all_conf_filtered, conf_thresh_percentile)
+            valid_mask = base_valid_mask & (all_conf_filtered >= conf_thresh)
             pts3d, colors = depths_to_world_points_with_colors(
                 all_depth,
                 all_intrinsics,
@@ -427,10 +789,9 @@ def load_data(
         elif conf_mode == "per_frame":
             valid_mask = np.zeros_like(all_depth, dtype=bool)
             for i in tqdm(range(N_total), desc="Computing per-frame conf masks"):
-                conf_thr_i = np.percentile(all_conf[i], conf_thresh_percentile)
-                d = all_depth[i]
-                c = all_conf[i]
-                vm = np.isfinite(d) & (d > 0) & (c >= conf_thr_i)
+                conf_thr_i = np.percentile(all_conf_filtered[i], conf_thresh_percentile)
+                c = all_conf_filtered[i]
+                vm = base_valid_mask[i] & (c >= conf_thr_i)
                 valid_mask[i] = vm
             pts3d, colors = depths_to_world_points_with_colors(
                 all_depth,
@@ -445,14 +806,13 @@ def load_data(
                 np.flatnonzero(valid_mask[i].reshape(-1)).astype(np.int64) for i in range(N_total)
             ]
         elif conf_mode == "per_frame_guided":
-            global_thr = np.percentile(all_conf, conf_global_percentile)
+            global_thr = np.percentile(all_conf_filtered, conf_global_percentile)
             valid_mask = np.zeros_like(all_depth, dtype=bool)
             for i in tqdm(range(N_total), desc="Computing per-frame guided conf masks"):
-                d = all_depth[i]
-                c = all_conf[i]
+                c = all_conf_filtered[i]
                 local_thr = np.percentile(c, conf_local_percentile)
                 conf_thr_i = max(global_thr, local_thr)
-                vm = np.isfinite(d) & (d > 0) & (c >= conf_thr_i)
+                vm = base_valid_mask[i] & (c >= conf_thr_i)
                 valid_mask[i] = vm
             pts3d, colors = depths_to_world_points_with_colors(
                 all_depth,
@@ -469,7 +829,7 @@ def load_data(
         elif conf_mode == "voxel":
             pts3d, colors, valid_flat_indices_all = _voxelized_conf_filter_da3(
                 all_depth,
-                all_conf,
+                all_conf_filtered,
                 all_intrinsics,
                 all_extrinsics,
                 all_images,
@@ -477,34 +837,37 @@ def load_data(
                 local_percentile=conf_thresh_percentile,
                 global_percentile=None,
                 min_count_percentile=voxel_min_count_percentile,
+                valid_mask=base_valid_mask,
             )
         elif conf_mode == "voxel_guided":
             pts3d, colors, valid_flat_indices_all = _voxelized_conf_filter_da3(
                 all_depth,
-                all_conf,
+                all_conf_filtered,
                 all_intrinsics,
                 all_extrinsics,
                 all_images,
                 voxel_size,
                 local_percentile=conf_local_percentile,
                 global_percentile=conf_global_percentile,
+                valid_mask=base_valid_mask,
             )
         else:  # "voxel_or" – OR-combine voxel_guided and voxel(min-count) selections
             # First: voxel_guided branch (global/local guided)
             pts3d_g, colors_g, flat_idx_g = _voxelized_conf_filter_da3(
                 all_depth,
-                all_conf,
+                all_conf_filtered,
                 all_intrinsics,
                 all_extrinsics,
                 all_images,
                 voxel_size,
                 local_percentile=conf_local_percentile,
                 global_percentile=conf_global_percentile,
+                valid_mask=base_valid_mask,
             )
             # Second: plain voxel branch with strong local/min-count filtering
             pts3d_v, colors_v, flat_idx_v = _voxelized_conf_filter_da3(
                 all_depth,
-                all_conf,
+                all_conf_filtered,
                 all_intrinsics,
                 all_extrinsics,
                 all_images,
@@ -512,6 +875,7 @@ def load_data(
                 local_percentile=conf_thresh_percentile,
                 global_percentile=None,
                 min_count_percentile=voxel_min_count_percentile,
+                valid_mask=base_valid_mask,
             )
 
             pts3d = []
@@ -564,6 +928,13 @@ def load_data(
             valid_indices_path,
             **{f"frame_{i:05d}": arr for i, arr in enumerate(valid_flat_indices_all)},
         )
+        if conf_mask_sky:
+            _write_debug_mask_pngs(
+                output_dir=os.path.join(pcl_conf_folder, "debug_masks"),
+                depth_shape=all_depth.shape,
+                sky_mask=sky_mask,
+                valid_flat_indices_all=valid_flat_indices_all,
+            )
 
     pcls = [o3d.io.read_point_cloud(os.path.join(pcl_conf_folder, f"frame_{i:05d}.ply")) for i in indices]
     extrinsics = [ext for ext in extrinsics]
@@ -608,8 +979,37 @@ def load_data(
             conf_local_percentile=conf_local_percentile,
             conf_global_percentile=conf_global_percentile,
             voxel_size=voxel_size,
+            voxel_min_count_percentile=voxel_min_count_percentile,
+            conf_mask_sky=conf_mask_sky,
+            conf_mask_sky_depth_band=conf_mask_sky_depth_band,
+            conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+            conf_mask_depth_edges=conf_mask_depth_edges,
+            conf_edge_rtol=conf_edge_rtol,
+            conf_edge_atol=conf_edge_atol,
+            conf_edge_kernel_size=conf_edge_kernel_size,
+            conf_mask_max_depth=conf_mask_max_depth,
+            conf_max_depth_rtol=conf_max_depth_rtol,
+            conf_max_depth_atol=conf_max_depth_atol,
             offset=offset,
             load_original_images_and_intrinsics=load_original_images_and_intrinsics,
+        )
+
+    debug_mask_dir = os.path.join(pcl_conf_folder, "debug_masks")
+    need_sky_dir = sky_mask is not None
+    if conf_mask_sky and (
+        not os.path.isdir(os.path.join(debug_mask_dir, "kept"))
+        or (need_sky_dir and not os.path.isdir(os.path.join(debug_mask_dir, "sky")))
+    ):
+        valid_indices_npz = np.load(valid_indices_path)
+        valid_flat_indices_all = []
+        for frame_idx in range(N_total):
+            key = f"frame_{frame_idx:05d}"
+            valid_flat_indices_all.append(valid_indices_npz[key] if key in valid_indices_npz else np.zeros((0,), dtype=np.int64))
+        _write_debug_mask_pngs(
+            output_dir=debug_mask_dir,
+            depth_shape=all_depth.shape,
+            sky_mask=sky_mask,
+            valid_flat_indices_all=valid_flat_indices_all,
         )
 
     logger.info("Computed valid pixel indices for %d frames", len(valid_pixel_indices))
@@ -636,7 +1036,7 @@ def load_data(
             offset=offset,
         )
 
-    depth_conf = all_conf[indices]  # (N, H, W)
+    depth_conf = all_conf_filtered[indices]  # (N, H, W)
     depth_maps = all_depth[indices]  # (N, H, W)
 
     return (
@@ -709,6 +1109,10 @@ def load_depth_maps_da3(
     offset: int = 0,
     device: str = "cpu",
     conf_thresh_percentile: float = 40.0,
+    conf_mask_depth_edges: bool = False,
+    conf_edge_rtol: float | None = 0.03,
+    conf_edge_atol: float | None = None,
+    conf_edge_kernel_size: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Load raw depth maps and per-pixel validity masks from a DA3 NPZ file.
 
@@ -730,12 +1134,21 @@ def load_depth_maps_da3(
 
     all_depth = predictions["depth"]  # (N_total, H, W)
     all_conf = predictions["conf"]  # (N_total, H, W)
-    conf_thresh = np.percentile(all_conf, conf_thresh_percentile)
+    all_conf_filtered, base_valid_mask = _apply_depth_edge_suppression(
+        all_depth,
+        all_conf,
+        enabled=conf_mask_depth_edges,
+        edge_rtol=conf_edge_rtol,
+        edge_atol=conf_edge_atol,
+        edge_kernel_size=conf_edge_kernel_size,
+    )
+    conf_thresh = np.percentile(all_conf_filtered, conf_thresh_percentile)
 
     depth_selected = all_depth[indices]  # (N, H, W)
-    conf_selected = all_conf[indices]  # (N, H, W)
+    conf_selected = all_conf_filtered[indices]  # (N, H, W)
+    valid_base_selected = base_valid_mask[indices]  # (N, H, W)
 
-    valid = np.isfinite(depth_selected) & (depth_selected > 0) & (conf_selected >= conf_thresh)
+    valid = valid_base_selected & (conf_selected >= conf_thresh)
 
     depth_maps = torch.from_numpy(depth_selected.astype(np.float32)).to(device)
     valid_masks = torch.from_numpy(valid).to(device)

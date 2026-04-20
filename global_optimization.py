@@ -127,6 +127,16 @@ def main(config: GlobalOptimizationConfig):
         conf_global_percentile=align_params.conf_global_percentile,
         voxel_size=align_params.conf_voxel_size,
         voxel_min_count_percentile=align_params.conf_voxel_min_count_percentile,
+        conf_mask_sky=align_params.conf_mask_sky,
+        conf_mask_sky_depth_band=align_params.conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent=align_params.conf_sky_depth_band_percent,
+        conf_mask_depth_edges=align_params.conf_mask_depth_edges,
+        conf_edge_rtol=align_params.conf_edge_rtol,
+        conf_edge_atol=align_params.conf_edge_atol,
+        conf_edge_kernel_size=align_params.conf_edge_kernel_size,
+        conf_mask_max_depth=align_params.conf_mask_max_depth,
+        conf_max_depth_rtol=align_params.conf_max_depth_rtol,
+        conf_max_depth_atol=align_params.conf_max_depth_atol,
         offset=align_params.offset,
     )
 
