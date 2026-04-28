@@ -23,6 +23,17 @@ except ImportError as exc:  # pragma: no cover - exercised at runtime.
         "Gradio is required for this UI. Install it with `pip install gradio` in the active environment."
     ) from exc
 
+try:
+    _GRADIO_MAJOR_VERSION = int(str(gr.__version__).split(".", 1)[0])
+except (TypeError, ValueError):  # pragma: no cover - defensive runtime fallback.
+    _GRADIO_MAJOR_VERSION = 0
+
+if _GRADIO_MAJOR_VERSION >= 6:  # pragma: no cover - exercised at runtime.
+    raise SystemExit(
+        f"Detected gradio {gr.__version__}. This app currently requires `gradio<6` due to a frontend compatibility "
+        "regression with Gradio 6. Install a 5.x release, for example `pip install \"gradio<6\"`."
+    )
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 VIDEOS_ROOT = (PROJECT_ROOT / "videos").resolve()
@@ -34,7 +45,20 @@ APP_VERSION = APP_BUILD_TIME
 WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
 MAX_LOG_LINES = 220
 POLL_INTERVAL_SEC = 1.0
-DEFAULT_STAGE0_MAX_FRAMES = 30
+DEFAULT_STAGE0_MAX_FRAMES = 20
+DEFAULT_STAGE0_MAX_STRIDE = 6
+DEFAULT_STAGE0_STREAMING_OVERLAP = 10
+DEFAULT_STAGE0_REF_VIEW_STRATEGY = "saddle_balanced"
+DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT = "directstorage_stream"
+UPLOAD_SCENE_DIRNAME = "scene"
+UPLOAD_FRAMES_DIRNAME = "frames"
+RUNTIME_EXPORT_CHOICES = [
+    ("DirectStorage Stream", "directstorage_stream"),
+    ("Kinect RGBD Video (HAP Q)", "kinect_rgbd_video"),
+    ("Packed Frame Sequence", "packed_frame_sequence"),
+    ("Packed Frame Sequence (8-bit Depth)", "packed_frame_sequence_depth8"),
+    ("None", "none"),
+]
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv"}
 IGNORED_VIDEO_DIR_NAMES = {"gs_video", "gs_video_eval"}
 
@@ -126,6 +150,35 @@ def _safe_stem(name: str) -> str:
     return safe or "scene"
 
 
+def _new_upload_uid() -> str:
+    while True:
+        candidate = uuid.uuid4().hex[:8]
+        if not (UPLOADS_ROOT / candidate).exists():
+            return candidate
+
+
+def _is_managed_upload_path(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(UPLOADS_ROOT.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _default_scene_root_for_video(input_video: Path) -> Path:
+    video_path = input_video.resolve()
+    if _is_managed_upload_path(video_path) and video_path.parent != UPLOADS_ROOT.resolve():
+        return (video_path.parent / UPLOAD_SCENE_DIRNAME).resolve()
+    return video_path.with_suffix("").resolve()
+
+
+def _default_scene_root_for_frames_dir(frames_dir: Path) -> Path:
+    frames_path = frames_dir.resolve()
+    if _is_managed_upload_path(frames_path) and frames_path.parent != UPLOADS_ROOT.resolve():
+        return (frames_path.parent / UPLOAD_SCENE_DIRNAME).resolve()
+    return frames_path.with_name(f"{frames_path.name}_preprocessed").resolve()
+
+
 def _coerce_int(value: object, *, label: str, optional: bool = False) -> Optional[int]:
     if value in (None, ""):
         if optional:
@@ -146,6 +199,14 @@ def _coerce_float(value: object, *, label: str, optional: bool = False) -> Optio
         return float(str(value))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be a number.") from exc
+
+
+def _coerce_runtime_export_format(value: object, *, label: str = "Stage 0 Runtime Export") -> str:
+    normalized = str(value or "none").strip()
+    valid_values = {choice_value for _, choice_value in RUNTIME_EXPORT_CHOICES}
+    if normalized not in valid_values:
+        raise ValueError(f"{label} must be one of: {', '.join(sorted(valid_values))}.")
+    return normalized
 
 
 def _append_confidence_filter_args(
@@ -270,6 +331,53 @@ def _append_sky_depth_band_args(
         command.extend([f"--{prefix}.conf-sky-depth-band-percent", str(band_percent)])
 
 
+def _append_min_depth_range_args(
+    command: list[str],
+    *,
+    prefix: str,
+    enabled_percent: bool,
+    min_depth_range_percent: Optional[float],
+    enabled_meters: bool,
+    min_depth_range_meters: Optional[float],
+) -> None:
+    _append_tyro_bool_arg(
+        command,
+        prefix=prefix,
+        name="conf_mask_min_depth_range_percent",
+        value=enabled_percent,
+        default=True,
+    )
+    if min_depth_range_percent is not None:
+        _append_tyro_value_arg(
+            command,
+            prefix=prefix,
+            name="conf_min_depth_range_percent",
+            value=min_depth_range_percent,
+            default=50.0,
+        )
+    _append_tyro_bool_arg(
+        command,
+        prefix=prefix,
+        name="conf_mask_min_depth_range_meters",
+        value=enabled_meters,
+        default=False,
+    )
+    if min_depth_range_meters is not None:
+        _append_tyro_value_arg(
+            command,
+            prefix=prefix,
+            name="conf_min_depth_range_meters",
+            value=min_depth_range_meters,
+            default=3.0,
+        )
+
+
+def _append_prepare_bool_arg(command: list[str], *, name: str, value: bool, default: bool) -> None:
+    if value == default:
+        return
+    command.append(f"--{name}" if value else f"--no-{name}")
+
+
 def _append_prepare_alignment_args(
     command: list[str],
     *,
@@ -281,6 +389,10 @@ def _append_prepare_alignment_args(
     conf_mask_sky: bool,
     conf_mask_sky_depth_band: bool,
     conf_sky_depth_band_percent: Optional[float],
+    conf_mask_min_depth_range_percent: bool,
+    conf_min_depth_range_percent: Optional[float],
+    conf_mask_min_depth_range_meters: bool,
+    conf_min_depth_range_meters: Optional[float],
     conf_mask_depth_edges: bool,
     conf_edge_rtol: Optional[float],
     conf_edge_atol: Optional[float],
@@ -342,6 +454,22 @@ def _append_prepare_alignment_args(
         command.append("--prepare_conf_mask_sky_depth_band")
         if conf_sky_depth_band_percent is not None:
             command.extend(["--prepare_conf_sky_depth_band_percent", str(conf_sky_depth_band_percent)])
+    _append_prepare_bool_arg(
+        command,
+        name="prepare_conf_mask_min_depth_range_percent",
+        value=conf_mask_min_depth_range_percent,
+        default=True,
+    )
+    if conf_min_depth_range_percent is not None:
+        command.extend(["--prepare_conf_min_depth_range_percent", str(conf_min_depth_range_percent)])
+    _append_prepare_bool_arg(
+        command,
+        name="prepare_conf_mask_min_depth_range_meters",
+        value=conf_mask_min_depth_range_meters,
+        default=False,
+    )
+    if conf_min_depth_range_meters is not None:
+        command.extend(["--prepare_conf_min_depth_range_meters", str(conf_min_depth_range_meters)])
     if conf_mask_depth_edges:
         if conf_edge_rtol is None and conf_edge_atol is None:
             raise ValueError("Depth-edge suppression needs a relative or absolute threshold.")
@@ -525,28 +653,23 @@ def _append_gs_extra_args(command: list[str], *, prefix: str, settings: dict[str
 
 def _copy_uploaded_video(uploaded_path: str) -> Path:
     source = _resolve_existing_file(uploaded_path)
-    try:
-        source.relative_to(UPLOADS_ROOT)
+    if _is_managed_upload_path(source):
         return source.resolve()
-    except ValueError:
-        pass
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = UPLOADS_ROOT / f"{stamp}_{uuid.uuid4().hex[:8]}_{_safe_stem(source.name)}{source.suffix.lower()}"
+    upload_dir = UPLOADS_ROOT / _new_upload_uid()
+    upload_dir.mkdir(parents=True, exist_ok=False)
+    target = upload_dir / f"{upload_dir.name}{source.suffix.lower()}"
     shutil.copy2(source, target)
-    return target
+    return target.resolve()
 
 
 def _copy_uploaded_frames_dir(frames_dir_path: object) -> Path:
     source = _resolve_existing_dir(frames_dir_path)
-    try:
-        source.relative_to(UPLOADS_ROOT)
+    if _is_managed_upload_path(source):
         return source.resolve()
-    except ValueError:
-        pass
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = UPLOADS_ROOT / f"{stamp}_{uuid.uuid4().hex[:8]}_{_safe_stem(source.name)}"
+    upload_dir = UPLOADS_ROOT / _new_upload_uid()
+    target = upload_dir / UPLOAD_FRAMES_DIRNAME
     shutil.copytree(source, target)
     return target.resolve()
 
@@ -1102,13 +1225,15 @@ def _build_pipeline_command(
     preprocess_overwrite: bool,
     preprocess_max_frames: int,
     preprocess_max_stride: int,
+    preprocess_streaming: bool,
+    preprocess_streaming_overlap: int,
     preprocess_image_ext: str,
     preprocess_model_name: str,
     preprocess_process_res: int,
     preprocess_process_res_method: str,
     preprocess_export_gs_video: bool,
-    preprocess_export_kinect_rgbd_video: bool,
-    preprocess_kinect_rgbd_video_fps: int,
+    preprocess_runtime_export_format: str,
+    preprocess_runtime_export_fps: int,
     preprocess_use_ray_pose: bool,
     preprocess_ref_view_strategy: str,
     alignment_num_frames: int,
@@ -1119,6 +1244,10 @@ def _build_pipeline_command(
     conf_mask_sky: bool,
     conf_mask_sky_depth_band: bool,
     conf_sky_depth_band_percent: Optional[float],
+    conf_mask_min_depth_range_percent: bool,
+    conf_min_depth_range_percent: Optional[float],
+    conf_mask_min_depth_range_meters: bool,
+    conf_min_depth_range_meters: Optional[float],
     conf_mask_depth_edges: bool,
     conf_edge_rtol: Optional[float],
     conf_edge_atol: Optional[float],
@@ -1151,16 +1280,18 @@ def _build_pipeline_command(
 
     command += ["--config.preprocess-max-frames", str(preprocess_max_frames)]
     command += ["--config.preprocess-max-stride", str(preprocess_max_stride)]
+    if preprocess_streaming:
+        command += ["--config.preprocess-streaming"]
+    command += ["--config.preprocess-streaming-overlap", str(preprocess_streaming_overlap)]
     command += ["--config.preprocess-image-ext", preprocess_image_ext]
     command += ["--config.preprocess-model-name", preprocess_model_name]
     command += ["--config.preprocess-process-res", str(preprocess_process_res)]
     command += ["--config.preprocess-process-res-method", preprocess_process_res_method]
     command += ["--config.preprocess-ref-view-strategy", preprocess_ref_view_strategy]
+    command += ["--config.preprocess-runtime-export-format", preprocess_runtime_export_format]
+    command += ["--config.preprocess-runtime-export-fps", str(preprocess_runtime_export_fps)]
     if preprocess_export_gs_video:
         command += ["--config.preprocess-export-gs-video"]
-    if preprocess_export_kinect_rgbd_video:
-        command += ["--config.preprocess-export-kinect-rgbd-video"]
-        command += ["--config.preprocess-kinect-rgbd-video-fps", str(preprocess_kinect_rgbd_video_fps)]
     if preprocess_use_ray_pose:
         command += ["--config.preprocess-use-ray-pose"]
     command += ["--config.stage0-alignment.num-frames", str(alignment_num_frames)]
@@ -1182,6 +1313,14 @@ def _build_pipeline_command(
         prefix="config.stage0-alignment",
         enabled=conf_mask_sky_depth_band,
         band_percent=conf_sky_depth_band_percent,
+    )
+    _append_min_depth_range_args(
+        command,
+        prefix="config.stage0-alignment",
+        enabled_percent=conf_mask_min_depth_range_percent,
+        min_depth_range_percent=conf_min_depth_range_percent,
+        enabled_meters=conf_mask_min_depth_range_meters,
+        min_depth_range_meters=conf_min_depth_range_meters,
     )
     _append_depth_edge_args(
         command,
@@ -1223,15 +1362,17 @@ def _build_stage0_command(
     preprocess_overwrite: bool,
     preprocess_max_frames: int,
     preprocess_max_stride: int,
+    preprocess_streaming: bool,
+    preprocess_streaming_overlap: int,
     preprocess_image_ext: str,
     preprocess_model_name: str,
     preprocess_process_res: int = 768,
     preprocess_process_res_method: str = "upper_bound_resize",
     preprocess_export_gs_video: bool = False,
-    preprocess_export_kinect_rgbd_video: bool = False,
-    preprocess_kinect_rgbd_video_fps: int = 30,
+    preprocess_runtime_export_format: str = DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT,
+    preprocess_runtime_export_fps: int = 30,
     preprocess_use_ray_pose: bool = False,
-    preprocess_ref_view_strategy: str = "first",
+    preprocess_ref_view_strategy: str = DEFAULT_STAGE0_REF_VIEW_STRATEGY,
     alignment_num_frames: int = 50,
     alignment_stride: int = 2,
     alignment_offset: int = 0,
@@ -1240,8 +1381,12 @@ def _build_stage0_command(
     conf_mask_sky: bool = False,
     conf_mask_sky_depth_band: bool = False,
     conf_sky_depth_band_percent: Optional[float] = None,
+    conf_mask_min_depth_range_percent: bool = True,
+    conf_min_depth_range_percent: Optional[float] = 50.0,
+    conf_mask_min_depth_range_meters: bool = False,
+    conf_min_depth_range_meters: Optional[float] = 3.0,
     conf_mask_depth_edges: bool = True,
-    conf_edge_rtol: Optional[float] = 0.03,
+    conf_edge_rtol: Optional[float] = 0.1,
     conf_edge_atol: Optional[float] = None,
     conf_edge_kernel_size: int = 3,
     conf_mask_max_depth: bool = False,
@@ -1256,6 +1401,12 @@ def _build_stage0_command(
         preprocess_image_ext,
         "--model_name",
         preprocess_model_name,
+        "--streaming_overlap",
+        str(preprocess_streaming_overlap),
+        "--runtime_export_format",
+        preprocess_runtime_export_format,
+        "--runtime_export_fps",
+        str(preprocess_runtime_export_fps),
         "--process_res",
         str(preprocess_process_res),
         "--process_res_method",
@@ -1265,10 +1416,10 @@ def _build_stage0_command(
     ]
     if preprocess_export_gs_video:
         command += ["--export_gs_video"]
-    if preprocess_export_kinect_rgbd_video:
-        command += ["--export_kinect_rgbd_video", "--kinect_rgbd_video_fps", str(preprocess_kinect_rgbd_video_fps)]
     if preprocess_use_ray_pose:
         command += ["--use_ray_pose"]
+    if preprocess_streaming:
+        command += ["--streaming"]
     if input_video is not None:
         command += [
             "--input_video",
@@ -1296,6 +1447,10 @@ def _build_stage0_command(
         conf_mask_sky=conf_mask_sky,
         conf_mask_sky_depth_band=conf_mask_sky_depth_band,
         conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent=conf_mask_min_depth_range_percent,
+        conf_min_depth_range_percent=conf_min_depth_range_percent,
+        conf_mask_min_depth_range_meters=conf_mask_min_depth_range_meters,
+        conf_min_depth_range_meters=conf_min_depth_range_meters,
         conf_mask_depth_edges=conf_mask_depth_edges,
         conf_edge_rtol=conf_edge_rtol,
         conf_edge_atol=conf_edge_atol,
@@ -1435,10 +1590,10 @@ def _prepare_pipeline_run(
         scene_root_override = _compose_scene_root_override(
             output_parent_selection,
             custom_scene_name,
-            default_stem=_safe_stem(input_video.name),
+            default_stem=input_video.parent.name if _is_managed_upload_path(input_video) else _safe_stem(input_video.name),
         )
         scene_root_override = _ensure_unique_scene_root(scene_root_override) if scene_root_override is not None else None
-        effective_scene_root = scene_root_override or _ensure_unique_scene_root(input_video.with_suffix(""))
+        effective_scene_root = scene_root_override or _ensure_unique_scene_root(_default_scene_root_for_video(input_video))
         return input_video, None, scene_root_override, effective_scene_root, f"Copied upload to `{input_video}`"
 
     if normalized == "existing_video":
@@ -1448,9 +1603,9 @@ def _prepare_pipeline_run(
         scene_root_override = _compose_scene_root_override(
             output_parent_selection,
             custom_scene_name,
-            default_stem=_safe_stem(input_video.name),
+            default_stem=input_video.parent.name if _is_managed_upload_path(input_video) else _safe_stem(input_video.name),
         )
-        effective_scene_root = scene_root_override or input_video.with_suffix("")
+        effective_scene_root = scene_root_override or _default_scene_root_for_video(input_video)
         return input_video, None, scene_root_override, effective_scene_root, f"Using existing video `{input_video}`"
 
     if normalized != "existing_scene":
@@ -1480,10 +1635,10 @@ def _prepare_stage0_run(
         scene_root_override = _compose_scene_root_override(
             output_parent_selection,
             custom_scene_name,
-            default_stem=_safe_stem(input_video.name),
+            default_stem=input_video.parent.name if _is_managed_upload_path(input_video) else _safe_stem(input_video.name),
         )
         scene_root_override = _ensure_unique_scene_root(scene_root_override) if scene_root_override is not None else None
-        effective_scene_root = scene_root_override or _ensure_unique_scene_root(input_video.with_suffix(""))
+        effective_scene_root = scene_root_override or _ensure_unique_scene_root(_default_scene_root_for_video(input_video))
         return input_video, None, scene_root_override, effective_scene_root, f"Copied upload to `{input_video}`"
 
     if normalized == "existing_video":
@@ -1493,9 +1648,9 @@ def _prepare_stage0_run(
         scene_root_override = _compose_scene_root_override(
             output_parent_selection,
             custom_scene_name,
-            default_stem=_safe_stem(input_video.name),
+            default_stem=input_video.parent.name if _is_managed_upload_path(input_video) else _safe_stem(input_video.name),
         )
-        effective_scene_root = scene_root_override or input_video.with_suffix("")
+        effective_scene_root = scene_root_override or _default_scene_root_for_video(input_video)
         return input_video, None, scene_root_override, effective_scene_root, f"Using existing video `{input_video}`"
 
     if normalized != "existing_frames":
@@ -1508,11 +1663,9 @@ def _prepare_stage0_run(
     scene_root_override = _compose_scene_root_override(
         output_parent_selection,
         custom_scene_name,
-        default_stem=_safe_stem(frames_dir.name),
+        default_stem=frames_dir.parent.name if _is_managed_upload_path(frames_dir) else _safe_stem(frames_dir.name),
     )
-    effective_scene_root = scene_root_override or _ensure_unique_scene_root(
-        frames_dir.with_name(f"{frames_dir.name}_preprocessed")
-    )
+    effective_scene_root = scene_root_override or _ensure_unique_scene_root(_default_scene_root_for_frames_dir(frames_dir))
     return (
         None,
         frames_dir,
@@ -1677,13 +1830,15 @@ def _run_pipeline_generator(*args, **kwargs):
         preprocess_overwrite,
         preprocess_max_frames,
         preprocess_max_stride,
+        preprocess_streaming,
+        preprocess_streaming_overlap,
         preprocess_image_ext,
         preprocess_model_name,
         preprocess_process_res,
         preprocess_process_res_method,
         preprocess_export_gs_video,
-        preprocess_export_kinect_rgbd_video,
-        preprocess_kinect_rgbd_video_fps,
+        preprocess_runtime_export_format,
+        preprocess_runtime_export_fps,
         preprocess_use_ray_pose,
         preprocess_ref_view_strategy,
         alignment_num_frames,
@@ -1694,6 +1849,10 @@ def _run_pipeline_generator(*args, **kwargs):
         conf_mask_sky,
         conf_mask_sky_depth_band,
         conf_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent,
+        conf_min_depth_range_percent,
+        conf_mask_min_depth_range_meters,
+        conf_min_depth_range_meters,
         conf_mask_depth_edges,
         conf_edge_rtol,
         conf_edge_atol,
@@ -1841,15 +2000,19 @@ def _run_pipeline_generator(*args, **kwargs):
             renderer_choice=renderer_choice,
             preprocess_overwrite=preprocess_overwrite,
             preprocess_max_frames=_coerce_int(preprocess_max_frames, label="Stage 0 Max Frames") or DEFAULT_STAGE0_MAX_FRAMES,
-            preprocess_max_stride=_coerce_int(preprocess_max_stride, label="Stage 0 Max Stride") or 8,
+            preprocess_max_stride=_coerce_int(preprocess_max_stride, label="Stage 0 Max Stride") or DEFAULT_STAGE0_MAX_STRIDE,
+            preprocess_streaming=bool(preprocess_streaming),
+            preprocess_streaming_overlap=(
+                _coerce_int(preprocess_streaming_overlap, label="DA3 Streaming Overlap") or DEFAULT_STAGE0_STREAMING_OVERLAP
+            ),
             preprocess_image_ext=str(preprocess_image_ext or "png"),
             preprocess_model_name=str(preprocess_model_name or "depth-anything/DA3NESTED-GIANT-LARGE"),
             preprocess_process_res=_coerce_int(preprocess_process_res, label="DA3 Processing Resolution") or 768,
             preprocess_process_res_method=str(preprocess_process_res_method or "upper_bound_resize"),
             preprocess_export_gs_video=bool(preprocess_export_gs_video),
-            preprocess_export_kinect_rgbd_video=bool(preprocess_export_kinect_rgbd_video),
-            preprocess_kinect_rgbd_video_fps=(
-                _coerce_int(preprocess_kinect_rgbd_video_fps, label="Kinect RGBD Video FPS") or 30
+            preprocess_runtime_export_format=_coerce_runtime_export_format(preprocess_runtime_export_format),
+            preprocess_runtime_export_fps=(
+                _coerce_int(preprocess_runtime_export_fps, label="Stage 0 Runtime Export FPS") or 30
             ),
             preprocess_use_ray_pose=bool(preprocess_use_ray_pose),
             preprocess_ref_view_strategy=str(preprocess_ref_view_strategy or "auto"),
@@ -1867,6 +2030,18 @@ def _run_pipeline_generator(*args, **kwargs):
             conf_sky_depth_band_percent=_coerce_float(
                 conf_sky_depth_band_percent,
                 label="Sky Depth Band Percent",
+                optional=True,
+            ),
+            conf_mask_min_depth_range_percent=bool(conf_mask_min_depth_range_percent),
+            conf_min_depth_range_percent=_coerce_float(
+                conf_min_depth_range_percent,
+                label="Min Depth Range Percent",
+                optional=True,
+            ),
+            conf_mask_min_depth_range_meters=bool(conf_mask_min_depth_range_meters),
+            conf_min_depth_range_meters=_coerce_float(
+                conf_min_depth_range_meters,
+                label="Min Depth Range Meters",
                 optional=True,
             ),
             conf_mask_depth_edges=bool(conf_mask_depth_edges),
@@ -2073,6 +2248,95 @@ def _export_depth_volume(
         return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
 
 
+def _export_runtime_format(
+    scene_root_selection,
+    runtime_export_format,
+    runtime_export_fps,
+):
+    import traceback as _tb
+
+    if not scene_root_selection:
+        return "**Error:** No scene selected. Select a scene root first."
+
+    export_format = _coerce_runtime_export_format(runtime_export_format)
+    fps = _coerce_int(runtime_export_fps, label="Stage 0 Runtime Export FPS") or 30
+
+    try:
+        if export_format == "directstorage_stream":
+            from export_depth_image_stream_bc7 import export_depth_image_stream_bc7
+
+            output_path = export_depth_image_stream_bc7(
+                scene_root=scene_root_selection,
+                fps=int(fps),
+                overwrite=True,
+            )
+            return (
+                f"**Stage 0 runtime export complete!**\n\n"
+                f"- Format: `DirectStorage stream`\n"
+                f"- Output: `{output_path}`\n\n"
+                "Point `ADepthImageVolumeDirectStorageActor` at this `.divstream` file."
+            )
+
+        if export_format == "kinect_rgbd_video":
+            from export_stage0_kinect_video import export_stage0_kinect_video
+
+            output_dir = export_stage0_kinect_video(
+                scene_root=scene_root_selection,
+                fps=int(fps),
+                overwrite=True,
+            )
+            return (
+                f"**Stage 0 runtime export complete!**\n\n"
+                f"- Format: `Kinect RGBD Video (HAP Q)`\n"
+                f"- Root: `{output_dir}`\n"
+                f"- Video: `{os.path.join(output_dir, 'kinect_rgbd_hapq.mov')}`\n"
+                f"- Sequence info: `{os.path.join(output_dir, 'sequence_info.json')}`"
+            )
+
+        if export_format == "packed_frame_sequence":
+            from export_stage0_kinect_video import export_stage0_kinect_image_sequence
+
+            output_dir = export_stage0_kinect_image_sequence(
+                scene_root=scene_root_selection,
+                fps=int(fps),
+                overwrite=True,
+            )
+            frames_dir = os.path.join(output_dir, "frames")
+            sequence_info_path = os.path.join(output_dir, "sequence_info.json")
+            return (
+                f"**Stage 0 runtime export complete!**\n\n"
+                f"- Format: `Packed frame sequence`\n"
+                f"- Root: `{output_dir}`\n"
+                f"- Frames: `{frames_dir}`\n"
+                f"- Sequence info: `{sequence_info_path}`\n\n"
+                "Point `ADepthImageVolumeImageSequenceActor` at the sequence root or `frames/` directory."
+            )
+
+        if export_format == "packed_frame_sequence_depth8":
+            from export_stage0_kinect_video import export_stage0_kinect_image_sequence_depth8
+
+            output_dir = export_stage0_kinect_image_sequence_depth8(
+                scene_root=scene_root_selection,
+                fps=int(fps),
+                overwrite=True,
+            )
+            frames_dir = os.path.join(output_dir, "frames")
+            sequence_info_path = os.path.join(output_dir, "sequence_info.json")
+            return (
+                f"**Stage 0 runtime export complete!**\n\n"
+                f"- Format: `Packed frame sequence (8-bit depth)`\n"
+                f"- Root: `{output_dir}`\n"
+                f"- Frames: `{frames_dir}`\n"
+                f"- Sequence info: `{sequence_info_path}`\n\n"
+                "Point `ADepthImageVolumeImageSequenceActor` at the sequence root or `frames/` directory."
+            )
+
+        return "**Error:** Runtime export format is set to `none`."
+    except Exception as exc:
+        tb = _tb.format_exc()
+        return f"**Export failed:**\n\n```\n{exc}\n```\n\n<details><summary>Full traceback</summary>\n\n```\n{tb}\n```\n\n</details>"
+
+
 def _export_packed_frame_sequence(
     scene_root_selection,
     packed_sequence_fps,
@@ -2147,10 +2411,10 @@ def _export_directstorage_stream(
     try:
         from export_depth_image_stream_bc7 import export_depth_image_stream_bc7
 
-        fps = _coerce_int(stream_fps, label="DirectStorage Stream FPS") or 30
+        fps = _coerce_int(stream_fps, label="DirectStorage Stream FPS")
         output_path = export_depth_image_stream_bc7(
             scene_root=scene_root_selection,
-            fps=int(fps),
+            fps=(int(fps) if fps else None),
             overwrite=True,
         )
         return (
@@ -2300,13 +2564,15 @@ def _run_stage_generator(*args, **kwargs):
         stage0_overwrite,
         stage0_max_frames,
         stage0_max_stride,
+        stage0_streaming,
+        stage0_streaming_overlap,
         stage0_image_ext,
         stage0_model_name,
         stage0_process_res,
         stage0_process_res_method,
         stage0_export_gs_video,
-        stage0_export_kinect_rgbd_video,
-        stage0_kinect_rgbd_video_fps,
+        stage0_runtime_export_format,
+        stage0_runtime_export_fps,
         stage0_use_ray_pose,
         stage0_ref_view_strategy,
         stage_scene_root_selection,
@@ -2319,6 +2585,10 @@ def _run_stage_generator(*args, **kwargs):
         stage1_conf_mask_sky,
         stage1_conf_mask_sky_depth_band,
         stage1_conf_sky_depth_band_percent,
+        stage1_conf_mask_min_depth_range_percent,
+        stage1_conf_min_depth_range_percent,
+        stage1_conf_mask_min_depth_range_meters,
+        stage1_conf_min_depth_range_meters,
         stage1_conf_mask_depth_edges,
         stage1_conf_edge_rtol,
         stage1_conf_edge_atol,
@@ -2468,15 +2738,19 @@ def _run_stage_generator(*args, **kwargs):
                 scene_root_override=scene_root_override,
                 preprocess_overwrite=stage0_overwrite,
                 preprocess_max_frames=_coerce_int(stage0_max_frames, label="Stage 0 Max Frames") or DEFAULT_STAGE0_MAX_FRAMES,
-                preprocess_max_stride=_coerce_int(stage0_max_stride, label="Stage 0 Max Stride") or 8,
+                preprocess_max_stride=_coerce_int(stage0_max_stride, label="Stage 0 Max Stride") or DEFAULT_STAGE0_MAX_STRIDE,
+                preprocess_streaming=bool(stage0_streaming),
+                preprocess_streaming_overlap=(
+                    _coerce_int(stage0_streaming_overlap, label="DA3 Streaming Overlap") or DEFAULT_STAGE0_STREAMING_OVERLAP
+                ),
                 preprocess_image_ext=str(stage0_image_ext or "png"),
                 preprocess_model_name=str(stage0_model_name or "depth-anything/DA3NESTED-GIANT-LARGE"),
                 preprocess_process_res=_coerce_int(stage0_process_res, label="DA3 Processing Resolution") or 768,
                 preprocess_process_res_method=str(stage0_process_res_method or "upper_bound_resize"),
                 preprocess_export_gs_video=bool(stage0_export_gs_video),
-                preprocess_export_kinect_rgbd_video=bool(stage0_export_kinect_rgbd_video),
-                preprocess_kinect_rgbd_video_fps=(
-                    _coerce_int(stage0_kinect_rgbd_video_fps, label="Kinect RGBD Video FPS") or 30
+                preprocess_runtime_export_format=_coerce_runtime_export_format(stage0_runtime_export_format),
+                preprocess_runtime_export_fps=(
+                    _coerce_int(stage0_runtime_export_fps, label="Stage 0 Runtime Export FPS") or 30
                 ),
                 preprocess_use_ray_pose=bool(stage0_use_ray_pose),
                 preprocess_ref_view_strategy=str(stage0_ref_view_strategy or "auto"),
@@ -2490,6 +2764,18 @@ def _run_stage_generator(*args, **kwargs):
                 conf_sky_depth_band_percent=_coerce_float(
                     stage1_conf_sky_depth_band_percent,
                     label="Sky Depth Band Percent",
+                    optional=True,
+                ),
+                conf_mask_min_depth_range_percent=bool(stage1_conf_mask_min_depth_range_percent),
+                conf_min_depth_range_percent=_coerce_float(
+                    stage1_conf_min_depth_range_percent,
+                    label="Min Depth Range Percent",
+                    optional=True,
+                ),
+                conf_mask_min_depth_range_meters=bool(stage1_conf_mask_min_depth_range_meters),
+                conf_min_depth_range_meters=_coerce_float(
+                    stage1_conf_min_depth_range_meters,
+                    label="Min Depth Range Meters",
                     optional=True,
                 ),
                 conf_mask_depth_edges=bool(stage1_conf_mask_depth_edges),
@@ -3130,16 +3416,22 @@ def build_app() -> gr.Blocks:
                 with gr.Accordion("Stage 0", open=False):
                     with gr.Row():
                         preprocess_max_frames = gr.Number(
-                            label="DA3 Input Max Frames",
+                            label="DA3 Input Max Frames / Chunk Size",
                             value=DEFAULT_STAGE0_MAX_FRAMES,
                             precision=0,
-                            info="Maximum raw video frames Stage 0 will send to DA3.",
+                            info="Global DA3 frame cap in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                         )
                         preprocess_max_stride = gr.Number(
                             label="DA3 Input Max Stride",
-                            value=8,
+                            value=DEFAULT_STAGE0_MAX_STRIDE,
                             precision=0,
-                            info="Upper bound on raw-video frame spacing during Stage 0 subsampling.",
+                            info="Upper bound on raw-video frame spacing in standard mode. Ignored in streaming mode, which now processes the full extracted clip by default.",
+                        )
+                        preprocess_streaming_overlap = gr.Number(
+                            label="DA3 Streaming Overlap",
+                            value=DEFAULT_STAGE0_STREAMING_OVERLAP,
+                            precision=0,
+                            info="Overlap between adjacent DA3 chunks when streaming mode is enabled.",
                         )
                         preprocess_image_ext = gr.Textbox(label="Image Extension", value="png")
                     preprocess_model_name = gr.Textbox(label="DA3 Model Name", value="depth-anything/DA3NESTED-GIANT-LARGE")
@@ -3158,43 +3450,49 @@ def build_app() -> gr.Blocks:
                         )
                         preprocess_ref_view_strategy = gr.Dropdown(
                             choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
-                            value="first",
+                            value=DEFAULT_STAGE0_REF_VIEW_STRATEGY,
                             label="DA3 Reference View",
-                            info="Default is `first` for this project.",
+                            info="Default is `saddle_balanced` for this project.",
                         )
                         preprocess_export_gs_video = gr.Checkbox(
                             label="Export DA3 GS Preview Video",
                             value=False,
                             info="Opt-in preview export. Leave off for a faster Stage 0.",
                         )
-                        preprocess_export_kinect_rgbd_video = gr.Checkbox(
-                            label="Export Kinect RGBD Video",
-                            value=False,
-                            info="Write a packed `[metadata|color|depth]` lossless video after Stage 0.",
+                        preprocess_runtime_export_format = gr.Dropdown(
+                            choices=RUNTIME_EXPORT_CHOICES,
+                            value=DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT,
+                            label="Stage 0 Runtime Export",
+                            info="Optional runtime-ready export written after Stage 0. Default is DirectStorage stream.",
                         )
                     with gr.Row():
-                        preprocess_kinect_rgbd_video_fps = gr.Number(
-                            label="Kinect RGBD Video FPS",
+                        preprocess_runtime_export_fps = gr.Number(
+                            label="Stage 0 Runtime Export FPS",
                             value=30,
                             precision=0,
-                            info="Frame rate used when assembling the packed Stage 0 RGBD video.",
+                            info="Frame rate metadata used by the selected Stage 0 runtime export.",
                         )
                         preprocess_use_ray_pose = gr.Checkbox(
                             label="Use DA3 Ray Pose",
                             value=False,
                             info="Use ray-based pose estimation instead of the camera decoder.",
                         )
+                        preprocess_streaming = gr.Checkbox(
+                            label="Use DA3 Streaming",
+                            value=False,
+                            info="Process the full selected sequence in overlapping chunks instead of one global DA3 batch.",
+                        )
                     gr.Markdown(
                         "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus "
-                        "`before_non_rigid_icp.ply` for the selected pre-ICP settings. Both the DA3 GS preview video and the packed Kinect-layout RGBD video are optional."
+                        "`before_non_rigid_icp.ply` for the selected pre-ICP settings. The DA3 GS preview video is optional, and `Stage 0 Runtime Export` chooses the runtime-ready output to write after preprocessing. "
+                        "When `Use DA3 Streaming` is enabled, `DA3 Input Max Frames / Chunk Size` becomes the chunk size and Stage 0 covers the full extracted clip with overlapping chunks."
                     )
                     gr.Markdown(
-                        "Reference-view note: this app now defaults DA3 to `first`. "
-                        "The original code path used DA3's default `saddle_balanced`."
+                        "Reference-view note: this app now defaults DA3 to `saddle_balanced`."
                     )
                     gr.Markdown(
-                        "Example: raw `500` frames with `DA3 Input Max Frames=30`, `DA3 Input Max Stride=8` usually gives about every 8th raw frame. "
-                        "Raw `5000` frames with the same settings clamps to stride 8 and only covers the earlier part of the clip."
+                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Max Stride=6` usually gives about every 6th raw frame. "
+                        "With `Use DA3 Streaming` off, raw `5000` frames with the same settings still only covers the earlier part of the clip. With streaming on, Stage 0 now uses 20-frame chunks with the chosen overlap across the full extracted clip."
                     )
                     gr.Markdown(
                         "When available, Stage 0 also stores DA3's sky mask in `results.npz`. The pre-ICP filtering controls below use it to drop sky pixels before the non-rigid ICP stage."
@@ -3239,14 +3537,27 @@ def build_app() -> gr.Blocks:
                         )
                         conf_mask_sky_depth_band = gr.Checkbox(
                             label="Expand Sky By Depth Band",
-                            value=True,
+                            value=False,
                             info="After sky masking, also drop pixels in the top x% depth band of the sky depth plateau.",
                         )
                         conf_sky_depth_band_percent = gr.Number(label="Sky Depth Band Percent", value=50.0)
                         conf_mask_depth_edges = gr.Checkbox(label="Suppress Depth Edges", value=True)
-                        conf_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.03)
+                        conf_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.1)
                         conf_edge_atol = gr.Number(label="Depth Edge Abs Threshold", value=None)
                         conf_edge_kernel_size = gr.Number(label="Depth Edge Kernel", value=3, precision=0)
+                    with gr.Row():
+                        conf_mask_min_depth_range_percent = gr.Checkbox(
+                            label="Limit By Min Depth Range %",
+                            value=True,
+                            info="Per frame, keep only pixels up to min_depth + x% of that frame's valid depth range.",
+                        )
+                        conf_min_depth_range_percent = gr.Number(label="Min Depth Range Percent", value=50.0)
+                        conf_mask_min_depth_range_meters = gr.Checkbox(
+                            label="Limit By Min Depth Metres",
+                            value=False,
+                            info="Per frame, keep only pixels within a fixed metric distance of the frame minimum depth.",
+                        )
+                        conf_min_depth_range_meters = gr.Number(label="Min Depth Range Metres", value=3.0)
                     with gr.Row():
                         conf_mask_max_depth = gr.Checkbox(label="Suppress Max DA3 Depth Plateau", value=False)
                         conf_max_depth_rtol = gr.Number(label="Max Depth Rel Threshold", value=0.001)
@@ -3257,6 +3568,11 @@ def build_app() -> gr.Blocks:
                     )
                     gr.Markdown(
                         "`Expand Sky By Depth Band` uses the masked sky depth plateau as a reference and removes any pixel within the top `x%` of that depth range."
+                    )
+                    gr.Markdown(
+                        "`Limit By Min Depth Range %` measures each frame's valid depth span after sky-based masking and keeps only points up to "
+                        "`min_depth + x% * (max_depth - min_depth)`. `Limit By Min Depth Metres` keeps only points up to "
+                        "`min_depth + metres`. If both are enabled, the stricter limit wins."
                     )
                 with gr.Accordion("Stage 1 RoMa Matching", open=False):
                     gr.Markdown("RoMa is the cross-frame matcher used to add correspondence constraints during Stage 1.")
@@ -3463,13 +3779,15 @@ def build_app() -> gr.Blocks:
                     preprocess_overwrite,
                     preprocess_max_frames,
                     preprocess_max_stride,
+                    preprocess_streaming,
+                    preprocess_streaming_overlap,
                     preprocess_image_ext,
                     preprocess_model_name,
                     preprocess_process_res,
                     preprocess_process_res_method,
                     preprocess_export_gs_video,
-                    preprocess_export_kinect_rgbd_video,
-                    preprocess_kinect_rgbd_video_fps,
+                    preprocess_runtime_export_format,
+                    preprocess_runtime_export_fps,
                     preprocess_use_ray_pose,
                     preprocess_ref_view_strategy,
                     alignment_num_frames,
@@ -3480,6 +3798,10 @@ def build_app() -> gr.Blocks:
                     conf_mask_sky,
                     conf_mask_sky_depth_band,
                     conf_sky_depth_band_percent,
+                    conf_mask_min_depth_range_percent,
+                    conf_min_depth_range_percent,
+                    conf_mask_min_depth_range_meters,
+                    conf_min_depth_range_meters,
                     conf_mask_depth_edges,
                     conf_edge_rtol,
                     conf_edge_atol,
@@ -3680,16 +4002,22 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     stage0_overwrite = gr.Checkbox(label="Overwrite Stage 0 Outputs", value=False)
                     stage0_max_frames = gr.Number(
-                        label="DA3 Input Max Frames",
+                        label="DA3 Input Max Frames / Chunk Size",
                         value=DEFAULT_STAGE0_MAX_FRAMES,
                         precision=0,
-                        info="Maximum raw video frames Stage 0 will send to DA3.",
+                        info="Global DA3 frame cap in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                     )
                     stage0_max_stride = gr.Number(
                         label="DA3 Input Max Stride",
-                        value=8,
+                        value=DEFAULT_STAGE0_MAX_STRIDE,
                         precision=0,
-                        info="Upper bound on raw-video frame spacing during Stage 0 subsampling.",
+                        info="Upper bound on raw-video frame spacing in standard mode. Ignored in streaming mode, which now processes the full extracted clip by default.",
+                    )
+                    stage0_streaming_overlap = gr.Number(
+                        label="DA3 Streaming Overlap",
+                        value=DEFAULT_STAGE0_STREAMING_OVERLAP,
+                        precision=0,
+                        info="Overlap between adjacent DA3 chunks when streaming mode is enabled.",
                     )
                     stage0_image_ext = gr.Textbox(label="Image Extension", value="png")
                     stage0_model_name = gr.Textbox(label="DA3 Model Name", value="depth-anything/DA3NESTED-GIANT-LARGE")
@@ -3708,42 +4036,47 @@ def build_app() -> gr.Blocks:
                     )
                     stage0_ref_view_strategy = gr.Dropdown(
                         choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
-                        value="first",
+                        value=DEFAULT_STAGE0_REF_VIEW_STRATEGY,
                         label="DA3 Reference View",
-                        info="Default is `first` for this project.",
+                        info="Default is `saddle_balanced` for this project.",
                     )
                     stage0_export_gs_video = gr.Checkbox(
                         label="Export DA3 GS Preview Video",
                         value=False,
                         info="Opt-in preview export. Leave off for a faster Stage 0.",
                     )
-                    stage0_export_kinect_rgbd_video = gr.Checkbox(
-                        label="Export Kinect RGBD Video",
-                        value=False,
-                        info="Write a packed `[metadata|color|depth]` lossless video after Stage 0.",
+                    stage0_runtime_export_format = gr.Dropdown(
+                        choices=RUNTIME_EXPORT_CHOICES,
+                        value=DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT,
+                        label="Stage 0 Runtime Export",
+                        info="Optional runtime-ready export written after Stage 0. Default is DirectStorage stream.",
                     )
                 with gr.Row():
-                    stage0_kinect_rgbd_video_fps = gr.Number(
-                        label="Kinect RGBD Video FPS",
+                    stage0_runtime_export_fps = gr.Number(
+                        label="Stage 0 Runtime Export FPS",
                         value=30,
                         precision=0,
-                        info="Frame rate used when assembling the packed Stage 0 RGBD video.",
+                        info="Frame rate metadata used by the selected Stage 0 runtime export.",
                     )
                     stage0_use_ray_pose = gr.Checkbox(
                         label="Use DA3 Ray Pose",
                         value=False,
                         info="Use ray-based pose estimation instead of the camera decoder.",
                     )
+                    stage0_streaming = gr.Checkbox(
+                        label="Use DA3 Streaming",
+                        value=False,
+                        info="Process the full selected sequence in overlapping chunks instead of one global DA3 batch.",
+                    )
                     gr.Markdown(
                         "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus `before_non_rigid_icp.ply`. "
-                        "Example: raw `500` frames with `DA3 Input Max Frames=30`, `DA3 Input Max Stride=8` usually gives about every 8th raw frame. "
-                        "Raw `5000` frames with those settings clamps to stride 8 and only covers the earlier part of the clip. "
-                        "If `Stage 0 Source Mode` is `Existing Image Folder`, the app first copies that folder into `videos/_gradio_uploads/<unique-folder>/`, then runs Stage 0 from the copied images and ignores `DA3 Input Max Frames` plus `DA3 Input Max Stride`. "
-                        "The optional DA3 GS preview video and packed Kinect-layout RGBD video are both skipped by default."
+                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Max Stride=6` usually gives about every 6th raw frame. "
+                        "With `Use DA3 Streaming` off, raw `5000` frames with those settings still only covers the earlier part of the clip. With streaming on, Stage 0 now uses 20-frame chunks with the chosen overlap across the full extracted clip. "
+                        "If `Stage 0 Source Mode` is `Existing Image Folder`, the app first copies that folder into `videos/_gradio_uploads/<uid>/frames/`, then runs Stage 0 from the copied images. Uploaded videos likewise land under `videos/_gradio_uploads/<uid>/<uid>.*` with a short default scene root at `videos/_gradio_uploads/<uid>/scene/`. In that mode `DA3 Input Max Stride` is ignored; `DA3 Input Max Frames / Chunk Size` is only used when streaming mode is enabled. "
+                        "The optional DA3 GS preview video is skipped by default. `Stage 0 Runtime Export` defaults to DirectStorage stream."
                     )
                 gr.Markdown(
-                    "Reference-view note: this app now defaults DA3 to `first`. "
-                    "The original code path used DA3's default `saddle_balanced`."
+                    "Reference-view note: this app now defaults DA3 to `saddle_balanced`."
                 )
 
             with gr.Accordion("Existing Scene / Run", open=True):
@@ -3803,14 +4136,27 @@ def build_app() -> gr.Blocks:
                         )
                         stage1_conf_mask_sky_depth_band = gr.Checkbox(
                             label="Expand Sky By Depth Band",
-                            value=True,
+                            value=False,
                             info="After sky masking, also drop pixels in the top x% depth band of the sky depth plateau.",
                         )
                         stage1_conf_sky_depth_band_percent = gr.Number(label="Sky Depth Band Percent", value=50.0)
                         stage1_conf_mask_depth_edges = gr.Checkbox(label="Suppress Depth Edges", value=True)
-                        stage1_conf_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.03)
+                        stage1_conf_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.1)
                         stage1_conf_edge_atol = gr.Number(label="Depth Edge Abs Threshold", value=None)
                         stage1_conf_edge_kernel_size = gr.Number(label="Depth Edge Kernel", value=3, precision=0)
+                    with gr.Row():
+                        stage1_conf_mask_min_depth_range_percent = gr.Checkbox(
+                            label="Limit By Min Depth Range %",
+                            value=True,
+                            info="Per frame, keep only pixels up to min_depth + x% of that frame's valid depth range.",
+                        )
+                        stage1_conf_min_depth_range_percent = gr.Number(label="Min Depth Range Percent", value=50.0)
+                        stage1_conf_mask_min_depth_range_meters = gr.Checkbox(
+                            label="Limit By Min Depth Metres",
+                            value=False,
+                            info="Per frame, keep only pixels within a fixed metric distance of the frame minimum depth.",
+                        )
+                        stage1_conf_min_depth_range_meters = gr.Number(label="Min Depth Range Metres", value=3.0)
                     with gr.Row():
                         stage1_conf_mask_max_depth = gr.Checkbox(label="Suppress Max DA3 Depth Plateau", value=False)
                         stage1_conf_max_depth_rtol = gr.Number(label="Max Depth Rel Threshold", value=0.001)
@@ -3821,6 +4167,11 @@ def build_app() -> gr.Blocks:
                     )
                     gr.Markdown(
                         "`Expand Sky By Depth Band` uses the masked sky depth plateau as a reference and removes any pixel within the top `x%` of that depth range."
+                    )
+                    gr.Markdown(
+                        "`Limit By Min Depth Range %` measures each frame's valid depth span after sky-based masking and keeps only points up to "
+                        "`min_depth + x% * (max_depth - min_depth)`. `Limit By Min Depth Metres` keeps only points up to "
+                        "`min_depth + metres`. If both are enabled, the stricter limit wins."
                     )
                 with gr.Accordion("Stage 1 RoMa Matching", open=False):
                     gr.Markdown("RoMa is the cross-frame matcher used to add correspondence constraints during Stage 1.")
@@ -4012,9 +4363,7 @@ def build_app() -> gr.Blocks:
                 stop_stage_button = gr.Button("Stop Active Run", variant="stop")
             with gr.Row():
                 export_div_button = gr.Button("Export Depth Volume", variant="secondary")
-                export_divstream_button = gr.Button("Export DirectStorage Stream", variant="secondary")
-                export_packed_sequence_button = gr.Button("Export Packed Frame Sequence", variant="secondary")
-                export_packed_sequence_depth8_button = gr.Button("Export Packed Frame Sequence (8-bit Depth)", variant="secondary")
+                export_runtime_button = gr.Button("Export Stage 0 Runtime Format", variant="secondary")
                 export_ply_button = gr.Button("Export PLY", variant="secondary")
 
             with gr.Accordion("PLY Export Settings", open=False):
@@ -4073,13 +4422,15 @@ def build_app() -> gr.Blocks:
                 stage0_overwrite,
                 stage0_max_frames,
                 stage0_max_stride,
+                stage0_streaming,
+                stage0_streaming_overlap,
                 stage0_image_ext,
                 stage0_model_name,
                 stage0_process_res,
                 stage0_process_res_method,
                 stage0_export_gs_video,
-                stage0_export_kinect_rgbd_video,
-                stage0_kinect_rgbd_video_fps,
+                stage0_runtime_export_format,
+                stage0_runtime_export_fps,
                 stage0_use_ray_pose,
                 stage0_ref_view_strategy,
                 stage_scene_root_selection,
@@ -4092,6 +4443,10 @@ def build_app() -> gr.Blocks:
                 stage1_conf_mask_sky,
                 stage1_conf_mask_sky_depth_band,
                 stage1_conf_sky_depth_band_percent,
+                stage1_conf_mask_min_depth_range_percent,
+                stage1_conf_min_depth_range_percent,
+                stage1_conf_mask_min_depth_range_meters,
+                stage1_conf_min_depth_range_meters,
                 stage1_conf_mask_depth_edges,
                 stage1_conf_edge_rtol,
                 stage1_conf_edge_atol,
@@ -4283,29 +4638,12 @@ def build_app() -> gr.Blocks:
                 outputs=[stage_status_md],
             )
 
-            export_packed_sequence_button.click(
-                fn=_export_packed_frame_sequence,
+            export_runtime_button.click(
+                fn=_export_runtime_format,
                 inputs=[
                     stage_scene_root_selection,
-                    stage0_kinect_rgbd_video_fps,
-                ],
-                outputs=[stage_status_md],
-            )
-
-            export_divstream_button.click(
-                fn=_export_directstorage_stream,
-                inputs=[
-                    stage_scene_root_selection,
-                    stage0_kinect_rgbd_video_fps,
-                ],
-                outputs=[stage_status_md],
-            )
-
-            export_packed_sequence_depth8_button.click(
-                fn=_export_packed_frame_sequence_depth8,
-                inputs=[
-                    stage_scene_root_selection,
-                    stage0_kinect_rgbd_video_fps,
+                    stage0_runtime_export_format,
+                    stage0_runtime_export_fps,
                 ],
                 outputs=[stage_status_md],
             )
@@ -4606,12 +4944,25 @@ def main() -> None:
 
     _ensure_workspace_dirs()
     app = build_app()
-    app.queue(default_concurrency_limit=2).launch(
+    _, local_url, share_url = app.queue(default_concurrency_limit=2).launch(
         server_name=args.server_name,
         server_port=args.server_port,
         share=args.share,
         inbrowser=args.inbrowser,
+        quiet=True,
+        prevent_thread_lock=True,
     )
+    print(f"* Running on local URL:  {local_url}")
+    if args.server_name in {"0.0.0.0", "::"}:
+        print(
+            f"* Bound on all interfaces via {args.server_name}:{args.server_port}. "
+            "Open localhost or this machine's LAN IP in a browser, not the bind address."
+        )
+    if share_url:
+        print(f"* Running on public URL: {share_url}")
+    else:
+        print("* To create a public link, set `share=True` in `launch()`.")
+    app.block_thread()
 
 
 if __name__ == "__main__":

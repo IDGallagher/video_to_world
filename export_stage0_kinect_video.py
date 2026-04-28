@@ -46,6 +46,81 @@ _PACKED_SEQUENCE_ENCODING_RGB16 = "raw_rgb_depth16_inverse"
 _PACKED_SEQUENCE_ENCODING_GRAY8 = "raw_rgb_depth8_inverse_gray"
 
 
+def _find_latest_valid_pixel_indices_path(scene_root: str) -> str | None:
+    ply_root = Path(scene_root) / "exports" / "ply"
+    if not ply_root.is_dir():
+        return None
+
+    candidates = [path for path in ply_root.glob("*/valid_pixel_indices.npz") if path.is_file()]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda path: (path.stat().st_mtime_ns, path.parent.name), reverse=True)
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        logger.info(
+            "Found %d Stage 0 valid-pixel caches under %s; using newest %s",
+            len(candidates),
+            ply_root,
+            chosen,
+        )
+    return str(chosen)
+
+
+def _apply_valid_pixel_indices_mask(
+    *,
+    images: np.ndarray,
+    depth: np.ndarray,
+    valid_indices_path: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if images.ndim != 4 or images.shape[-1] != 3:
+        raise ValueError(f"Expected images to be (N,H,W,3), got {images.shape}")
+    if depth.ndim != 3:
+        raise ValueError(f"Expected depth to be (N,H,W), got {depth.shape}")
+    if images.shape[:3] != depth.shape:
+        raise ValueError(
+            "Image/depth shapes disagree: "
+            f"images={images.shape} depth={depth.shape}",
+        )
+
+    num_frames, height, width = depth.shape
+    num_pixels = height * width
+
+    masked_images = np.zeros_like(images)
+    masked_depth = np.zeros_like(depth)
+    src_images_flat = images.reshape(num_frames, num_pixels, 3)
+    src_depth_flat = depth.reshape(num_frames, num_pixels)
+    masked_images_flat = masked_images.reshape(num_frames, num_pixels, 3)
+    masked_depth_flat = masked_depth.reshape(num_frames, num_pixels)
+
+    kept_total = 0
+    with np.load(valid_indices_path) as valid_indices_npz:
+        for frame_idx in range(num_frames):
+            key = f"frame_{frame_idx:05d}"
+            if key not in valid_indices_npz:
+                raise KeyError(f"Missing key '{key}' in valid-pixel cache '{valid_indices_path}'.")
+            flat_indices = np.asarray(valid_indices_npz[key], dtype=np.int64).reshape(-1)
+            if flat_indices.size == 0:
+                continue
+            if np.any(flat_indices < 0) or np.any(flat_indices >= num_pixels):
+                raise ValueError(
+                    f"Out-of-range flat indices in '{valid_indices_path}' for {key} "
+                    f"(expected [0, {num_pixels})).",
+                )
+            masked_images_flat[frame_idx, flat_indices] = src_images_flat[frame_idx, flat_indices]
+            masked_depth_flat[frame_idx, flat_indices] = src_depth_flat[frame_idx, flat_indices]
+            kept_total += int(np.unique(flat_indices).size)
+
+    logger.info(
+        "Applied Stage 0 valid-pixel mask from %s; kept %d / %d pixels across %d frames",
+        valid_indices_path,
+        kept_total,
+        num_frames * num_pixels,
+        num_frames,
+    )
+    return masked_images, masked_depth
+
+
 def _resolve_executable(name: str) -> str:
     resolved = shutil.which(name)
     if resolved:
@@ -341,6 +416,15 @@ def _load_stage0_results(scene_root: str) -> tuple[np.ndarray, np.ndarray, np.nd
     finally:
         if hasattr(predictions, "close"):
             predictions.close()
+    valid_indices_path = _find_latest_valid_pixel_indices_path(scene_root)
+    if valid_indices_path is not None:
+        images, depth = _apply_valid_pixel_indices_mask(
+            images=images,
+            depth=depth,
+            valid_indices_path=valid_indices_path,
+        )
+    else:
+        logger.info("No Stage 0 valid-pixel mask found under %s; exporting raw Stage 0 pixels.", scene_root)
     return images, depth, extrinsics, intrinsics
 
 

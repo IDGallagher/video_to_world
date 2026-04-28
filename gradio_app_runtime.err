@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/mnt/d/dev/video_to_world/tmp_gradio_server.py", line 28, in <module>
+    main()
+  File "/mnt/d/dev/video_to_world/tmp_gradio_server.py", line 9, in main
+    _, local_url, share_url = app.queue(default_concurrency_limit=2).launch(
+  File "/home/idgal/miniforge3/envs/video_to_world/lib/python3.10/site-packages/gradio/blocks.py", line 2720, in launch
+    ) = http_server.start_server(
+  File "/home/idgal/miniforge3/envs/video_to_world/lib/python3.10/site-packages/gradio/http_server.py", line 157, in start_server
+    raise OSError(
+OSError: Cannot find empty port in range: 7860-7860. You can specify a different port by setting the GRADIO_SERVER_PORT environment variable or passing the `server_port` parameter to `launch()`.

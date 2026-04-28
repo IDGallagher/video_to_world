@@ -7,7 +7,10 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 THIRD_PARTY_IMPORT_PATHS = {
-    "depth_anything_3": [PROJECT_ROOT / "third_party" / "depth-anything-3" / "src"],
+    "depth_anything_3": [
+        PROJECT_ROOT / "third_party" / "depth-anything-3" / "src",
+        PROJECT_ROOT / "third_party" / "depth-anything-3" / "da3_streaming",
+    ],
     "romav2": [PROJECT_ROOT / "third_party" / "RoMaV2" / "src"],
     "torch_kdtree": [PROJECT_ROOT / "third_party" / "torch_kdtree"],
 }

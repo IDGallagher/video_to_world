@@ -32,8 +32,12 @@ class AlignmentDataConfig:
     conf_mask_sky: bool = False
     conf_mask_sky_depth_band: bool = False
     conf_sky_depth_band_percent: float = 2.0
+    conf_mask_min_depth_range_percent: bool = True
+    conf_min_depth_range_percent: float = 50.0
+    conf_mask_min_depth_range_meters: bool = False
+    conf_min_depth_range_meters: float = 3.0
     conf_mask_depth_edges: bool = True
-    conf_edge_rtol: Optional[float] = 0.03
+    conf_edge_rtol: Optional[float] = 0.1
     conf_edge_atol: Optional[float] = None
     conf_edge_kernel_size: int = 3
     conf_mask_max_depth: bool = False

@@ -30,6 +30,13 @@ from configs.stage3_inverse_deformation import TrainInverseDeformationConfig
 from utils.stage1_preparation import prepare_stage1_inputs, resolve_stage1_out_path
 
 
+_RUNTIME_EXPORT_NONE = "none"
+_RUNTIME_EXPORT_DIRECTSTORAGE = "directstorage_stream"
+_RUNTIME_EXPORT_HAP = "kinect_rgbd_video"
+_RUNTIME_EXPORT_SEQUENCE = "packed_frame_sequence"
+_RUNTIME_EXPORT_SEQUENCE_DEPTH8 = "packed_frame_sequence_depth8"
+
+
 @dataclass
 class PipelineConfig:
     """End-to-end pipeline configuration."""
@@ -53,11 +60,17 @@ class PipelineConfig:
     preprocess_overwrite: bool = False
     """Force rerunning Stage 0 preprocessing even if outputs exist."""
 
-    preprocess_max_frames: int = 30
-    """Stage 0: maximum number of frames to run DA3 on."""
+    preprocess_max_frames: int = 20
+    """Stage 0: maximum number of frames to run DA3 on, or the DA3 chunk size in streaming mode."""
 
-    preprocess_max_stride: int = 8
-    """Stage 0: maximum stride between frames when subsampling."""
+    preprocess_max_stride: int = 6
+    """Stage 0: maximum stride between frames when subsampling, or the fixed raw-video stride in streaming mode."""
+
+    preprocess_streaming: bool = False
+    """Stage 0: use DA3-Streaming-style overlapping chunks instead of a single global DA3 batch."""
+
+    preprocess_streaming_overlap: int = 10
+    """Stage 0: number of frames overlapped between adjacent DA3 streaming chunks."""
 
     preprocess_image_ext: str = "png"
     """Stage 0: frame file extension (used for extraction + folder globbing)."""
@@ -74,17 +87,29 @@ class PipelineConfig:
     preprocess_use_ray_pose: bool = False
     """Stage 0: use DA3 ray-based pose estimation instead of the camera decoder."""
 
-    preprocess_ref_view_strategy: str = "first"
-    """Stage 0: DA3 multi-view reference-view strategy. Defaults to 'first' for this project."""
+    preprocess_ref_view_strategy: str = "saddle_balanced"
+    """Stage 0: DA3 multi-view reference-view strategy. Defaults to 'saddle_balanced' for this project."""
 
     preprocess_export_gs_video: bool = False
     """Stage 0: also export the DA3 gs_video preview outputs. Disabled by default to keep Stage 0 faster."""
 
+    preprocess_runtime_export_format: Literal[
+        "none",
+        "directstorage_stream",
+        "kinect_rgbd_video",
+        "packed_frame_sequence",
+        "packed_frame_sequence_depth8",
+    ] = "directstorage_stream"
+    """Stage 0: optional runtime export written after results.npz. Defaults to DirectStorage stream."""
+
+    preprocess_runtime_export_fps: int = 30
+    """Stage 0: frame rate metadata used by the selected runtime export."""
+
     preprocess_export_kinect_rgbd_video: bool = False
-    """Stage 0: also export a KinectStreamer-style packed RGBD video."""
+    """Deprecated compatibility toggle for the old Kinect RGBD HAP export."""
 
     preprocess_kinect_rgbd_video_fps: int = 30
-    """Stage 0: frame rate for the packed Kinect-layout RGBD video export."""
+    """Deprecated compatibility fps for the old Kinect RGBD HAP export."""
 
     stage0_alignment: AlignmentDataConfig = field(default_factory=AlignmentDataConfig)
     """Stage 0: frame selection and confidence filtering used to prepare Stage 1's pre-ICP inputs."""
@@ -145,6 +170,65 @@ class PipelineConfig:
 
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_runtime_export_format(config: PipelineConfig) -> str:
+    if config.preprocess_export_kinect_rgbd_video and config.preprocess_runtime_export_format in {
+        _RUNTIME_EXPORT_NONE,
+        _RUNTIME_EXPORT_DIRECTSTORAGE,
+    }:
+        return _RUNTIME_EXPORT_HAP
+    return str(config.preprocess_runtime_export_format)
+
+
+def _runtime_export_target_path(scene_root: str, runtime_export_format: str) -> Optional[str]:
+    if runtime_export_format == _RUNTIME_EXPORT_NONE:
+        return None
+    if runtime_export_format == _RUNTIME_EXPORT_DIRECTSTORAGE:
+        from export_depth_image_stream_bc7 import default_depth_image_stream_bc7_output_path
+
+        default_path = default_depth_image_stream_bc7_output_path(scene_root)
+        legacy_path = os.path.join(scene_root, "exports", "depth_image_stream", "depth_image_stream.divstream")
+        if os.path.exists(default_path):
+            return default_path
+        if os.path.exists(legacy_path):
+            return legacy_path
+        return default_path
+    if runtime_export_format == _RUNTIME_EXPORT_HAP:
+        return os.path.join(scene_root, "exports", "kinect_rgbd_video", "kinect_rgbd_hapq.mov")
+    if runtime_export_format == _RUNTIME_EXPORT_SEQUENCE:
+        return os.path.join(scene_root, "exports", "kinect_rgbd_sequence", "sequence_info.json")
+    if runtime_export_format == _RUNTIME_EXPORT_SEQUENCE_DEPTH8:
+        return os.path.join(scene_root, "exports", "kinect_rgbd_sequence_depth8", "sequence_info.json")
+    raise ValueError(f"Unsupported runtime export format: {runtime_export_format}")
+
+
+def _run_runtime_export(scene_root: str, runtime_export_format: str, fps: int, overwrite: bool) -> Optional[str]:
+    if runtime_export_format == _RUNTIME_EXPORT_NONE:
+        return None
+    if runtime_export_format == _RUNTIME_EXPORT_DIRECTSTORAGE:
+        from export_depth_image_stream_bc7 import export_depth_image_stream_bc7
+
+        return str(export_depth_image_stream_bc7(scene_root=scene_root, fps=int(fps), overwrite=overwrite))
+    if runtime_export_format == _RUNTIME_EXPORT_HAP:
+        from export_stage0_kinect_video import export_stage0_kinect_video
+
+        return str(export_stage0_kinect_video(scene_root=scene_root, fps=int(fps), overwrite=overwrite))
+    if runtime_export_format == _RUNTIME_EXPORT_SEQUENCE:
+        from export_stage0_kinect_video import export_stage0_kinect_image_sequence
+
+        return str(export_stage0_kinect_image_sequence(scene_root=scene_root, fps=int(fps), overwrite=overwrite))
+    if runtime_export_format == _RUNTIME_EXPORT_SEQUENCE_DEPTH8:
+        from export_stage0_kinect_video import export_stage0_kinect_image_sequence_depth8
+
+        return str(
+            export_stage0_kinect_image_sequence_depth8(
+                scene_root=scene_root,
+                fps=int(fps),
+                overwrite=overwrite,
+            )
+        )
+    raise ValueError(f"Unsupported runtime export format: {runtime_export_format}")
 
 
 def _resolve_stage0_alignment_config(
@@ -272,12 +356,9 @@ def main(config: PipelineConfig) -> None:
             scene_root = os.path.abspath(config.scene_root)
 
         npz_path = os.path.join(scene_root, "exports", "npz", "results.npz")
-        kinect_video_path = os.path.join(
-            scene_root,
-            "exports",
-            "kinect_rgbd_video",
-            "kinect_rgbd_hapq.mov",
-        )
+        runtime_export_format = _resolve_runtime_export_format(config)
+        runtime_export_fps = int(config.preprocess_runtime_export_fps)
+        runtime_export_target = _runtime_export_target_path(scene_root, runtime_export_format)
         prep_out_path = resolve_stage1_out_path(
             scene_root,
             prep_alignment_cfg,
@@ -286,9 +367,9 @@ def main(config: PipelineConfig) -> None:
         )
         prep_before_non_rigid = os.path.join(prep_out_path, "before_non_rigid_icp.ply")
         need_preprocess = config.preprocess_overwrite or (not os.path.exists(npz_path))
-        need_kinect_video = (
-            bool(config.preprocess_export_kinect_rgbd_video)
-            and (config.preprocess_overwrite or (not os.path.exists(kinect_video_path)))
+        need_runtime_export = (
+            runtime_export_target is not None
+            and (config.preprocess_overwrite or (not os.path.exists(runtime_export_target)))
         )
         need_stage1_prep = config.preprocess_overwrite or (not os.path.exists(prep_before_non_rigid))
         if need_preprocess:
@@ -306,6 +387,12 @@ def main(config: PipelineConfig) -> None:
                 str(config.preprocess_max_frames),
                 "--max_stride",
                 str(config.preprocess_max_stride),
+                "--streaming_overlap",
+                str(config.preprocess_streaming_overlap),
+                "--runtime_export_format",
+                runtime_export_format,
+                "--runtime_export_fps",
+                str(runtime_export_fps),
                 "--process_res",
                 str(config.preprocess_process_res),
                 "--process_res_method",
@@ -339,6 +426,10 @@ def main(config: PipelineConfig) -> None:
                 else str(prep_alignment_cfg.conf_voxel_min_count_percentile),
                 "--prepare_conf_sky_depth_band_percent",
                 str(prep_alignment_cfg.conf_sky_depth_band_percent),
+                "--prepare_conf_min_depth_range_percent",
+                str(prep_alignment_cfg.conf_min_depth_range_percent),
+                "--prepare_conf_min_depth_range_meters",
+                str(prep_alignment_cfg.conf_min_depth_range_meters),
                 "--prepare_conf_edge_rtol",
                 "none" if prep_alignment_cfg.conf_edge_rtol is None else str(prep_alignment_cfg.conf_edge_rtol),
                 "--prepare_conf_edge_atol",
@@ -362,20 +453,24 @@ def main(config: PipelineConfig) -> None:
                 stage0_cmd += ["--prepare_conf_mask_sky"]
             if prep_alignment_cfg.conf_mask_sky_depth_band:
                 stage0_cmd += ["--prepare_conf_mask_sky_depth_band"]
+            if prep_alignment_cfg.conf_mask_min_depth_range_percent:
+                stage0_cmd += ["--prepare_conf_mask_min_depth_range_percent"]
+            else:
+                stage0_cmd += ["--no-prepare_conf_mask_min_depth_range_percent"]
+            if prep_alignment_cfg.conf_mask_min_depth_range_meters:
+                stage0_cmd += ["--prepare_conf_mask_min_depth_range_meters"]
+            else:
+                stage0_cmd += ["--no-prepare_conf_mask_min_depth_range_meters"]
             if prep_alignment_cfg.conf_mask_depth_edges:
                 stage0_cmd += ["--prepare_conf_mask_depth_edges"]
             if prep_alignment_cfg.conf_mask_max_depth:
                 stage0_cmd += ["--prepare_conf_mask_max_depth"]
             if config.preprocess_export_gs_video:
                 stage0_cmd += ["--export_gs_video"]
-            if config.preprocess_export_kinect_rgbd_video:
-                stage0_cmd += [
-                    "--export_kinect_rgbd_video",
-                    "--kinect_rgbd_video_fps",
-                    str(config.preprocess_kinect_rgbd_video_fps),
-                ]
             if config.preprocess_use_ray_pose:
                 stage0_cmd += ["--use_ray_pose"]
+            if config.preprocess_streaming:
+                stage0_cmd += ["--streaming"]
             if config.input_video is not None:
                 stage0_cmd += ["--input_video", os.path.abspath(config.input_video)]
             else:
@@ -386,16 +481,15 @@ def main(config: PipelineConfig) -> None:
 
             _run(stage0_cmd, config.dry_run)
         else:
-            if need_kinect_video:
-                print("[PIPELINE] === Stage 0: Kinect RGBD Video Export ===")
+            if need_runtime_export:
+                print(f"[PIPELINE] === Stage 0: Runtime Export ({runtime_export_format}) ===")
                 if config.dry_run:
-                    print(f"[PIPELINE] Would export packed Kinect-layout RGBD video at {kinect_video_path}")
+                    print(f"[PIPELINE] Would export runtime format at {runtime_export_target}")
                 else:
-                    from export_stage0_kinect_video import export_stage0_kinect_video
-
-                    export_stage0_kinect_video(
+                    _run_runtime_export(
                         scene_root=scene_root,
-                        fps=int(config.preprocess_kinect_rgbd_video_fps),
+                        runtime_export_format=runtime_export_format,
+                        fps=runtime_export_fps,
                         overwrite=bool(config.preprocess_overwrite),
                     )
             if need_stage1_prep:
@@ -413,7 +507,7 @@ def main(config: PipelineConfig) -> None:
                         device="cpu",
                         overwrite_before_non_rigid=config.preprocess_overwrite,
                     )
-            if not need_kinect_video and not need_stage1_prep:
+            if not need_runtime_export and not need_stage1_prep:
                 print(
                     f"[PIPELINE] Skipping Stage 0 (found existing NPZ + pre-ICP prep): {npz_path} and {prep_before_non_rigid}",
                 )

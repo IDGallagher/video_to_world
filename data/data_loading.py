@@ -58,6 +58,18 @@ def _sky_depth_band_suffix(*, enabled: bool, band_percent: float) -> str:
     return f"_skyband_p{float(band_percent):.3f}"
 
 
+def _min_depth_range_percent_suffix(*, enabled: bool, min_depth_range_percent: float) -> str:
+    if not enabled:
+        return ""
+    return f"_mindepth_pct{float(min_depth_range_percent):.3f}"
+
+
+def _min_depth_range_meters_suffix(*, enabled: bool, min_depth_range_meters: float) -> str:
+    if not enabled:
+        return ""
+    return f"_mindepth_m{float(min_depth_range_meters):.3f}"
+
+
 def _sky_mask_suffix(*, enabled: bool) -> str:
     return "_sky" if enabled else ""
 
@@ -159,6 +171,57 @@ def _apply_sky_depth_band_suppression(
         band_mask = vm & (frame_depth >= threshold)
         conf_filtered[i][band_mask] = 0.0
         valid_filtered[i][band_mask] = False
+
+    return conf_filtered, valid_filtered
+
+
+def _apply_min_depth_range_suppression(
+    depth: np.ndarray,
+    conf: np.ndarray,
+    *,
+    enabled_percent: bool,
+    min_depth_range_percent: float,
+    enabled_meters: bool,
+    min_depth_range_meters: float,
+    base_valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    base_valid = base_valid_mask if base_valid_mask is not None else (np.isfinite(depth) & (depth > 0))
+    if not enabled_percent and not enabled_meters:
+        return conf, base_valid
+    if enabled_percent and (min_depth_range_percent < 0.0 or min_depth_range_percent > 100.0):
+        raise ValueError(
+            f"Minimum-depth range percent must be between 0 and 100, got {min_depth_range_percent}."
+        )
+    if enabled_meters and min_depth_range_meters < 0.0:
+        raise ValueError(f"Minimum-depth range meters must be non-negative, got {min_depth_range_meters}.")
+
+    conf_filtered = conf.copy()
+    valid_filtered = base_valid.copy()
+    percent_ratio = float(min_depth_range_percent) / 100.0 if enabled_percent else None
+    max_distance_m = float(min_depth_range_meters) if enabled_meters else None
+
+    for i in range(depth.shape[0]):
+        vm = base_valid[i]
+        if not np.any(vm):
+            continue
+
+        frame_depth = depth[i]
+        frame_min = float(frame_depth[vm].min())
+        keep_limit: float | None = None
+
+        if percent_ratio is not None:
+            frame_max = float(frame_depth[vm].max())
+            keep_limit = frame_min + percent_ratio * (frame_max - frame_min)
+        if max_distance_m is not None:
+            meters_limit = frame_min + max_distance_m
+            keep_limit = meters_limit if keep_limit is None else min(keep_limit, meters_limit)
+
+        if keep_limit is None:
+            continue
+
+        far_mask = vm & (frame_depth > keep_limit)
+        conf_filtered[i][far_mask] = 0.0
+        valid_filtered[i][far_mask] = False
 
     return conf_filtered, valid_filtered
 
@@ -590,8 +653,12 @@ def load_data(
     conf_mask_sky: bool = False,
     conf_mask_sky_depth_band: bool = False,
     conf_sky_depth_band_percent: float = 2.0,
+    conf_mask_min_depth_range_percent: bool = True,
+    conf_min_depth_range_percent: float = 50.0,
+    conf_mask_min_depth_range_meters: bool = False,
+    conf_min_depth_range_meters: float = 3.0,
     conf_mask_depth_edges: bool = False,
-    conf_edge_rtol: float | None = 0.03,
+    conf_edge_rtol: float | None = 0.1,
     conf_edge_atol: float | None = None,
     conf_edge_kernel_size: int = 3,
     conf_mask_max_depth: bool = False,
@@ -637,6 +704,27 @@ def load_data(
             "Sky-depth-band suppression removed %d pixels before confidence filtering (band_percent=%s)",
             masked_pixels,
             str(conf_sky_depth_band_percent),
+        )
+    min_depth_valid_before = base_valid_mask.copy()
+    all_conf_filtered, base_valid_mask = _apply_min_depth_range_suppression(
+        all_depth,
+        all_conf_filtered,
+        enabled_percent=conf_mask_min_depth_range_percent,
+        min_depth_range_percent=conf_min_depth_range_percent,
+        enabled_meters=conf_mask_min_depth_range_meters,
+        min_depth_range_meters=conf_min_depth_range_meters,
+        base_valid_mask=base_valid_mask,
+    )
+    if conf_mask_min_depth_range_percent or conf_mask_min_depth_range_meters:
+        masked_pixels = int((min_depth_valid_before & (~base_valid_mask)).sum())
+        logger.info(
+            "Min-depth-range suppression removed %d pixels before confidence filtering "
+            "(percent_enabled=%s, percent=%s, meters_enabled=%s, meters=%s)",
+            masked_pixels,
+            str(conf_mask_min_depth_range_percent),
+            str(conf_min_depth_range_percent),
+            str(conf_mask_min_depth_range_meters),
+            str(conf_min_depth_range_meters),
         )
 
     all_conf_filtered, base_valid_mask = _apply_max_depth_suppression(
@@ -757,6 +845,18 @@ def load_data(
     )
     if sky_depth_band_suffix:
         pcl_conf_folder = f"{pcl_conf_folder}{sky_depth_band_suffix}"
+    min_depth_range_percent_suffix = _min_depth_range_percent_suffix(
+        enabled=conf_mask_min_depth_range_percent,
+        min_depth_range_percent=conf_min_depth_range_percent,
+    )
+    if min_depth_range_percent_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{min_depth_range_percent_suffix}"
+    min_depth_range_meters_suffix = _min_depth_range_meters_suffix(
+        enabled=conf_mask_min_depth_range_meters,
+        min_depth_range_meters=conf_min_depth_range_meters,
+    )
+    if min_depth_range_meters_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{min_depth_range_meters_suffix}"
 
     if not os.path.exists(pcl_conf_folder):
         os.makedirs(pcl_conf_folder, exist_ok=True)
@@ -983,6 +1083,10 @@ def load_data(
             conf_mask_sky=conf_mask_sky,
             conf_mask_sky_depth_band=conf_mask_sky_depth_band,
             conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+            conf_mask_min_depth_range_percent=conf_mask_min_depth_range_percent,
+            conf_min_depth_range_percent=conf_min_depth_range_percent,
+            conf_mask_min_depth_range_meters=conf_mask_min_depth_range_meters,
+            conf_min_depth_range_meters=conf_min_depth_range_meters,
             conf_mask_depth_edges=conf_mask_depth_edges,
             conf_edge_rtol=conf_edge_rtol,
             conf_edge_atol=conf_edge_atol,
@@ -1110,7 +1214,7 @@ def load_depth_maps_da3(
     device: str = "cpu",
     conf_thresh_percentile: float = 40.0,
     conf_mask_depth_edges: bool = False,
-    conf_edge_rtol: float | None = 0.03,
+    conf_edge_rtol: float | None = 0.1,
     conf_edge_atol: float | None = None,
     conf_edge_kernel_size: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -115,6 +115,10 @@ def main(config: GSConfig):
         conf_mask_sky=align_params.conf_mask_sky,
         conf_mask_sky_depth_band=align_params.conf_mask_sky_depth_band,
         conf_sky_depth_band_percent=align_params.conf_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent=align_params.conf_mask_min_depth_range_percent,
+        conf_min_depth_range_percent=align_params.conf_min_depth_range_percent,
+        conf_mask_min_depth_range_meters=align_params.conf_mask_min_depth_range_meters,
+        conf_min_depth_range_meters=align_params.conf_min_depth_range_meters,
         conf_mask_depth_edges=align_params.conf_mask_depth_edges,
         conf_edge_rtol=align_params.conf_edge_rtol,
         conf_edge_atol=align_params.conf_edge_atol,
@@ -130,6 +134,8 @@ def main(config: GSConfig):
         "conf_mode=%s, conf_local_percentile=%s, conf_global_percentile=%s, "
         "conf_voxel_size=%.4f, conf_voxel_min_count_percentile=%s, "
         "conf_mask_sky=%s, conf_mask_sky_depth_band=%s, conf_sky_depth_band_percent=%s, "
+        "conf_mask_min_depth_range_percent=%s, conf_min_depth_range_percent=%s, "
+        "conf_mask_min_depth_range_meters=%s, conf_min_depth_range_meters=%s, "
         "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d, "
         "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s",
         align_params.num_frames,
@@ -144,6 +150,10 @@ def main(config: GSConfig):
         str(align_params.conf_mask_sky),
         str(align_params.conf_mask_sky_depth_band),
         str(align_params.conf_sky_depth_band_percent),
+        str(align_params.conf_mask_min_depth_range_percent),
+        str(align_params.conf_min_depth_range_percent),
+        str(align_params.conf_mask_min_depth_range_meters),
+        str(align_params.conf_min_depth_range_meters),
         str(align_params.conf_mask_depth_edges),
         str(align_params.conf_edge_rtol),
         str(align_params.conf_edge_atol),
@@ -369,6 +379,10 @@ def main(config: GSConfig):
                 "conf_mask_sky": align_params.conf_mask_sky,
                 "conf_mask_sky_depth_band": align_params.conf_mask_sky_depth_band,
                 "conf_sky_depth_band_percent": align_params.conf_sky_depth_band_percent,
+                "conf_mask_min_depth_range_percent": align_params.conf_mask_min_depth_range_percent,
+                "conf_min_depth_range_percent": align_params.conf_min_depth_range_percent,
+                "conf_mask_min_depth_range_meters": align_params.conf_mask_min_depth_range_meters,
+                "conf_min_depth_range_meters": align_params.conf_min_depth_range_meters,
                 "conf_mask_depth_edges": align_params.conf_mask_depth_edges,
                 "conf_edge_rtol": align_params.conf_edge_rtol,
                 "conf_edge_atol": align_params.conf_edge_atol,

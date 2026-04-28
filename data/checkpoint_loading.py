@@ -319,6 +319,10 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
     conf_mask_sky = bool(a.get("conf_mask_sky", False))
     conf_mask_sky_depth_band = bool(a.get("conf_mask_sky_depth_band", False))
     conf_sky_depth_band_percent = float(a.get("conf_sky_depth_band_percent", 2.0))
+    conf_mask_min_depth_range_percent = bool(a.get("conf_mask_min_depth_range_percent", False))
+    conf_min_depth_range_percent = float(a.get("conf_min_depth_range_percent", 50.0))
+    conf_mask_min_depth_range_meters = bool(a.get("conf_mask_min_depth_range_meters", False))
+    conf_min_depth_range_meters = float(a.get("conf_min_depth_range_meters", 3.0))
     conf_mask_depth_edges = bool(a.get("conf_mask_depth_edges", False))
 
     conf_edge_rtol = a.get("conf_edge_rtol", None)
@@ -346,6 +350,8 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         "conf_mode=%s, conf_local_percentile=%s, conf_global_percentile=%s, "
         "conf_voxel_size=%.4f, conf_voxel_min_count_percentile=%s, "
         "conf_mask_sky=%s, conf_mask_sky_depth_band=%s, conf_sky_depth_band_percent=%s, "
+        "conf_mask_min_depth_range_percent=%s, conf_min_depth_range_percent=%s, "
+        "conf_mask_min_depth_range_meters=%s, conf_min_depth_range_meters=%s, "
         "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d, "
         "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s",
         run,
@@ -361,6 +367,10 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         str(conf_mask_sky),
         str(conf_mask_sky_depth_band),
         str(conf_sky_depth_band_percent),
+        str(conf_mask_min_depth_range_percent),
+        str(conf_min_depth_range_percent),
+        str(conf_mask_min_depth_range_meters),
+        str(conf_min_depth_range_meters),
         str(conf_mask_depth_edges),
         str(conf_edge_rtol),
         str(conf_edge_atol),
@@ -383,6 +393,10 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         conf_mask_sky=conf_mask_sky,
         conf_mask_sky_depth_band=conf_mask_sky_depth_band,
         conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent=conf_mask_min_depth_range_percent,
+        conf_min_depth_range_percent=conf_min_depth_range_percent,
+        conf_mask_min_depth_range_meters=conf_mask_min_depth_range_meters,
+        conf_min_depth_range_meters=conf_min_depth_range_meters,
         conf_mask_depth_edges=conf_mask_depth_edges,
         conf_edge_rtol=conf_edge_rtol,
         conf_edge_atol=conf_edge_atol,

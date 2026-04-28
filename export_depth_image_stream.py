@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -44,8 +45,10 @@ _DEPTH_U16_INVALID = np.uint16(0)
 _DEPTH_U16_VALID_MIN = np.uint16(1)
 _DEPTH_U16_VALID_MAX = np.uint16(65535)
 _DEPTH_U16_VALID_RANGE = float(int(_DEPTH_U16_VALID_MAX) - int(_DEPTH_U16_VALID_MIN))
+_DIRECTSTORAGE_TRANSLATION_SCALE = 100.0
 
 _DEFAULT_OUTPUT_FILENAME = "depth_image_stream.divstream"
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,36 @@ class _FrameEntry:
     color_size: int
     depth_offset: int
     depth_size: int
+
+
+def _safe_output_component(raw: str) -> str:
+    safe = _SAFE_NAME_RE.sub("_", str(raw).strip()).strip("._-")
+    return safe or "scene"
+
+
+def default_depth_image_stream_output_path(scene_root: str) -> str:
+    scene_root_path = Path(scene_root).resolve()
+    scene_name = _safe_output_component(scene_root_path.name)
+
+    source_name = ""
+    meta_path = scene_root_path / "preprocess_frames.json"
+    if meta_path.exists():
+        try:
+            import json
+
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        source_input_path = str(meta.get("source_input_path") or "").strip()
+        if source_input_path:
+            source_path = Path(source_input_path)
+            source_name = _safe_output_component(
+                source_path.stem if source_path.suffix else source_path.name
+            )
+
+    base_name = source_name or scene_name
+
+    return str(scene_root_path / "exports" / "depth_image_stream" / f"{base_name}.divstream")
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -289,7 +322,9 @@ def _write_zero_padding(stream, count: int) -> None:
 def _relative_c2w_video_3x4(relative_c2w: np.ndarray) -> np.ndarray:
     if relative_c2w.shape != (4, 4):
         raise ValueError(f"relative_c2w must be 4x4, got {relative_c2w.shape}")
-    return np.asarray(relative_c2w[:3, :4], dtype=np.float32)
+    relative_c2w_video = np.asarray(relative_c2w[:3, :4], dtype=np.float32).copy()
+    relative_c2w_video[:3, 3] *= float(_DIRECTSTORAGE_TRANSLATION_SCALE)
+    return relative_c2w_video
 
 
 def export_depth_image_stream(
@@ -307,7 +342,7 @@ def export_depth_image_stream(
 
     scene_root = os.path.abspath(scene_root)
     if output_path is None or str(output_path).strip() == "":
-        output_path = os.path.join(scene_root, "exports", "depth_image_stream", _DEFAULT_OUTPUT_FILENAME)
+        output_path = default_depth_image_stream_output_path(scene_root)
     output_path = os.path.abspath(output_path)
     output_dir = os.path.dirname(output_path)
 

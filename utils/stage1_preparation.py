@@ -60,6 +60,14 @@ def load_stage0_prep_alignment(out_path: str) -> AlignmentDataConfig | None:
         raise ValueError(f"Invalid Stage 0 prep config at '{config_path}': missing alignment object.")
 
     defaults = asdict(AlignmentDataConfig())
+    defaults.update(
+        {
+            "conf_mask_min_depth_range_percent": False,
+            "conf_min_depth_range_percent": 50.0,
+            "conf_mask_min_depth_range_meters": False,
+            "conf_min_depth_range_meters": 3.0,
+        }
+    )
     resolved_alignment = {
         key: alignment_payload.get(key, default_value)
         for key, default_value in defaults.items()
@@ -107,6 +115,10 @@ def prepare_stage1_inputs(
         conf_mask_sky=alignment.conf_mask_sky,
         conf_mask_sky_depth_band=alignment.conf_mask_sky_depth_band,
         conf_sky_depth_band_percent=alignment.conf_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent=alignment.conf_mask_min_depth_range_percent,
+        conf_min_depth_range_percent=alignment.conf_min_depth_range_percent,
+        conf_mask_min_depth_range_meters=alignment.conf_mask_min_depth_range_meters,
+        conf_min_depth_range_meters=alignment.conf_min_depth_range_meters,
         conf_mask_depth_edges=alignment.conf_mask_depth_edges,
         conf_edge_rtol=alignment.conf_edge_rtol,
         conf_edge_atol=alignment.conf_edge_atol,

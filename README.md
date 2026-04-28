@@ -111,7 +111,7 @@ python run_reconstruction.py --config.input-video /path/to/video.mp4
 For a local UI around the same pipeline:
 
 ```bash
-pip install gradio
+pip install "gradio<6"
 python gradio_app.py --server-name 0.0.0.0 --server-port 7860
 ```
 
@@ -147,13 +147,15 @@ python preprocess_video.py --input_video /path/to/video.mp4 --prepare_stage1_inp
 ```
 
 This estimates per-frame pointclouds using DepthAnyting-3 and saves the results to `<scene_root> = /path/to/video` (overwrite via `--scene_root /path/to/da3_scene`).
-With `--prepare_stage1_inputs`, Stage 0 also materializes the filtered `exports/ply/...` cache and writes `before_non_rigid_icp.ply` into the corresponding `frame_to_model_icp_<...>/` run directory. Add `--export_gs_video` if you also want the DA3 preview video and trajectory export. Add `--export_kinect_rgbd_video` to also write a packed KinectStreamer-style RGBD video under `exports/kinect_rgbd_video/`.
+With `--prepare_stage1_inputs`, Stage 0 also materializes the filtered `exports/ply/...` cache and writes `before_non_rigid_icp.ply` into the corresponding `frame_to_model_icp_<...>/` run directory. Add `--export_gs_video` if you also want the DA3 preview video and trajectory export. `--runtime_export_format` selects the runtime-ready Stage 0 export to write after preprocessing; the default is `directstorage_stream`.
 
-Subsampling of frames is controlled by `--max_frames` (default: 30) and `--max_stride` (default: 8).
+Subsampling of frames is controlled by `--max_frames` (default: 20) and `--max_stride` (default: 6).
 The script extracts all frames to `<scene_root>/frames/`, then writes the selected subset (renumbered from `000000.*`) to `<scene_root>/frames_subsampled/` and runs DepthAnyting-3 on that folder.
 This constrains memory of DA3 to the available budget (choose fewer frames for smaller GPUs).
 Please consult the original repository for more information regarding memory.
-If the scene contains much more frames, one can use [DA3-Streaming](https://github.com/ByteDance-Seed/Depth-Anything-3/blob/main/da3_streaming/README.md) to predict per-frame pointclouds for all frames.
+If the scene contains much more frames, Stage 0 now also supports a built-in DA3 streaming mode via `--streaming --streaming_overlap 10`.
+In streaming mode, `--max_frames` becomes the per-chunk DA3 batch size, `--max_stride` is ignored, and Stage 0 aligns overlapping chunks across the full extracted clip before writing the standard combined `exports/npz/results.npz`.
+The optional DA3 GS preview export is currently only available in non-streaming mode.
 
 **Expected scene layout**:
 
@@ -178,7 +180,7 @@ If the scene contains much more frames, one can use [DA3-Streaming](https://gith
       frames/
         000000.png         # Layout: [metadata_barcode|color|depth]
     depth_image_stream/    # Optional exact DirectStorage stream export
-      depth_image_stream.divstream
+      <source-video>.divstream
   frames/                   # extracted original frames
   frames_subsampled/         # renumbered subset used for DA3
 ```
@@ -205,7 +207,7 @@ If `--export_kinect_rgbd_video` is enabled, Stage 0 also writes:
 The Gradio app can also export:
 - an exact packed frame sequence to `exports/kinect_rgbd_sequence/` using the current 16-bit inverse-depth RGB codebook
 - an exact packed frame sequence to `exports/kinect_rgbd_sequence_depth8/` using 8-bit inverse-depth grayscale replicated across RGB
-- an exact single-file DirectStorage stream to `exports/depth_image_stream/depth_image_stream.divstream`
+- an exact single-file DirectStorage stream to `exports/depth_image_stream/<source-video>.divstream`
 
 The two PNG-sequence exports can be used with `ADepthImageVolumeImageSequenceActor` for side-by-side Unreal comparisons against the HAP path. The `.divstream` export is intended for `ADepthImageVolumeDirectStorageActor`.
 

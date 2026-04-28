@@ -11,10 +11,11 @@ Format goals:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import shutil
 import struct
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +39,7 @@ from export_stage0_kinect_video import _load_stage0_results, _relative_c2w_from_
 
 _MAGIC = b"DIVBC7F1"
 _VERSION = 1
-_CHUNK_ALIGNMENT = 4096
+_PAYLOAD_ALIGNMENT = 4096
 _D3D12_TEXTURE_DATA_PITCH_ALIGNMENT = 256
 _D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512
 _COLOR_FORMAT_BC7_RAW = 2
@@ -47,6 +48,8 @@ _DEFAULT_OUTPUT_FILENAME = "depth_image_stream.divstream"
 
 _HEADER_STRUCT = struct.Struct("<8sIIIIIIIIIdQQQ")
 _FRAME_STRUCT = struct.Struct("<12f6fQIQI")
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,34 @@ class _FrameEntry:
     color_size: int
     depth_offset: int
     depth_size: int
+
+
+def _safe_output_component(raw: str) -> str:
+    safe = _SAFE_NAME_RE.sub("_", str(raw).strip()).strip("._-")
+    return safe or "scene"
+
+
+def default_depth_image_stream_bc7_output_path(scene_root: str) -> str:
+    scene_root_path = Path(scene_root).resolve()
+    scene_name = _safe_output_component(scene_root_path.name)
+
+    source_name = ""
+    meta_path = scene_root_path / "preprocess_frames.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        source_input_path = str(meta.get("source_input_path") or "").strip()
+        if source_input_path:
+            source_path = Path(source_input_path)
+            source_name = _safe_output_component(
+                source_path.stem if source_path.suffix else source_path.name
+            )
+
+    base_name = source_name or scene_name
+
+    return str(scene_root_path / "exports" / "depth_image_stream" / f"{base_name}.divstream")
 
 
 def _build_bc7_helper() -> Path:
@@ -207,45 +238,45 @@ def _filter_depth_residual_frame_bytes(depth_frame_bytes: bytes, *, width: int, 
     return _row_sub_filter_bytes(low_plane) + _row_sub_filter_bytes(high_plane)
 
 
-def _compress_depth_chunk_with_fallback(helper_path: Path, payload: bytes, *, preferred_level: int) -> bytes:
-    try:
-        return _compress_payload_with_helper(helper_path, payload, level=preferred_level)
-    except subprocess.CalledProcessError:
-        pass
-
-    candidate_levels = [level for level in range(12, 0, -1) if level != preferred_level]
-    best_blob: bytes | None = None
-    best_level: int | None = None
-    last_error: Exception | None = None
-    for level in candidate_levels:
-        try:
-            compressed = _compress_payload_with_helper(helper_path, payload, level=level)
-            if best_blob is None or len(compressed) < len(best_blob):
-                best_blob = compressed
-                best_level = level
-        except subprocess.CalledProcessError as exc:
-            last_error = exc
-
-    if best_blob is None:
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("No working GDeflate compression level was found for the depth chunk payload.")
-
-    print(
-        f"[DIVBC7C3] Preferred GDeflate level {preferred_level} failed; "
-        f"using fallback level {best_level} for one depth chunk ({len(payload)} -> {len(best_blob)} bytes)."
+def _infer_scene_fps(scene_root: str) -> int:
+    scene_root_path = Path(scene_root)
+    sequence_info_candidates = (
+        scene_root_path / "exports" / "kinect_rgbd_sequence" / "sequence_info.json",
+        scene_root_path / "exports" / "kinect_rgbd_sequence_depth8" / "sequence_info.json",
+        scene_root_path / "exports" / "kinect_rgbd_video" / "sequence_info.json",
     )
-    return best_blob
+
+    for info_path in sequence_info_candidates:
+        if not info_path.exists():
+            continue
+        try:
+            payload = json.loads(info_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        frame_rate = payload.get("frame_rate")
+        if frame_rate is None:
+            frame_rate = payload.get("fps")
+        if frame_rate is None:
+            continue
+
+        inferred_fps = int(round(float(frame_rate)))
+        if inferred_fps >= 1:
+            return inferred_fps
+
+    return 30
 
 
 def export_depth_image_stream_bc7(
     *,
     scene_root: str,
     output_path: str | None = None,
-    fps: int = 30,
+    fps: int | None = None,
     compression_level: int = 9,
     overwrite: bool = False,
 ) -> str:
+    if fps is None:
+        fps = _infer_scene_fps(scene_root)
     if fps < 1:
         raise ValueError("fps must be at least 1.")
     if compression_level < 1 or compression_level > 12:
@@ -253,7 +284,7 @@ def export_depth_image_stream_bc7(
 
     scene_root = os.path.abspath(scene_root)
     if output_path is None or str(output_path).strip() == "":
-        output_path = os.path.join(scene_root, "exports", "depth_image_stream", _DEFAULT_OUTPUT_FILENAME)
+        output_path = default_depth_image_stream_bc7_output_path(scene_root)
     output_path = os.path.abspath(output_path)
     output_dir = os.path.dirname(output_path)
 
@@ -289,7 +320,7 @@ def export_depth_image_stream_bc7(
     frame_table_size = _FRAME_STRUCT.size * num_frames
     header_size = _HEADER_STRUCT.size
     frame_table_offset = header_size
-    payload_offset = _align_up(frame_table_offset + frame_table_size, _CHUNK_ALIGNMENT)
+    payload_offset = _align_up(frame_table_offset + frame_table_size, _PAYLOAD_ALIGNMENT)
 
     frame_entries: list[_FrameEntry] = []
     frame_blobs: list[tuple[int, bytes]] = []
@@ -341,11 +372,11 @@ def export_depth_image_stream_bc7(
 
         color_offset = next_offset
         next_offset += len(color_blob)
-        next_offset = _align_up(next_offset, _CHUNK_ALIGNMENT)
+        next_offset = _align_up(next_offset, _PAYLOAD_ALIGNMENT)
 
         depth_offset = next_offset
         next_offset += len(depth_blob)
-        next_offset = _align_up(next_offset, _CHUNK_ALIGNMENT)
+        next_offset = _align_up(next_offset, _PAYLOAD_ALIGNMENT)
 
         frame_entries.append(
             _FrameEntry(
@@ -404,11 +435,11 @@ def export_depth_image_stream_bc7(
         current = stream.tell()
         _write_zero_padding(stream, payload_offset - current)
 
-        for chunk_offset, blob in frame_blobs:
+        for blob_offset, blob in frame_blobs:
             current = stream.tell()
-            if current > chunk_offset:
-                raise RuntimeError(f"Chunk overlap while writing {output_path}")
-            _write_zero_padding(stream, chunk_offset - current)
+            if current > blob_offset:
+                raise RuntimeError(f"Payload overlap while writing {output_path}")
+            _write_zero_padding(stream, blob_offset - current)
             stream.write(blob)
 
     return output_path
@@ -420,14 +451,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         default="",
-        help="Output path for the BC7 chunked DirectStorage stream. Defaults under exports/depth_image_stream/.",
+        help="Output path for the DIVBC7F1 DirectStorage stream. Defaults under exports/depth_image_stream/.",
     )
-    parser.add_argument("--fps", type=int, default=30, help="Playback fps metadata for the stream.")
+    parser.add_argument("--fps", type=int, default=None, help="Playback fps metadata for the stream. Defaults to scene metadata.")
     parser.add_argument(
         "--compression-level",
         type=int,
         default=9,
-        help="GDeflate compression level [1..12] for depth chunk payloads.",
+        help="GDeflate compression level [1..12] for per-frame depth payloads.",
     )
     parser.add_argument(
         "--overwrite",
