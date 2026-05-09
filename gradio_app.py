@@ -4827,11 +4827,13 @@ def build_app() -> gr.Blocks:
                         label="DA3 Input Max Frames / Chunk Size",
                         value=DEFAULT_STAGE0_MAX_FRAMES,
                         precision=0,
+                        info="Target DA3 frame count in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                     )
                     simple_stage0_max_stride = gr.Number(
                         label="DA3 Input Stride",
                         value=DEFAULT_STAGE0_MAX_STRIDE,
                         precision=0,
+                        info="Maximum raw-frame gap in standard mode. In streaming mode this is applied exactly before chunking.",
                     )
                     simple_stage0_streaming = gr.Checkbox(label="Use DA3 Streaming", value=DEFAULT_STAGE0_STREAMING)
                     simple_stage0_streaming_overlap = gr.Number(
@@ -5223,13 +5225,13 @@ def build_app() -> gr.Blocks:
                             label="DA3 Input Max Frames / Chunk Size",
                             value=DEFAULT_STAGE0_MAX_FRAMES,
                             precision=0,
-                            info="Global DA3 frame cap in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
+                            info="Target DA3 frame count in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                         )
                         preprocess_max_stride = gr.Number(
                             label="DA3 Input Stride",
                             value=DEFAULT_STAGE0_MAX_STRIDE,
                             precision=0,
-                            info="Raw-video frame stride. In streaming mode this is applied before chunking.",
+                            info="Maximum raw-frame gap in standard mode. In streaming mode this is applied exactly before chunking.",
                         )
                         preprocess_streaming_overlap = gr.Number(
                             label="DA3 Streaming Overlap",
@@ -5300,8 +5302,8 @@ def build_app() -> gr.Blocks:
                         "Reference-view note: this app now defaults DA3 to `first`."
                     )
                     gr.Markdown(
-                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Stride=6` uses every 6th raw frame before chunking. "
-                        "With `Use DA3 Streaming` off, raw `5000` frames with the same settings still only covers the earlier part of the clip. With streaming on, Stage 0 uses 20-frame chunks with the chosen overlap across the selected strided clip."
+                        "Example: in standard mode, raw `500` frames with `DA3 Input Max Frames / Chunk Size=100`, `DA3 Input Stride=6` samples 100 frames across the clip with no gap above 6. "
+                        "In streaming mode, `DA3 Input Stride=6` uses every sixth raw frame before chunking."
                     )
                     gr.Markdown(
                         "When available, Stage 0 also stores DA3's sky mask in `results.npz`. The pre-ICP filtering controls below use it to drop sky pixels before the non-rigid ICP stage."
@@ -5814,15 +5816,15 @@ def build_app() -> gr.Blocks:
                     stage0_overwrite = gr.Checkbox(label="Overwrite Stage 0 Outputs", value=False)
                     stage0_max_frames = gr.Number(
                         label="DA3 Input Max Frames / Chunk Size",
-                        value=DEFAULT_STAGE0_MAX_FRAMES,
+                        value=5,
                         precision=0,
-                        info="Global DA3 frame cap in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
+                        info="Target DA3 frame count in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                     )
                     stage0_max_stride = gr.Number(
                         label="DA3 Input Stride",
-                        value=DEFAULT_STAGE0_MAX_STRIDE,
+                        value=1000,
                         precision=0,
-                        info="Raw-video frame stride. In streaming mode this is applied before chunking.",
+                        info="Maximum raw-frame gap in standard mode. In streaming mode this is applied exactly before chunking.",
                     )
                     stage0_streaming_overlap = gr.Number(
                         label="DA3 Streaming Overlap",
@@ -5847,9 +5849,9 @@ def build_app() -> gr.Blocks:
                     )
                     stage0_ref_view_strategy = gr.Dropdown(
                         choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
-                        value=DEFAULT_STAGE0_REF_VIEW_STRATEGY,
+                        value="saddle_balanced",
                         label="DA3 Reference View",
-                        info="Default is `first` for stable chunked divstream exports.",
+                        info="Run Explicit Stage defaults to `saddle_balanced`.",
                     )
                     stage0_export_gs_video = gr.Checkbox(
                         label="Export DA3 GS Preview Video",
@@ -5876,7 +5878,7 @@ def build_app() -> gr.Blocks:
                     )
                     stage0_streaming = gr.Checkbox(
                         label="Use DA3 Streaming",
-                        value=DEFAULT_STAGE0_STREAMING,
+                        value=False,
                         info="Process the full selected sequence in overlapping chunks instead of one global DA3 batch.",
                     )
                     stage0_streaming_global_guide = gr.Checkbox(
@@ -5886,8 +5888,8 @@ def build_app() -> gr.Blocks:
                     )
                     gr.Markdown(
                         "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus `before_non_rigid_icp.ply`. "
-                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Stride=6` uses every 6th raw frame before chunking. "
-                        "With `Use DA3 Streaming` off, raw `5000` frames with those settings still only covers the earlier part of the clip. With streaming on, Stage 0 uses 20-frame chunks with the chosen overlap across the selected strided clip. "
+                        "Example: in standard mode, raw `500` frames with `DA3 Input Max Frames / Chunk Size=100`, `DA3 Input Stride=6` samples 100 frames across the clip with no gap above 6. "
+                        "In streaming mode, `DA3 Input Stride=6` uses every sixth raw frame before chunking. "
                         "If `Stage 0 Source Mode` is `Existing Image Folder`, the app first copies that folder into `videos/_gradio_uploads/<uid>/frames/`, then runs Stage 0 from the copied images. Uploaded videos likewise land under `videos/_gradio_uploads/<uid>/<uid>.*` with a short default scene root at `videos/_gradio_uploads/<uid>/scene/`. In that mode `DA3 Input Stride` is ignored; `DA3 Input Max Frames / Chunk Size` is only used when streaming mode is enabled. "
                         "The optional DA3 GS preview video is skipped by default. `Stage 0 Runtime Export` defaults to DirectStorage stream."
                     )

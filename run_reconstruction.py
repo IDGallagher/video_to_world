@@ -64,7 +64,7 @@ class PipelineConfig:
     """Stage 0: maximum number of frames to run DA3 on, or the DA3 chunk size in streaming mode."""
 
     preprocess_max_stride: int = 6
-    """Stage 0: maximum stride between frames when subsampling, or the fixed raw-video stride in streaming mode."""
+    """Stage 0: maximum raw-frame gap in standard mode, or the fixed raw-video stride in streaming mode."""
 
     preprocess_streaming: bool = False
     """Stage 0: use DA3-Streaming-style overlapping chunks instead of a single global DA3 batch."""

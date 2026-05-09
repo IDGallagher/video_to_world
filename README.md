@@ -150,11 +150,12 @@ This estimates per-frame pointclouds using DepthAnyting-3 and saves the results 
 With `--prepare_stage1_inputs`, Stage 0 also materializes the filtered `exports/ply/...` cache and writes `before_non_rigid_icp.ply` into the corresponding `frame_to_model_icp_<...>/` run directory. Add `--export_gs_video` if you also want the DA3 preview video and trajectory export. `--runtime_export_format` selects the runtime-ready Stage 0 export to write after preprocessing; the default is `directstorage_stream`.
 
 Subsampling of frames is controlled by `--max_frames` (default: 20) and `--max_stride` (default: 6).
+In standard mode, `--max_frames` is the target selected-frame count and `--max_stride` is the maximum raw-frame gap when sampling across the extracted video.
 The script extracts all frames to `<scene_root>/frames/`, then writes the selected subset (renumbered from `000000.*`) to `<scene_root>/frames_subsampled/` and runs DepthAnyting-3 on that folder.
 This constrains memory of DA3 to the available budget (choose fewer frames for smaller GPUs).
 Please consult the original repository for more information regarding memory.
 If the scene contains much more frames, Stage 0 now also supports a built-in DA3 streaming mode via `--streaming --streaming_overlap 10`.
-In streaming mode, `--max_frames` becomes the per-chunk DA3 batch size, `--max_stride` is ignored, and Stage 0 aligns overlapping chunks across the full extracted clip before writing the standard combined `exports/npz/results.npz`.
+In streaming mode, `--max_frames` becomes the per-chunk DA3 batch size, `--max_stride` is applied as a fixed input-video stride, and Stage 0 aligns overlapping chunks across the selected clip before writing the standard combined `exports/npz/results.npz`.
 The optional DA3 GS preview export is currently only available in non-streaming mode.
 
 **Expected scene layout**:

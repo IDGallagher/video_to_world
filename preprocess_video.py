@@ -86,11 +86,38 @@ def subsample_frames(
     max_frames: Optional[int] = None,
     max_stride: Optional[int] = None,
 ) -> tuple[list[str], int]:
-    stride = 1 if max_stride is None or int(max_stride) < 1 else int(max_stride)
-    selected = images[::stride]
-    if max_frames is not None and int(max_frames) > 0:
-        selected = selected[: int(max_frames)]
-    return selected, stride
+    if not images:
+        return [], 1
+
+    stride_limit = 1 if max_stride is None or int(max_stride) < 1 else int(max_stride)
+    frame_limit = None if max_frames is None or int(max_frames) <= 0 else int(max_frames)
+
+    if frame_limit is None:
+        return images[::stride_limit], stride_limit
+
+    target_count = min(frame_limit, len(images))
+    if target_count >= len(images):
+        return list(images), 1
+    if target_count <= 1:
+        return [images[0]], 1
+
+    required_max_gap = int(math.ceil((len(images) - 1) / float(target_count - 1)))
+    if required_max_gap <= stride_limit:
+        indices = [
+            int(round(i * (len(images) - 1) / float(target_count - 1)))
+            for i in range(target_count)
+        ]
+        indices[0] = 0
+        indices[-1] = len(images) - 1
+        selected = [images[idx] for idx in indices]
+        actual_stride = max(
+            1,
+            max(indices[i + 1] - indices[i] for i in range(len(indices) - 1)),
+        )
+        return selected, actual_stride
+
+    selected = images[::stride_limit][:target_count]
+    return selected, stride_limit
 
 
 def extract_frames(
@@ -1888,8 +1915,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help=(
-            "Maximum number of frames to run DA3 on. In streaming mode, this becomes the per-chunk "
-            "DA3 batch size instead of a global frame cap."
+            "Target number of frames to run DA3 on. In standard mode, frames are sampled across "
+            "the extracted video subject to --max_stride. In streaming mode, this becomes the "
+            "per-chunk DA3 batch size instead of a global frame cap."
         ),
     )
     p.add_argument(
@@ -1897,8 +1925,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Frame stride for input-video frame selection. In streaming mode, this is applied exactly: "
-            "for example, 6 uses every sixth extracted video frame."
+            "Maximum raw-frame gap for standard-mode frame selection. In streaming mode, this is "
+            "applied exactly: for example, 6 uses every sixth extracted video frame."
         ),
     )
     p.add_argument(
