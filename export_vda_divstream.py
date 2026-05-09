@@ -239,43 +239,51 @@ def _apply_depth_filters(
     if mask_min_depth_range_meters and min_depth_range_meters < 0.0:
         raise ValueError("Min Depth Range Metres must be non-negative.")
 
-    removed_min_range = 0
-    if mask_min_depth_range_percent or mask_min_depth_range_meters:
+    global_min = global_max = None
+    if mask_min_depth_range_percent or mask_max_depth_range_percent:
+        global_depth = filtered[valid]
+        if global_depth.size:
+            global_min = float(global_depth.min())
+            global_max = float(global_depth.max())
+
+    removed_min_range_percent = 0
+    if mask_min_depth_range_percent and global_min is not None and global_max is not None:
+        keep_limit = global_min + (float(min_depth_range_percent) / 100.0) * (global_max - global_min)
+        remove = valid & (filtered > keep_limit)
+        removed_min_range_percent = int(np.count_nonzero(remove))
+        valid[remove] = False
+        print(
+            "VDA global min-depth-range filter "
+            f"(range={global_min:.6g}..{global_max:.6g}, keep<= {keep_limit:.6g}) "
+            f"removed {removed_min_range_percent:,} pixels."
+        )
+
+    removed_min_range_meters = 0
+    if mask_min_depth_range_meters:
         for frame_idx in range(filtered.shape[0]):
             vm = valid[frame_idx]
             if not np.any(vm):
                 continue
             frame_depth = filtered[frame_idx]
             frame_min = float(frame_depth[vm].min())
-            keep_limit: float | None = None
-            if mask_min_depth_range_percent:
-                frame_max = float(frame_depth[vm].max())
-                keep_limit = frame_min + (float(min_depth_range_percent) / 100.0) * (frame_max - frame_min)
-            if mask_min_depth_range_meters:
-                meters_limit = frame_min + float(min_depth_range_meters)
-                keep_limit = meters_limit if keep_limit is None else min(keep_limit, meters_limit)
-            if keep_limit is not None:
-                remove = vm & (frame_depth > keep_limit)
-                removed_min_range += int(np.count_nonzero(remove))
-                valid[frame_idx][remove] = False
-    if removed_min_range:
-        print(f"VDA min-depth-range filter removed {removed_min_range:,} pixels.")
+            keep_limit = frame_min + float(min_depth_range_meters)
+            remove = vm & (frame_depth > keep_limit)
+            removed_min_range_meters += int(np.count_nonzero(remove))
+            valid[frame_idx][remove] = False
+    if removed_min_range_meters:
+        print(f"VDA min-depth-range-meters filter removed {removed_min_range_meters:,} pixels.")
 
     removed_max_range = 0
-    if mask_max_depth_range_percent:
-        for frame_idx in range(filtered.shape[0]):
-            vm = valid[frame_idx]
-            if not np.any(vm):
-                continue
-            frame_depth = filtered[frame_idx]
-            frame_min = float(frame_depth[vm].min())
-            frame_max = float(frame_depth[vm].max())
-            keep_limit = frame_max - (float(max_depth_range_percent) / 100.0) * (frame_max - frame_min)
-            remove = vm & (frame_depth < keep_limit)
-            removed_max_range += int(np.count_nonzero(remove))
-            valid[frame_idx][remove] = False
-    if removed_max_range:
-        print(f"VDA max-depth-range filter removed {removed_max_range:,} pixels.")
+    if mask_max_depth_range_percent and global_min is not None and global_max is not None:
+        keep_limit = global_max - (float(max_depth_range_percent) / 100.0) * (global_max - global_min)
+        remove = valid & (filtered < keep_limit)
+        removed_max_range = int(np.count_nonzero(remove))
+        valid[remove] = False
+        print(
+            "VDA global max-depth-range filter "
+            f"(range={global_min:.6g}..{global_max:.6g}, keep>= {keep_limit:.6g}) "
+            f"removed {removed_max_range:,} pixels."
+        )
 
     removed_max_depth = 0
     if mask_max_depth:
@@ -363,6 +371,7 @@ def _write_results_npz(
     input_size: int,
     max_res: int,
     stride: int,
+    decoder_micro_batch_size: int,
     fixed_camera_fov_degrees: float,
     relative_depth_inverse: bool,
 ) -> Path:
@@ -396,6 +405,7 @@ def _write_results_npz(
                 "input_size": int(input_size),
                 "max_res": int(max_res),
                 "actual_stride": int(stride),
+                "decoder_micro_batch_size": int(decoder_micro_batch_size),
                 "runtime_export_fps": float(fps),
                 "num_frames_used": int(num_frames),
                 "selected_frame_indices": [int(idx) for idx in selected_indices],
@@ -418,6 +428,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--encoder", choices=sorted(MODEL_CONFIGS.keys()), default="vits")
     parser.add_argument("--metric", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--input-size", type=int, default=518)
+    parser.add_argument("--decoder-micro-batch-size", type=int, default=1)
     parser.add_argument("--max-res", type=int, default=1280)
     parser.add_argument("--max-frames", type=int, default=-1)
     parser.add_argument("--stride", type=int, default=1)
@@ -488,7 +499,8 @@ def main() -> None:
     print(
         "VDA inference settings: "
         f"encoder={args.encoder}, metric={bool(args.metric)}, input_size={int(args.input_size)}, "
-        f"max_res={int(args.max_res)}, fp32={bool(args.fp32)}, device={device}, checkpoint={checkpoint_path}"
+        f"decoder_micro_batch_size={int(args.decoder_micro_batch_size)}, max_res={int(args.max_res)}, "
+        f"fp32={bool(args.fp32)}, device={device}, checkpoint={checkpoint_path}"
     )
     if args.fp32:
         print(
@@ -509,6 +521,7 @@ def main() -> None:
             input_size=int(args.input_size),
             device=device,
             fp32=bool(args.fp32),
+            decoder_micro_batch_size=max(1, int(args.decoder_micro_batch_size)),
         )
     except RuntimeError as exc:
         if "out of memory" in str(exc).lower():
@@ -517,7 +530,8 @@ def main() -> None:
             raise RuntimeError(
                 "VDA CUDA out of memory during inference. "
                 f"Failed settings: encoder={args.encoder}, metric={bool(args.metric)}, "
-                f"input_size={int(args.input_size)}, max_res={int(args.max_res)}, "
+                f"input_size={int(args.input_size)}, decoder_micro_batch_size={int(args.decoder_micro_batch_size)}, "
+                f"max_res={int(args.max_res)}, "
                 f"selected_frames={frames.shape[0]}, frame_shape={frames.shape[2]}x{frames.shape[1]}. "
                 "Reduce VDA Input Size first (try 384 or 518 instead of 768), reduce Video Max Resolution, "
                 "or use vitb/vits. Large/vitl at input size 768 is too large for this GPU in a 32-frame VDA chunk."
@@ -561,6 +575,7 @@ def main() -> None:
         input_size=int(args.input_size),
         max_res=int(args.max_res),
         stride=stride,
+        decoder_micro_batch_size=max(1, int(args.decoder_micro_batch_size)),
         fixed_camera_fov_degrees=float(args.fixed_camera_fov_degrees),
         relative_depth_inverse=bool(args.relative_depth_inverse),
     )

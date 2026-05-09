@@ -2588,6 +2588,7 @@ def _run_vda_divstream_generator(
     vda_metric,
     vda_relative_depth_inverse,
     vda_input_size,
+    vda_decoder_micro_batch_size,
     vda_max_res,
     vda_max_frames,
     vda_stride,
@@ -2625,11 +2626,17 @@ def _run_vda_divstream_generator(
         if parsed_encoder not in {"vits", "vitb", "vitl"}:
             raise ValueError("VDA Encoder must be one of vits, vitb, or vitl.")
         parsed_input_size = _coerce_int(vda_input_size, label="VDA Input Size")
+        parsed_decoder_micro_batch_size = _coerce_int(
+            vda_decoder_micro_batch_size,
+            label="VDA Decoder Micro-Batch Size",
+        )
         parsed_max_res = _coerce_int(vda_max_res, label="VDA Max Resolution")
         parsed_max_frames = _coerce_int(vda_max_frames, label="VDA Max Frames")
         parsed_stride = _coerce_int(vda_stride, label="VDA Input Stride")
         if parsed_input_size is None or parsed_input_size < 14:
             raise ValueError("VDA Input Size must be at least 14.")
+        if parsed_decoder_micro_batch_size is None or parsed_decoder_micro_batch_size < 1:
+            raise ValueError("VDA Decoder Micro-Batch Size must be at least 1.")
         if parsed_max_res is None:
             parsed_max_res = -1
         if parsed_max_frames is None:
@@ -2706,6 +2713,8 @@ def _run_vda_divstream_generator(
         parsed_encoder,
         "--input-size",
         str(int(parsed_input_size)),
+        "--decoder-micro-batch-size",
+        str(int(parsed_decoder_micro_batch_size)),
         "--max-res",
         str(int(parsed_max_res)),
         "--max-frames",
@@ -5016,9 +5025,15 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     vda_input_size = gr.Number(
                         label="VDA Input Size",
-                        value=518,
+                        value=768,
                         precision=0,
                         info="Model inference size. Large/vitl at 768 can exceed 24 GB VRAM; use 384 or 518 if CUDA OOM.",
+                    )
+                    vda_decoder_micro_batch_size = gr.Number(
+                        label="Decoder Micro-Batch Size",
+                        value=4,
+                        precision=0,
+                        info="Lower uses less VRAM in VDA's decoder. Use 1 if CUDA OOM occurs.",
                     )
                     vda_max_res = gr.Number(
                         label="Video Max Resolution",
@@ -5059,11 +5074,13 @@ def build_app() -> gr.Blocks:
                     vda_filter_mask_min_depth_range_percent = gr.Checkbox(
                         label="Limit By Min Depth Range %",
                         value=False,
+                        info="Uses the global valid depth range across all exported frames and removes depths beyond the near-side limit.",
                     )
                     vda_filter_min_depth_range_percent = gr.Number(label="Min Depth Range Percent", value=50.0)
                     vda_filter_mask_max_depth_range_percent = gr.Checkbox(
                         label="Limit By Max Depth Range %",
                         value=False,
+                        info="Uses the global valid depth range across all exported frames and removes depths before the far-side limit.",
                     )
                     vda_filter_max_depth_range_percent = gr.Number(label="Max Depth Range Percent", value=50.0)
                 with gr.Row():
@@ -5101,6 +5118,7 @@ def build_app() -> gr.Blocks:
                     vda_metric,
                     vda_relative_depth_inverse,
                     vda_input_size,
+                    vda_decoder_micro_batch_size,
                     vda_max_res,
                     vda_max_frames,
                     vda_stride,
