@@ -138,6 +138,12 @@ def _to_native_windows_path(path: str | Path) -> str:
     resolved = os.fspath(path)
     if os.name == "nt":
         return str(Path(resolved))
+    resolved_posix = resolved.replace("\\", "/")
+    match = re.match(r"^/mnt/([A-Za-z])/(.*)$", resolved_posix)
+    if match:
+        drive = match.group(1).upper()
+        rest = match.group(2).replace("/", "\\")
+        return f"{drive}:\\{rest}"
     result = subprocess.run(
         ["wslpath", "-w", resolved],
         check=True,
@@ -244,7 +250,9 @@ def _build_gdeflate_helper() -> Path:
 
 
 def _compress_payload_with_helper(helper_path: Path, payload: bytes, *, level: int) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="divstream_gdeflate_") as temp_dir:
+    temp_parent = helper_path.parent / "_tmp"
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="divstream_gdeflate_", dir=temp_parent) as temp_dir:
         temp_dir_path = Path(temp_dir)
         input_path = temp_dir_path / "input.bin"
         output_path = temp_dir_path / "output.gdeflate"
@@ -331,12 +339,13 @@ def export_depth_image_stream(
     *,
     scene_root: str,
     output_path: str | None = None,
-    fps: int = 30,
+    fps: float = 30.0,
     compression_level: int = 9,
     overwrite: bool = False,
 ) -> str:
-    if fps < 1:
-        raise ValueError("fps must be at least 1.")
+    fps = float(fps)
+    if fps <= 0.0:
+        raise ValueError("fps must be greater than 0.")
     if compression_level < 1 or compression_level > 12:
         raise ValueError("compression_level must be between 1 and 12.")
 

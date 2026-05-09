@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import glob
+import math
 import os
 import shutil
 import subprocess
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from PIL import Image
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 
 from configs.common import AlignmentDataConfig
@@ -81,44 +86,11 @@ def subsample_frames(
     max_frames: Optional[int] = None,
     max_stride: Optional[int] = None,
 ) -> tuple[list[str], int]:
-    total_frames = len(images)
-
-    # If we have fewer or equal frames than requested, just use all with stride 1.
-    # This also respects the "max_stride is an upper bound" semantics.
-    if max_frames is not None and total_frames <= max_frames:
-        return images, 1
-
-    # If no constraints, return everything
-    if max_frames is None and max_stride is None:
-        return images, 1
-
-    # If max_frames is not specified, treat it as "use everything" and ignore max_stride.
-    # (Current CLI always passes max_frames when subsampling is desired.)
-    if max_frames is None:
-        return images, 1
-
-    # Normalise max_stride: None or <1 means "no effective upper bound"
-    if max_stride is None or max_stride < 1:
-        max_stride = total_frames
-
-    # Ideal average stride to hit max_frames over total_frames
-    ideal_stride = total_frames / float(max_frames)
-
-    if ideal_stride <= max_stride:
-        # We can (approximately) span the whole sequence.
-        # Pick the smallest integer stride that still gives us at least max_frames,
-        # i.e. floor(ideal_stride), but at least 1.
-        stride = max(1, total_frames // max_frames)
-    else:
-        # Hard max_stride constraint prevents covering the full range uniformly.
-        # Enforce max_stride strictly and truncate coverage.
-        stride = max_stride
-
-    indices = list(range(0, total_frames, stride))
-    if len(indices) > max_frames:
-        indices = indices[:max_frames]
-
-    return [images[i] for i in indices], stride
+    stride = 1 if max_stride is None or int(max_stride) < 1 else int(max_stride)
+    selected = images[::stride]
+    if max_frames is not None and int(max_frames) > 0:
+        selected = selected[: int(max_frames)]
+    return selected, stride
 
 
 def extract_frames(
@@ -141,11 +113,198 @@ def extract_frames(
     _run(cmd)
 
 
+def _estimate_fixed_camera_inputs(
+    image_paths: list[str],
+    *,
+    horizontal_fov_degrees: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not image_paths:
+        raise ValueError("Cannot estimate fixed-camera inputs with no images.")
+
+    hfov = float(horizontal_fov_degrees)
+    if not math.isfinite(hfov) or hfov <= 1.0 or hfov >= 179.0:
+        raise ValueError("Fixed camera horizontal FOV must be between 1 and 179 degrees.")
+
+    hfov_rad = math.radians(hfov)
+    intrinsics: list[np.ndarray] = []
+    for image_path in image_paths:
+        with Image.open(image_path) as image:
+            width, height = image.size
+        focal = (0.5 * float(width)) / math.tan(0.5 * hfov_rad)
+        K = np.array(
+            [
+                [focal, 0.0, (float(width) - 1.0) * 0.5],
+                [0.0, focal, (float(height) - 1.0) * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        intrinsics.append(K)
+
+    extrinsics = np.repeat(
+        np.eye(4, dtype=np.float32)[None, :, :],
+        len(image_paths),
+        axis=0,
+    )
+    return extrinsics, np.stack(intrinsics, axis=0)
+
+
+def _run_da3_inference(
+    *,
+    model,
+    image_paths: list[str],
+    process_res: int,
+    process_res_method: str,
+    infer_gs: bool,
+    use_ray_pose: bool,
+    ref_view_strategy: str,
+    export_dir: str | None = None,
+    export_format: str = "npz",
+    fixed_camera: bool = False,
+    fixed_camera_fov_degrees: float = 60.0,
+    input_extrinsics: np.ndarray | None = None,
+    input_intrinsics: np.ndarray | None = None,
+    input_camera_params_processed: bool = False,
+    align_to_input_ext_scale: bool = False,
+):
+    has_camera_priors = input_extrinsics is not None or input_intrinsics is not None
+    if has_camera_priors and (input_extrinsics is None or input_intrinsics is None):
+        raise ValueError("DA3 camera priors require both extrinsics and intrinsics.")
+    if fixed_camera and has_camera_priors:
+        raise ValueError("Fixed-camera DA3 mode cannot also use external camera priors.")
+
+    if not fixed_camera and not has_camera_priors:
+        return model.inference(
+            image=image_paths,
+            export_dir=export_dir,
+            export_format=export_format,
+            process_res=process_res,
+            process_res_method=process_res_method,
+            infer_gs=infer_gs,
+            use_ray_pose=use_ray_pose,
+            ref_view_strategy=ref_view_strategy,
+            align_to_input_ext_scale=False,
+        )
+
+    if has_camera_priors and not input_camera_params_processed:
+        return model.inference(
+            image=image_paths,
+            extrinsics=np.asarray(input_extrinsics, dtype=np.float32),
+            intrinsics=np.asarray(input_intrinsics, dtype=np.float32),
+            export_dir=export_dir,
+            export_format=export_format,
+            process_res=process_res,
+            process_res_method=process_res_method,
+            infer_gs=infer_gs,
+            use_ray_pose=use_ray_pose,
+            ref_view_strategy=ref_view_strategy,
+            align_to_input_ext_scale=align_to_input_ext_scale,
+        )
+
+    if has_camera_priors:
+        input_ext_np = np.stack(
+            [_as_homogeneous44(ext) for ext in np.asarray(input_extrinsics, dtype=np.float32)],
+            axis=0,
+        )
+        input_intr_np = np.asarray(input_intrinsics, dtype=np.float32)
+        if input_ext_np.shape[0] != len(image_paths) or input_intr_np.shape[0] != len(image_paths):
+            raise ValueError("DA3 camera prior counts must match image_paths.")
+
+        # The guide pass produces intrinsics in DA3's processed image space.
+        # Running the public API would resize those intrinsics again, so use the
+        # lower-level path and attach the already-processed camera priors directly.
+        imgs_cpu, _, _ = model._preprocess_inputs(
+            image_paths,
+            None,
+            None,
+            process_res,
+            process_res_method,
+        )
+        ex_cpu = torch.from_numpy(input_ext_np).float()
+        in_cpu = torch.from_numpy(input_intr_np).float()
+        imgs, ex_t, in_t = model._prepare_model_inputs(imgs_cpu, ex_cpu, in_cpu)
+        ex_t_norm = model._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
+        export_feat_layers: list[int] = []
+        raw_output = model._run_model_forward(
+            imgs,
+            ex_t_norm,
+            in_t,
+            export_feat_layers,
+            infer_gs,
+            use_ray_pose,
+            ref_view_strategy,
+        )
+        prediction = model._convert_to_prediction(raw_output)
+        prediction = model._align_to_input_extrinsics_intrinsics(
+            ex_cpu,
+            in_cpu,
+            prediction,
+            align_to_input_ext_scale,
+        )
+        prediction = model._add_processed_images(prediction, imgs_cpu)
+
+        if export_dir is not None:
+            model._export_results(prediction, export_format, export_dir)
+
+        return prediction
+
+    fixed_extrinsics, fixed_intrinsics = _estimate_fixed_camera_inputs(
+        image_paths,
+        horizontal_fov_degrees=fixed_camera_fov_degrees,
+    )
+    print(
+        "DA3 fixed-camera mode: supplying identity extrinsics and estimated pinhole "
+        f"intrinsics (horizontal_fov={fixed_camera_fov_degrees:g} deg)."
+    )
+
+    # DA3's public inference path always tries to Umeyama-align predictions to
+    # supplied extrinsics. A static camera path is degenerate for that alignment,
+    # so run the same lower-level steps and then explicitly keep the supplied
+    # fixed-camera calibration in the exported prediction.
+    imgs_cpu, ex_cpu, in_cpu = model._preprocess_inputs(
+        image_paths,
+        fixed_extrinsics,
+        fixed_intrinsics,
+        process_res,
+        process_res_method,
+    )
+    imgs, ex_t, in_t = model._prepare_model_inputs(imgs_cpu, ex_cpu, in_cpu)
+    ex_t_norm = model._normalize_extrinsics(ex_t.clone() if ex_t is not None else None)
+    export_feat_layers: list[int] = []
+    raw_output = model._run_model_forward(
+        imgs,
+        ex_t_norm,
+        in_t,
+        export_feat_layers,
+        infer_gs,
+        use_ray_pose,
+        ref_view_strategy,
+    )
+    prediction = model._convert_to_prediction(raw_output)
+
+    ex_np = ex_cpu.detach().cpu().numpy()
+    if ex_np.shape[-2:] == (4, 4):
+        ex_np = ex_np[:, :3, :4]
+    prediction.extrinsics = ex_np.astype(np.float32, copy=False)
+    prediction.intrinsics = in_cpu.detach().cpu().numpy().astype(np.float32, copy=False)
+    prediction = model._add_processed_images(prediction, imgs_cpu)
+
+    if export_dir is not None:
+        model._export_results(prediction, export_format, export_dir)
+
+    return prediction
+
+
 _STREAMING_ALIGN_IRLS = {
     "delta": 0.1,
     "max_iters": 5,
     "tol": "1e-9",
 }
+# Dense overlap point correspondences are the primary stitch signal. Camera
+# centers are only accepted when they do not make those overlapping 3-D points
+# line up worse in the shared chunk basis.
+_STREAMING_CAMERA_CENTER_ALIGN_WEIGHT = 1.0
+_STREAMING_CAMERA_CENTER_MAX_DENSE_RESIDUAL_RATIO = 1.0
 _RUNTIME_EXPORT_NONE = "none"
 _RUNTIME_EXPORT_DIRECTSTORAGE = "directstorage_stream"
 _RUNTIME_EXPORT_HAP = "kinect_rgbd_video"
@@ -161,8 +320,8 @@ _RUNTIME_EXPORT_CHOICES = (
 
 
 def _streaming_select_frames(images: list[str], stride: Optional[int]) -> tuple[list[str], int]:
-    _ = stride
-    return images, 1
+    actual_stride = 1 if stride is None or int(stride) < 1 else int(stride)
+    return images[::actual_stride], actual_stride
 
 
 def _normalize_runtime_export_format(raw: str | None, *, legacy_kinect_rgbd_video: bool = False) -> str:
@@ -192,8 +351,9 @@ def _export_stage0_runtime_format(
     *,
     scene_root: str,
     runtime_export_format: str,
-    fps: int,
+    fps: float,
     overwrite: bool,
+    prep_run: str | None = None,
 ) -> Optional[str]:
     if runtime_export_format == _RUNTIME_EXPORT_NONE:
         return None
@@ -203,8 +363,9 @@ def _export_stage0_runtime_format(
         return str(
             export_depth_image_stream_bc7(
                 scene_root=scene_root,
-                fps=int(fps),
+                fps=float(fps),
                 overwrite=overwrite,
+                prep_run=prep_run,
             )
         )
     if runtime_export_format == _RUNTIME_EXPORT_HAP:
@@ -307,6 +468,435 @@ def _depth_to_point_cloud_vectorized(
     c2w = np.linalg.inv(extrinsics_h)
     world_coords_h = np.einsum("nij,nhwj->nhwi", c2w, camera_coords_h, optimize=True)
     return world_coords_h[..., :3].astype(np.float32, copy=False)
+
+
+def _transform_point_map_sim3(
+    point_map: np.ndarray,
+    sim3: tuple[float, np.ndarray, np.ndarray],
+) -> np.ndarray:
+    s, R, t = sim3
+    points = np.asarray(point_map, dtype=np.float32)
+    transformed = float(s) * (points @ np.asarray(R, dtype=np.float32).T) + np.asarray(t, dtype=np.float32)
+    return transformed.astype(np.float32, copy=False)
+
+
+def _orthonormalize_rotation(rotation: np.ndarray) -> np.ndarray:
+    U, _, Vt = np.linalg.svd(np.asarray(rotation, dtype=np.float32))
+    R = U @ Vt
+    if np.linalg.det(R) < 0.0:
+        U[:, -1] *= -1.0
+        R = U @ Vt
+    return R.astype(np.float32, copy=False)
+
+
+def _rotation_matrix_to_quaternion(rotation: np.ndarray) -> np.ndarray:
+    R = _orthonormalize_rotation(rotation)
+    trace = float(np.trace(R))
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        quat = np.array(
+            [
+                0.25 * s,
+                (R[2, 1] - R[1, 2]) / s,
+                (R[0, 2] - R[2, 0]) / s,
+                (R[1, 0] - R[0, 1]) / s,
+            ],
+            dtype=np.float32,
+        )
+    else:
+        diag = np.diag(R)
+        axis = int(np.argmax(diag))
+        if axis == 0:
+            s = np.sqrt(max(1.0 + R[0, 0] - R[1, 1] - R[2, 2], 1.0e-12)) * 2.0
+            quat = np.array(
+                [
+                    (R[2, 1] - R[1, 2]) / s,
+                    0.25 * s,
+                    (R[0, 1] + R[1, 0]) / s,
+                    (R[0, 2] + R[2, 0]) / s,
+                ],
+                dtype=np.float32,
+            )
+        elif axis == 1:
+            s = np.sqrt(max(1.0 + R[1, 1] - R[0, 0] - R[2, 2], 1.0e-12)) * 2.0
+            quat = np.array(
+                [
+                    (R[0, 2] - R[2, 0]) / s,
+                    (R[0, 1] + R[1, 0]) / s,
+                    0.25 * s,
+                    (R[1, 2] + R[2, 1]) / s,
+                ],
+                dtype=np.float32,
+            )
+        else:
+            s = np.sqrt(max(1.0 + R[2, 2] - R[0, 0] - R[1, 1], 1.0e-12)) * 2.0
+            quat = np.array(
+                [
+                    (R[1, 0] - R[0, 1]) / s,
+                    (R[0, 2] + R[2, 0]) / s,
+                    (R[1, 2] + R[2, 1]) / s,
+                    0.25 * s,
+                ],
+                dtype=np.float32,
+            )
+
+    norm = float(np.linalg.norm(quat))
+    if norm < 1.0e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return (quat / norm).astype(np.float32, copy=False)
+
+
+def _quaternion_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
+    q = np.asarray(quat, dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    if norm < 1.0e-12:
+        return np.eye(3, dtype=np.float32)
+    w, x, y, z = q / norm
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _slerp_rotation_matrix(
+    rotation_a: np.ndarray,
+    rotation_b: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    a = float(np.clip(alpha, 0.0, 1.0))
+    quat_a = _rotation_matrix_to_quaternion(rotation_a)
+    quat_b = _rotation_matrix_to_quaternion(rotation_b)
+    dot = float(np.dot(quat_a, quat_b))
+    if dot < 0.0:
+        quat_b = -quat_b
+        dot = -dot
+
+    if dot > 0.9995:
+        quat = quat_a + a * (quat_b - quat_a)
+        quat /= max(float(np.linalg.norm(quat)), 1.0e-12)
+        return _quaternion_to_rotation_matrix(quat)
+
+    theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * a
+    sin_theta = np.sin(theta)
+    s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    quat = (s0 * quat_a) + (s1 * quat_b)
+    return _quaternion_to_rotation_matrix(quat)
+
+
+def _blend_extrinsics_w2c(
+    extrinsic_a_w2c: np.ndarray,
+    extrinsic_b_w2c: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    a = float(np.clip(alpha, 0.0, 1.0))
+    c2w_a = np.linalg.inv(_as_homogeneous44(extrinsic_a_w2c))
+    c2w_b = np.linalg.inv(_as_homogeneous44(extrinsic_b_w2c))
+
+    blended_c2w = np.eye(4, dtype=np.float32)
+    blended_c2w[:3, :3] = _slerp_rotation_matrix(c2w_a[:3, :3], c2w_b[:3, :3], a)
+    blended_c2w[:3, 3] = ((1.0 - a) * c2w_a[:3, 3] + a * c2w_b[:3, 3]).astype(np.float32)
+    return np.linalg.inv(blended_c2w)[:3, :4].astype(np.float32, copy=False)
+
+
+def _blend_intrinsics(
+    intrinsics_a: np.ndarray,
+    intrinsics_b: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    a = float(np.clip(alpha, 0.0, 1.0))
+    return (
+        (1.0 - a) * np.asarray(intrinsics_a, dtype=np.float32)
+        + a * np.asarray(intrinsics_b, dtype=np.float32)
+    ).astype(np.float32, copy=False)
+
+
+def _identity_sim3() -> tuple[float, np.ndarray, np.ndarray]:
+    return (
+        1.0,
+        np.eye(3, dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+    )
+
+
+def _build_streaming_guide_indices(num_frames: int, guide_count: int) -> list[int]:
+    if num_frames <= 0:
+        return []
+    count = min(max(1, int(guide_count)), int(num_frames))
+    if count >= num_frames:
+        return list(range(num_frames))
+    raw = np.linspace(0, num_frames - 1, count)
+    indices: list[int] = []
+    seen: set[int] = set()
+    for value in raw:
+        idx = int(round(float(value)))
+        idx = max(0, min(num_frames - 1, idx))
+        if idx not in seen:
+            indices.append(idx)
+            seen.add(idx)
+    if 0 not in seen:
+        indices.insert(0, 0)
+        seen.add(0)
+    if (num_frames - 1) not in seen:
+        indices.append(num_frames - 1)
+    return sorted(indices)
+
+
+def _interpolate_streaming_guide_priors(
+    *,
+    num_frames: int,
+    guide_indices: list[int],
+    guide_extrinsics: np.ndarray,
+    guide_intrinsics: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not guide_indices:
+        raise ValueError("Cannot interpolate streaming guide priors with no guide frames.")
+
+    indices = np.asarray(guide_indices, dtype=np.int64)
+    order = np.argsort(indices)
+    indices = indices[order]
+    guide_ext_h = np.stack(
+        [_as_homogeneous44(ext) for ext in np.asarray(guide_extrinsics, dtype=np.float32)[order]],
+        axis=0,
+    )
+    guide_intr = np.asarray(guide_intrinsics, dtype=np.float32)[order]
+    guide_c2w = np.linalg.inv(guide_ext_h)
+
+    all_ext = np.empty((num_frames, 4, 4), dtype=np.float32)
+    all_intr = np.empty((num_frames, 3, 3), dtype=np.float32)
+
+    for frame_idx in range(num_frames):
+        right = int(np.searchsorted(indices, frame_idx, side="left"))
+        if right < len(indices) and int(indices[right]) == frame_idx:
+            c2w = guide_c2w[right].astype(np.float32, copy=True)
+            intr = guide_intr[right]
+        elif right <= 0:
+            c2w = guide_c2w[0].astype(np.float32, copy=True)
+            intr = guide_intr[0]
+        elif right >= len(indices):
+            c2w = guide_c2w[-1].astype(np.float32, copy=True)
+            intr = guide_intr[-1]
+        else:
+            left = right - 1
+            span = max(int(indices[right]) - int(indices[left]), 1)
+            alpha = float(frame_idx - int(indices[left])) / float(span)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = _slerp_rotation_matrix(
+                guide_c2w[left, :3, :3],
+                guide_c2w[right, :3, :3],
+                alpha,
+            )
+            c2w[:3, 3] = (
+                (1.0 - alpha) * guide_c2w[left, :3, 3]
+                + alpha * guide_c2w[right, :3, 3]
+            ).astype(np.float32)
+            intr = _blend_intrinsics(guide_intr[left], guide_intr[right], alpha)
+
+        all_ext[frame_idx] = np.linalg.inv(c2w).astype(np.float32, copy=False)
+        all_intr[frame_idx] = intr.astype(np.float32, copy=False)
+
+    return all_ext, all_intr
+
+
+def _save_streaming_guide_npz(
+    *,
+    scene_root: str,
+    guide_indices: list[int],
+    prediction,
+) -> str:
+    output_dir = os.path.join(scene_root, "exports", "npz")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "streaming_guide.npz")
+    save_dict: dict[str, np.ndarray] = {
+        "guide_indices": np.asarray(guide_indices, dtype=np.int32),
+        "depth": np.asarray(prediction.depth, dtype=np.float32),
+    }
+    if prediction.conf is not None:
+        save_dict["conf"] = np.asarray(prediction.conf, dtype=np.float32)
+    if prediction.extrinsics is not None:
+        save_dict["extrinsics"] = np.asarray(prediction.extrinsics, dtype=np.float32)
+    if prediction.intrinsics is not None:
+        save_dict["intrinsics"] = np.asarray(prediction.intrinsics, dtype=np.float32)
+    np.savez_compressed(output_path, **save_dict)
+    return output_path
+
+
+def _estimate_chunk_depth_scale_to_guide(
+    *,
+    chunk_start: int,
+    chunk_depth: np.ndarray,
+    guide_indices: list[int],
+    guide_depth: np.ndarray,
+) -> tuple[float | None, int, int]:
+    guide_lookup = {int(global_idx): local_idx for local_idx, global_idx in enumerate(guide_indices)}
+    per_frame_scales: list[float] = []
+    per_frame_counts: list[int] = []
+
+    for local_idx in range(chunk_depth.shape[0]):
+        guide_local_idx = guide_lookup.get(chunk_start + local_idx)
+        if guide_local_idx is None:
+            continue
+        if guide_local_idx >= guide_depth.shape[0]:
+            continue
+        source = np.asarray(chunk_depth[local_idx], dtype=np.float32)
+        target = np.asarray(guide_depth[guide_local_idx], dtype=np.float32)
+        if source.shape != target.shape:
+            continue
+
+        valid = np.isfinite(source) & np.isfinite(target) & (source > 0.0) & (target > 0.0)
+        if not np.any(valid):
+            continue
+
+        ratio = (target[valid] / np.maximum(source[valid], 1.0e-12)).astype(np.float32, copy=False)
+        ratio = ratio[np.isfinite(ratio) & (ratio > 0.02) & (ratio < 50.0)]
+        if ratio.size < 1024:
+            continue
+        if ratio.size > 200_000:
+            step = int(np.ceil(float(ratio.size) / 200_000.0))
+            ratio = ratio[::step]
+        low, high = np.percentile(ratio, [10.0, 90.0])
+        trimmed = ratio[(ratio >= low) & (ratio <= high)]
+        if trimmed.size < 1024:
+            trimmed = ratio
+        per_frame_scales.append(float(np.median(trimmed)))
+        per_frame_counts.append(int(trimmed.size))
+
+    if not per_frame_scales:
+        return None, 0, 0
+
+    weights = np.asarray(per_frame_counts, dtype=np.float64)
+    scales = np.asarray(per_frame_scales, dtype=np.float64)
+    scale = float(np.sum(scales * weights) / max(float(np.sum(weights)), 1.0))
+    if not math.isfinite(scale) or scale <= 0.0:
+        return None, len(per_frame_scales), int(np.sum(per_frame_counts))
+    return scale, len(per_frame_scales), int(np.sum(per_frame_counts))
+
+
+def _estimate_chunk_transform_to_guide(
+    *,
+    chunk_start: int,
+    chunk_depth: np.ndarray,
+    chunk_conf: np.ndarray,
+    chunk_intrinsics: np.ndarray,
+    chunk_extrinsics: np.ndarray,
+    guide_indices: list[int],
+    guide_depth: np.ndarray,
+    guide_conf: np.ndarray,
+    guide_intrinsics: np.ndarray,
+    guide_extrinsics: np.ndarray,
+) -> tuple[tuple[float, np.ndarray, np.ndarray] | None, list[int]]:
+    guide_lookup = {int(global_idx): local_idx for local_idx, global_idx in enumerate(guide_indices)}
+    chunk_local_indices: list[int] = []
+    guide_local_indices: list[int] = []
+    matched_global_indices: list[int] = []
+
+    for local_idx in range(chunk_depth.shape[0]):
+        global_idx = chunk_start + local_idx
+        guide_local_idx = guide_lookup.get(global_idx)
+        if guide_local_idx is None:
+            continue
+        if guide_local_idx >= guide_depth.shape[0]:
+            continue
+        if chunk_depth[local_idx].shape != guide_depth[guide_local_idx].shape:
+            continue
+        chunk_local_indices.append(local_idx)
+        guide_local_indices.append(guide_local_idx)
+        matched_global_indices.append(global_idx)
+
+    if not chunk_local_indices:
+        return None, []
+
+    chunk_local = np.asarray(chunk_local_indices, dtype=np.int64)
+    guide_local = np.asarray(guide_local_indices, dtype=np.int64)
+
+    chunk_depth_anchor = np.asarray(chunk_depth[chunk_local], dtype=np.float32)
+    guide_depth_anchor = np.asarray(guide_depth[guide_local], dtype=np.float32)
+    chunk_conf_anchor = np.asarray(chunk_conf[chunk_local], dtype=np.float32).copy()
+    guide_conf_anchor = np.asarray(guide_conf[guide_local], dtype=np.float32).copy()
+    chunk_conf_anchor[~(np.isfinite(chunk_depth_anchor) & (chunk_depth_anchor > 0.0))] = 0.0
+    guide_conf_anchor[~(np.isfinite(guide_depth_anchor) & (guide_depth_anchor > 0.0))] = 0.0
+
+    chunk_points = _depth_to_point_cloud_vectorized(
+        chunk_depth_anchor,
+        np.asarray(chunk_intrinsics[chunk_local], dtype=np.float32),
+        np.asarray(chunk_extrinsics[chunk_local], dtype=np.float32),
+    )
+    guide_points = _depth_to_point_cloud_vectorized(
+        guide_depth_anchor,
+        np.asarray(guide_intrinsics[guide_local], dtype=np.float32),
+        np.asarray(guide_extrinsics[guide_local], dtype=np.float32),
+    )
+
+    conf_threshold = min(float(np.median(chunk_conf_anchor)), float(np.median(guide_conf_anchor))) * 0.1
+    try:
+        transform = _weighted_align_point_maps_da3_dense(
+            point_map_target=guide_points,
+            conf_target=guide_conf_anchor,
+            point_map_source=chunk_points,
+            conf_source=chunk_conf_anchor,
+            conf_threshold=conf_threshold,
+            camera_centers_target=_camera_centers_from_extrinsics(
+                np.asarray(guide_extrinsics[guide_local], dtype=np.float32)
+            ),
+            camera_centers_source=_camera_centers_from_extrinsics(
+                np.asarray(chunk_extrinsics[chunk_local], dtype=np.float32)
+            ),
+        )
+        return transform, matched_global_indices
+    except ValueError as exc:
+        print(f"Streaming guide anchor dense Sim(3) failed ({exc}); falling back to camera-center translation.")
+
+    guide_centers = _camera_centers_from_extrinsics(np.asarray(guide_extrinsics[guide_local], dtype=np.float32))
+    chunk_centers = _camera_centers_from_extrinsics(np.asarray(chunk_extrinsics[chunk_local], dtype=np.float32))
+    valid = np.all(np.isfinite(guide_centers), axis=1) & np.all(np.isfinite(chunk_centers), axis=1)
+    if not np.any(valid):
+        return None, matched_global_indices
+
+    translation = np.median(guide_centers[valid] - chunk_centers[valid], axis=0).astype(np.float32)
+    return (1.0, np.eye(3, dtype=np.float32), translation), matched_global_indices
+
+
+def _point_map_to_depth_map(
+    *,
+    point_map_world: np.ndarray,
+    intrinsics: np.ndarray,
+    extrinsic_w2c: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, float]:
+    """Encode world-space points as z-depths along an existing camera ray grid."""
+    points = np.asarray(point_map_world, dtype=np.float32)
+    if points.ndim != 3 or points.shape[-1] != 3:
+        raise ValueError(f"point_map_world must be (H,W,3), got {points.shape}")
+
+    height, width, _ = points.shape
+    us, vs = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    pixel_coords = np.stack([us, vs, np.ones_like(us, dtype=np.float32)], axis=-1)
+    rays = np.einsum("ij,hwj->hwi", np.linalg.inv(np.asarray(intrinsics, dtype=np.float32)), pixel_coords)
+
+    points_h = np.concatenate([points, np.ones((height, width, 1), dtype=np.float32)], axis=-1)
+    camera_points_h = np.einsum("ij,hwj->hwi", _as_homogeneous44(extrinsic_w2c), points_h)
+    camera_points = camera_points_h[..., :3]
+
+    ray_norm_sq = np.sum(rays * rays, axis=-1)
+    depth = np.sum(camera_points * rays, axis=-1) / np.maximum(ray_norm_sq, 1.0e-12)
+    projected_camera_points = rays * depth[..., None]
+    projection_error = np.linalg.norm(camera_points - projected_camera_points, axis=-1)
+
+    valid = np.isfinite(depth) & (depth > 0.0) & (camera_points[..., 2] > 0.0)
+    valid &= np.all(np.isfinite(camera_points), axis=-1)
+    if valid_mask is not None:
+        valid &= np.asarray(valid_mask, dtype=bool)
+
+    encoded_depth = np.zeros((height, width), dtype=np.float32)
+    encoded_depth[valid] = depth[valid].astype(np.float32, copy=False)
+    mean_projection_error = float(np.mean(projection_error[valid])) if np.any(valid) else 0.0
+    return encoded_depth, mean_projection_error
 
 
 def _save_combined_npz(
@@ -421,6 +1011,12 @@ def _weighted_estimate_overlap_rotation(
     return R.astype(np.float32), mean_angle_deg
 
 
+def _camera_centers_from_extrinsics(extrinsics: np.ndarray) -> np.ndarray:
+    extrinsics_h = np.stack([_as_homogeneous44(ext) for ext in np.asarray(extrinsics, dtype=np.float32)], axis=0)
+    c2w = np.linalg.inv(extrinsics_h)
+    return c2w[:, :3, 3].astype(np.float32, copy=False)
+
+
 def _robust_weighted_estimate_sim3(
     src: np.ndarray,
     tgt: np.ndarray,
@@ -523,6 +1119,8 @@ def _weighted_align_point_maps_da3_dense(
     point_map_source: np.ndarray,
     conf_source: np.ndarray,
     conf_threshold: float,
+    camera_centers_target: np.ndarray | None = None,
+    camera_centers_source: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     aligned_points_target: list[np.ndarray] = []
     aligned_points_source: list[np.ndarray] = []
@@ -550,10 +1148,53 @@ def _weighted_align_point_maps_da3_dense(
     if not aligned_points_target:
         raise ValueError("No matching point pairs were found.")
 
-    all_target = np.concatenate(aligned_points_target, axis=0)
-    all_source = np.concatenate(aligned_points_source, axis=0)
-    all_weights = np.concatenate(confidence_weights, axis=0)
+    dense_target = np.concatenate(aligned_points_target, axis=0)
+    dense_source = np.concatenate(aligned_points_source, axis=0)
+    dense_weights = np.concatenate(confidence_weights, axis=0)
+    dense_count = int(dense_target.shape[0])
+    dense_weight_sum = float(np.sum(dense_weights))
 
+    center_target = None
+    center_source = None
+    center_count = 0
+    if (
+        camera_centers_target is not None
+        and camera_centers_source is not None
+        and _STREAMING_CAMERA_CENTER_ALIGN_WEIGHT > 0.0
+        and dense_weight_sum > 0.0
+    ):
+        center_target = np.asarray(camera_centers_target, dtype=np.float32)
+        center_source = np.asarray(camera_centers_source, dtype=np.float32)
+        center_count = min(center_target.shape[0], center_source.shape[0])
+        if center_count > 0:
+            center_target = center_target[:center_count]
+            center_source = center_source[:center_count]
+            center_valid = np.all(np.isfinite(center_target), axis=1) & np.all(np.isfinite(center_source), axis=1)
+            center_target = center_target[center_valid]
+            center_source = center_source[center_valid]
+            center_count = int(center_target.shape[0])
+        if center_count > 0:
+            center_weight = (
+                dense_weight_sum
+                * float(_STREAMING_CAMERA_CENTER_ALIGN_WEIGHT)
+                / float(center_count)
+            )
+            augmented_target = np.concatenate([dense_target, center_target], axis=0)
+            augmented_source = np.concatenate([dense_source, center_source], axis=0)
+            augmented_weights = np.concatenate(
+                [dense_weights, np.full(center_count, center_weight, dtype=np.float32)],
+                axis=0,
+            )
+        else:
+            augmented_target = dense_target
+            augmented_source = dense_source
+            augmented_weights = dense_weights
+    else:
+        augmented_target = dense_target
+        augmented_source = dense_source
+        augmented_weights = dense_weights
+
+    torch_estimator = None
     align_backend = "numpy"
     if torch.cuda.is_available():
         try:
@@ -561,34 +1202,97 @@ def _weighted_align_point_maps_da3_dense(
         except Exception as exc:
             print(f"DA3 torch alignment import failed ({exc}). Falling back to local numpy SIM(3).")
         else:
+            torch_estimator = robust_weighted_estimate_sim3_torch
             align_backend = "da3_torch"
-            s, R, t = robust_weighted_estimate_sim3_torch(
-                all_source,
-                all_target,
-                all_weights,
+
+    def _estimate(
+        source: np.ndarray,
+        target: np.ndarray,
+        weights: np.ndarray,
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        if torch_estimator is not None:
+            s_est, R_est, t_est = torch_estimator(
+                source,
+                target,
+                weights,
                 delta=float(_STREAMING_ALIGN_IRLS["delta"]),
                 max_iters=int(_STREAMING_ALIGN_IRLS["max_iters"]),
                 tol=float(_STREAMING_ALIGN_IRLS["tol"]),
                 align_method="sim3",
             )
-            transformed = s * (all_source @ R.T) + t
-            mean_error = float(np.mean(np.linalg.norm(all_target - transformed, axis=1)))
-            print(
-                "Streaming overlap alignment using "
-                f"{all_target.shape[0]:,} dense correspondences ({align_backend})."
+            return (
+                float(s_est),
+                np.asarray(R_est, dtype=np.float32),
+                np.asarray(t_est, dtype=np.float32),
             )
-            print(f"Streaming overlap alignment mean residual: {mean_error:.6f}")
-            return float(s), np.asarray(R, dtype=np.float32), np.asarray(t, dtype=np.float32)
+        return _robust_weighted_estimate_sim3(source, target, weights)
 
-    s, R, t = _robust_weighted_estimate_sim3(all_source, all_target, all_weights)
-    transformed = s * (all_source @ R.T) + t
-    mean_error = float(np.mean(np.linalg.norm(all_target - transformed, axis=1)))
+    def _dense_residual_metrics(s: float, R: np.ndarray, t: np.ndarray) -> dict[str, float]:
+        transformed = s * (dense_source @ R.T) + t
+        residuals = np.linalg.norm(dense_target - transformed, axis=1)
+        return {
+            "mean": float(np.mean(residuals)),
+            "weighted_mean": float(np.average(residuals, weights=dense_weights)),
+            "median": float(np.median(residuals)),
+            "p95": float(np.percentile(residuals, 95)),
+        }
+
+    def _center_mean_residual(s: float, R: np.ndarray, t: np.ndarray) -> float | None:
+        if center_count <= 0 or center_target is None or center_source is None:
+            return None
+        center_transformed = s * (center_source @ R.T) + t
+        return float(np.mean(np.linalg.norm(center_target - center_transformed, axis=1)))
+
+    def _format_metrics(metrics: dict[str, float]) -> str:
+        return (
+            f"mean={metrics['mean']:.6f}, weighted_mean={metrics['weighted_mean']:.6f}, "
+            f"median={metrics['median']:.6f}, p95={metrics['p95']:.6f}"
+        )
+
     print(
         "Streaming overlap alignment using "
-        f"{all_target.shape[0]:,} dense correspondences ({align_backend})."
+        f"{dense_count:,} dense correspondences ({align_backend}; "
+        f"{center_count} camera centers, center_weight={_STREAMING_CAMERA_CENTER_ALIGN_WEIGHT:g}x)."
     )
-    print(f"Streaming overlap alignment mean residual: {mean_error:.6f}")
-    return s, R, t
+
+    dense_s, dense_R, dense_t = _estimate(dense_source, dense_target, dense_weights)
+    dense_metrics = _dense_residual_metrics(dense_s, dense_R, dense_t)
+    selected_s, selected_R, selected_t = dense_s, dense_R, dense_t
+    selected_label = "dense points"
+    print(f"Streaming overlap same-basis point residual (dense only): {_format_metrics(dense_metrics)}")
+
+    if center_count > 0:
+        center_s, center_R, center_t = _estimate(augmented_source, augmented_target, augmented_weights)
+        center_metrics = _dense_residual_metrics(center_s, center_R, center_t)
+        print(
+            "Streaming overlap same-basis point residual (with camera centers): "
+            f"{_format_metrics(center_metrics)}"
+        )
+
+        dense_center_error = _center_mean_residual(dense_s, dense_R, dense_t)
+        center_center_error = _center_mean_residual(center_s, center_R, center_t)
+        if dense_center_error is not None and center_center_error is not None:
+            print(
+                "Streaming overlap camera-center mean residual: "
+                f"dense_only={dense_center_error:.6f}, with_centers={center_center_error:.6f}"
+            )
+
+        max_center_mean = dense_metrics["mean"] * float(_STREAMING_CAMERA_CENTER_MAX_DENSE_RESIDUAL_RATIO)
+        if center_metrics["mean"] <= max_center_mean:
+            selected_s, selected_R, selected_t = center_s, center_R, center_t
+            selected_label = "dense points + camera centers"
+        else:
+            print(
+                "Rejected camera-center stitch candidate because it worsened the "
+                "same-basis dense point residual."
+            )
+
+    selected_metrics = _dense_residual_metrics(selected_s, selected_R, selected_t)
+    print(
+        "Selected streaming overlap stitch from "
+        f"{selected_label}: {_format_metrics(selected_metrics)}"
+    )
+    return selected_s, selected_R, selected_t
 
 
 def _estimate_overlap_pose_sim3(
@@ -689,12 +1393,141 @@ def _streaming_chunk_save_indices(
     chunk_len: int,
     overlap: int,
 ) -> range:
+    """Return local chunk frames to keep when stitching overlapping DA3 chunks.
+
+    Keep the trailing overlap from the previous chunk and skip the leading
+    duplicate frames from the next chunk. This moves cuts to the far side of the
+    overlap that was used for alignment instead of switching at the first
+    overlapped frame.
+    """
     if num_chunks == 1:
         return range(0, chunk_len)
-    if chunk_index == num_chunks - 1:
+    if chunk_index == 0:
         return range(0, chunk_len)
-    save_end = max(chunk_len - overlap, 0)
-    return range(0, save_end)
+    return range(min(overlap, chunk_len), chunk_len)
+
+
+def _streaming_overlap_blend_alpha(frame_index: int, overlap_count: int) -> float:
+    if overlap_count <= 1:
+        return 0.5
+    return float(frame_index) / float(overlap_count - 1)
+
+
+def _blend_streaming_overlap_point_maps(
+    *,
+    stored_depths: list[np.ndarray | None],
+    stored_confs: list[np.ndarray | None],
+    stored_intrinsics: list[np.ndarray | None],
+    stored_extrinsics: list[np.ndarray | None],
+    chunk_start: int,
+    previous_depth: np.ndarray,
+    previous_conf: np.ndarray,
+    previous_point_map: np.ndarray,
+    previous_transform: tuple[float, np.ndarray, np.ndarray],
+    current_depth: np.ndarray,
+    current_conf: np.ndarray,
+    current_intrinsics: np.ndarray,
+    current_extrinsics: np.ndarray,
+    current_point_map: np.ndarray,
+    current_transform: tuple[float, np.ndarray, np.ndarray],
+) -> None:
+    overlap_count = min(
+        previous_depth.shape[0],
+        previous_conf.shape[0],
+        previous_point_map.shape[0],
+        current_depth.shape[0],
+        current_conf.shape[0],
+        current_intrinsics.shape[0],
+        current_extrinsics.shape[0],
+        current_point_map.shape[0],
+    )
+    if overlap_count <= 0:
+        return
+
+    previous_points_global = _transform_point_map_sim3(previous_point_map[:overlap_count], previous_transform)
+    current_points_global = _transform_point_map_sim3(current_point_map[:overlap_count], current_transform)
+
+    encoded_pixel_counts: list[int] = []
+    projection_errors: list[float] = []
+    for overlap_idx in range(overlap_count):
+        global_idx = chunk_start + overlap_idx
+        if global_idx >= len(stored_depths):
+            continue
+        previous_intrinsics = stored_intrinsics[global_idx]
+        previous_extrinsics = stored_extrinsics[global_idx]
+        if previous_intrinsics is None or previous_extrinsics is None:
+            continue
+
+        alpha = _streaming_overlap_blend_alpha(overlap_idx, overlap_count)
+        current_extrinsic_global = _transform_extrinsics_to_global(
+            current_extrinsics[overlap_idx],
+            current_transform,
+        )
+        blended_intrinsics = _blend_intrinsics(
+            previous_intrinsics,
+            current_intrinsics[overlap_idx],
+            alpha,
+        )
+        blended_extrinsics = _blend_extrinsics_w2c(
+            previous_extrinsics,
+            current_extrinsic_global,
+            alpha,
+        )
+        prev_valid = np.isfinite(previous_depth[overlap_idx]) & (previous_depth[overlap_idx] > 0.0)
+        cur_valid = np.isfinite(current_depth[overlap_idx]) & (current_depth[overlap_idx] > 0.0)
+        prev_valid &= np.all(np.isfinite(previous_points_global[overlap_idx]), axis=-1)
+        cur_valid &= np.all(np.isfinite(current_points_global[overlap_idx]), axis=-1)
+
+        any_valid = prev_valid | cur_valid
+        if not np.any(any_valid):
+            continue
+
+        blended_points = np.zeros_like(previous_points_global[overlap_idx], dtype=np.float32)
+        both_valid = prev_valid & cur_valid
+        prev_only = prev_valid & ~cur_valid
+        cur_only = cur_valid & ~prev_valid
+        blended_points[both_valid] = (
+            (1.0 - alpha) * previous_points_global[overlap_idx][both_valid]
+            + alpha * current_points_global[overlap_idx][both_valid]
+        )
+        blended_points[prev_only] = previous_points_global[overlap_idx][prev_only]
+        blended_points[cur_only] = current_points_global[overlap_idx][cur_only]
+
+        blended_depth, mean_projection_error = _point_map_to_depth_map(
+            point_map_world=blended_points,
+            intrinsics=blended_intrinsics,
+            extrinsic_w2c=blended_extrinsics,
+            valid_mask=any_valid,
+        )
+        encoded_valid = blended_depth > 0.0
+        if stored_depths[global_idx] is not None:
+            blended_depth = np.where(encoded_valid, blended_depth, stored_depths[global_idx])
+        stored_depths[global_idx] = blended_depth.astype(np.float32, copy=False)
+        stored_intrinsics[global_idx] = blended_intrinsics
+        stored_extrinsics[global_idx] = blended_extrinsics
+
+        if stored_confs[global_idx] is not None:
+            blended_conf = np.asarray(stored_confs[global_idx], dtype=np.float32).copy()
+            blended_conf[both_valid] = (
+                (1.0 - alpha) * previous_conf[overlap_idx][both_valid]
+                + alpha * current_conf[overlap_idx][both_valid]
+            )
+            blended_conf[cur_only] = current_conf[overlap_idx][cur_only]
+            blended_conf[prev_only] = previous_conf[overlap_idx][prev_only]
+            stored_confs[global_idx] = blended_conf.astype(np.float32, copy=False)
+
+        encoded_pixel_counts.append(int(np.count_nonzero(encoded_valid)))
+        projection_errors.append(mean_projection_error)
+
+    if encoded_pixel_counts:
+        alpha_last = _streaming_overlap_blend_alpha(overlap_count - 1, overlap_count)
+        print(
+            "Blended streaming overlap in point space with blended camera basis: "
+            f"frames {chunk_start}..{chunk_start + overlap_count - 1}, "
+            f"alpha={_streaming_overlap_blend_alpha(0, overlap_count):.2f}..{alpha_last:.2f}, "
+            f"encoded_pixels_avg={float(np.mean(encoded_pixel_counts)):.0f}, "
+            f"ray_projection_error_mean={float(np.mean(projection_errors)):.6f}"
+        )
 
 
 def _rebase_extrinsics_to_frame0_origin(extrinsics: list[np.ndarray]) -> list[np.ndarray]:
@@ -720,12 +1553,16 @@ def _run_streaming_da3(
     process_res_method: str,
     use_ray_pose: bool,
     ref_view_strategy: str,
+    fixed_camera: bool,
+    fixed_camera_fov_degrees: float,
+    global_guide: bool,
 ) -> dict[str, object]:
     chunk_indices = _build_streaming_chunk_indices(len(images_for_da3), chunk_size, overlap)
 
     print(
         "DA3 streaming settings: "
         f"chunk_size={chunk_size}, overlap={overlap}, chunks={len(chunk_indices)}, "
+        f"global_guide={global_guide}, "
         f"dense_align={'da3_torch' if torch.cuda.is_available() else 'numpy'}"
     )
 
@@ -738,11 +1575,54 @@ def _run_streaming_da3(
 
     chunk_sim3: list[tuple[float, np.ndarray, np.ndarray]] = []
     previous_predictions = None
-    current_transform = (
-        1.0,
-        np.eye(3, dtype=np.float32),
-        np.zeros(3, dtype=np.float32),
-    )
+    current_transform = _identity_sim3()
+    guide_context: dict[str, object] | None = None
+
+    if global_guide and len(chunk_indices) > 1:
+        guide_indices = _build_streaming_guide_indices(len(images_for_da3), chunk_size)
+        guide_step = (
+            0.0
+            if len(guide_indices) <= 1
+            else float(guide_indices[-1] - guide_indices[0]) / float(len(guide_indices) - 1)
+        )
+        print(
+            "Streaming global guide pass: "
+            f"{len(guide_indices)} frames over {len(images_for_da3)} selected frames "
+            f"(approx_step={guide_step:.2f})."
+        )
+        guide_predictions = _run_da3_inference(
+            model=model,
+            image_paths=[images_for_da3[idx] for idx in guide_indices],
+            process_res=process_res,
+            process_res_method=process_res_method,
+            infer_gs=False,
+            use_ray_pose=use_ray_pose,
+            ref_view_strategy=ref_view_strategy,
+            fixed_camera=fixed_camera,
+            fixed_camera_fov_degrees=fixed_camera_fov_degrees,
+        )
+        if guide_predictions.conf is None or guide_predictions.extrinsics is None or guide_predictions.intrinsics is None:
+            raise RuntimeError("DA3 streaming global guide requires confidence, intrinsics, and extrinsics outputs.")
+
+        guide_npz_path = _save_streaming_guide_npz(
+            scene_root=scene_root,
+            guide_indices=guide_indices,
+            prediction=guide_predictions,
+        )
+        guide_context = {
+            "indices": guide_indices,
+            "depth": np.asarray(guide_predictions.depth, dtype=np.float32),
+            "conf": np.asarray(guide_predictions.conf, dtype=np.float32),
+            "extrinsics": np.asarray(guide_predictions.extrinsics, dtype=np.float32),
+            "intrinsics": np.asarray(guide_predictions.intrinsics, dtype=np.float32),
+            "npz_path": guide_npz_path,
+        }
+        print("Streaming global guide pass: guide frames will anchor matching dense chunks after DA3 runs.")
+        print(f"Streaming global guide saved to {guide_npz_path}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    elif global_guide:
+        print("Streaming global guide requested but skipped because the selected sequence fits in one chunk.")
 
     for chunk_index, (chunk_start, chunk_end) in enumerate(chunk_indices):
         chunk_image_paths = images_for_da3[chunk_start:chunk_end]
@@ -750,15 +1630,16 @@ def _run_streaming_da3(
             f"Streaming chunk {chunk_index + 1}/{len(chunk_indices)}: "
             f"frames {chunk_start}..{chunk_end - 1} ({len(chunk_image_paths)} images)"
         )
-
-        predictions = model.inference(
-            image=chunk_image_paths,
+        predictions = _run_da3_inference(
+            model=model,
+            image_paths=chunk_image_paths,
             process_res=process_res,
             process_res_method=process_res_method,
             infer_gs=False,
             use_ray_pose=use_ray_pose,
             ref_view_strategy=ref_view_strategy,
-            align_to_input_ext_scale=False,
+            fixed_camera=fixed_camera,
+            fixed_camera_fov_degrees=fixed_camera_fov_degrees,
         )
 
         if predictions.conf is None or predictions.extrinsics is None or predictions.intrinsics is None:
@@ -773,6 +1654,55 @@ def _run_streaming_da3(
         chunk_images = np.asarray(predictions.processed_images, dtype=np.uint8)
         chunk_sky = None if predictions.sky is None else np.asarray(predictions.sky, dtype=bool)
 
+        guide_chunk_transform: tuple[float, np.ndarray, np.ndarray] | None = None
+        if guide_context is not None and not fixed_camera:
+            guide_chunk_transform, guide_anchor_frames = _estimate_chunk_transform_to_guide(
+                chunk_start=chunk_start,
+                chunk_depth=chunk_depth,
+                chunk_conf=chunk_conf,
+                chunk_intrinsics=chunk_intrinsics,
+                chunk_extrinsics=chunk_extrinsics,
+                guide_indices=guide_context["indices"],  # type: ignore[arg-type]
+                guide_depth=np.asarray(guide_context["depth"], dtype=np.float32),
+                guide_conf=np.asarray(guide_context["conf"], dtype=np.float32),
+                guide_intrinsics=np.asarray(guide_context["intrinsics"], dtype=np.float32),
+                guide_extrinsics=np.asarray(guide_context["extrinsics"], dtype=np.float32),
+            )
+            if guide_chunk_transform is not None:
+                guide_s, guide_R, guide_t = guide_chunk_transform
+                guide_rot_angle = float(
+                    np.degrees(
+                        np.arccos(
+                            np.clip((np.trace(guide_R) - 1.0) / 2.0, -1.0, 1.0)
+                        )
+                    )
+                )
+                print(
+                    "Streaming global guide anchor: "
+                    f"chunk={chunk_index + 1}, source_truth_frames={guide_anchor_frames}, "
+                    f"sim3_scale={guide_s:.6f}, rotation_deg={guide_rot_angle:.3f}, "
+                    f"translation_norm={float(np.linalg.norm(guide_t)):.6f}"
+                )
+            else:
+                print(
+                    "Streaming global guide anchor: "
+                    f"chunk={chunk_index + 1}, no direct guide frame in this chunk."
+                )
+        elif guide_context is not None:
+            guide_scale, guide_match_frames, guide_match_points = _estimate_chunk_depth_scale_to_guide(
+                chunk_start=chunk_start,
+                chunk_depth=chunk_depth,
+                guide_indices=guide_context["indices"],  # type: ignore[arg-type]
+                guide_depth=np.asarray(guide_context["depth"], dtype=np.float32),
+            )
+            if guide_scale is not None:
+                chunk_depth = (chunk_depth * float(guide_scale)).astype(np.float32, copy=False)
+                print(
+                    "Streaming fixed-camera guide depth scale: "
+                    f"chunk={chunk_index + 1}, scale={guide_scale:.6f}, "
+                    f"anchor_frames={guide_match_frames}, anchor_pixels={guide_match_points:,}"
+                )
+
         if stored_skies is None and chunk_sky is not None:
             stored_skies = [None] * len(images_for_da3)
 
@@ -782,37 +1712,79 @@ def _run_streaming_da3(
 
             conf_prev = previous_predictions["conf"][-overlap:]
             conf_cur = chunk_conf[:overlap]
+            point_map_prev = _depth_to_point_cloud_vectorized(
+                previous_predictions["depth"][-overlap:],
+                previous_predictions["intrinsics"][-overlap:],
+                previous_predictions["extrinsics"][-overlap:],
+            )
+            point_map_cur = _depth_to_point_cloud_vectorized(
+                chunk_depth[:overlap],
+                chunk_intrinsics[:overlap],
+                chunk_extrinsics[:overlap],
+            )
 
-            try:
-                point_map_prev = _depth_to_point_cloud_vectorized(
-                    previous_predictions["depth"][-overlap:],
-                    previous_predictions["intrinsics"][-overlap:],
-                    previous_predictions["extrinsics"][-overlap:],
+            previous_transform = current_transform
+            if guide_context is not None and fixed_camera:
+                pair_transform = _identity_sim3()
+                current_transform = _identity_sim3()
+                print("Streaming fixed-camera guide active: keeping chunk camera basis fixed.")
+            elif guide_context is not None and guide_chunk_transform is not None:
+                pair_transform = guide_chunk_transform
+                current_transform = guide_chunk_transform
+                print(
+                    "Streaming global guide active: using direct guide-frame anchor for this "
+                    "whole chunk instead of pairwise overlap Sim(3)."
                 )
-                point_map_cur = _depth_to_point_cloud_vectorized(
-                    chunk_depth[:overlap],
-                    chunk_intrinsics[:overlap],
-                    chunk_extrinsics[:overlap],
-                )
-                conf_threshold = min(float(np.median(conf_prev)), float(np.median(conf_cur))) * 0.1
-                pair_transform = _weighted_align_point_maps_da3_dense(
-                    point_map_target=point_map_prev,
-                    conf_target=conf_prev,
-                    point_map_source=point_map_cur,
-                    conf_source=conf_cur,
-                    conf_threshold=conf_threshold,
-                )
-            except ValueError:
-                print("Dense point-map overlap alignment failed. Falling back to camera-rig overlap alignment.")
-                pair_transform = _estimate_overlap_pose_sim3(
-                    extrinsics_target=previous_predictions["extrinsics"][-overlap:],
-                    conf_target=conf_prev,
-                    extrinsics_source=chunk_extrinsics[:overlap],
-                    conf_source=conf_cur,
-                )
-
-            current_transform = _compose_sim3(current_transform, pair_transform)
+            else:
+                if guide_context is not None:
+                    print(
+                        "Streaming global guide active but no guide frame anchors this chunk; "
+                        "falling back to pairwise overlap Sim(3)."
+                    )
+                try:
+                    conf_threshold = min(float(np.median(conf_prev)), float(np.median(conf_cur))) * 0.1
+                    pair_transform = _weighted_align_point_maps_da3_dense(
+                        point_map_target=point_map_prev,
+                        conf_target=conf_prev,
+                        point_map_source=point_map_cur,
+                        conf_source=conf_cur,
+                        conf_threshold=conf_threshold,
+                        camera_centers_target=_camera_centers_from_extrinsics(
+                            previous_predictions["extrinsics"][-overlap:]
+                        ),
+                        camera_centers_source=_camera_centers_from_extrinsics(chunk_extrinsics[:overlap]),
+                    )
+                except ValueError:
+                    print("Dense point-map overlap alignment failed. Falling back to camera-rig overlap alignment.")
+                    pair_transform = _estimate_overlap_pose_sim3(
+                        extrinsics_target=previous_predictions["extrinsics"][-overlap:],
+                        conf_target=conf_prev,
+                        extrinsics_source=chunk_extrinsics[:overlap],
+                        conf_source=conf_cur,
+                    )
+                current_transform = _compose_sim3(current_transform, pair_transform)
             chunk_sim3.append(pair_transform)
+            _blend_streaming_overlap_point_maps(
+                stored_depths=stored_depths,
+                stored_confs=stored_confs,
+                stored_intrinsics=stored_intrinsics,
+                stored_extrinsics=stored_extrinsics,
+                chunk_start=chunk_start,
+                previous_depth=previous_predictions["depth"][-overlap:],
+                previous_conf=conf_prev,
+                previous_point_map=point_map_prev,
+                previous_transform=previous_transform,
+                current_depth=chunk_depth[:overlap],
+                current_conf=conf_cur,
+                current_intrinsics=chunk_intrinsics[:overlap],
+                current_extrinsics=chunk_extrinsics[:overlap],
+                current_point_map=point_map_cur,
+                current_transform=current_transform,
+            )
+        elif guide_context is not None and guide_chunk_transform is not None:
+            current_transform = guide_chunk_transform
+            chunk_sim3.append(guide_chunk_transform)
+            print("Streaming global guide active: anchored first chunk to guide-frame source of truth.")
 
         save_indices = _streaming_chunk_save_indices(
             chunk_index=chunk_index,
@@ -849,9 +1821,13 @@ def _run_streaming_da3(
     if missing_indices:
         raise RuntimeError(f"DA3 streaming did not fill all output frames. Missing indices: {missing_indices[:8]}")
 
-    final_extrinsics = _rebase_extrinsics_to_frame0_origin(
-        [value for value in stored_extrinsics if value is not None]
-    )
+    if fixed_camera:
+        identity_w2c = np.eye(4, dtype=np.float32)[:3, :4]
+        final_extrinsics = [identity_w2c.copy() for value in stored_extrinsics if value is not None]
+    else:
+        final_extrinsics = _rebase_extrinsics_to_frame0_origin(
+            [value for value in stored_extrinsics if value is not None]
+        )
     npz_path = os.path.join(scene_root, "exports", "npz", "results.npz")
     _save_combined_npz(
         output_path=npz_path,
@@ -872,6 +1848,7 @@ def _run_streaming_da3(
         "chunk_indices": chunk_indices,
         "num_frames": len(images_for_da3),
         "pairwise_sim3": chunk_sim3,
+        "guide_npz_path": (None if guide_context is None else guide_context.get("npz_path")),
     }
 
 
@@ -918,10 +1895,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max_stride",
         type=int,
-        default=6,
+        default=1,
         help=(
-            "Maximum stride between frames when subsampling. This is ignored in streaming mode, "
-            "which now processes the full extracted clip by default."
+            "Frame stride for input-video frame selection. In streaming mode, this is applied exactly: "
+            "for example, 6 uses every sixth extracted video frame."
         ),
     )
     p.add_argument(
@@ -937,6 +1914,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Frame overlap between adjacent DA3 streaming chunks.",
+    )
+    p.add_argument(
+        "--streaming_global_guide",
+        action="store_true",
+        help=(
+            "In streaming mode, first run a sparse whole-video DA3 guide pass using chunk_size frames, "
+            "then anchor each dense chunk to exact matching guide frames when available."
+        ),
     )
     p.add_argument(
         "--process_res",
@@ -961,12 +1946,23 @@ def parse_args() -> argparse.Namespace:
         help="Use DA3 ray-based pose estimation instead of the camera decoder.",
     )
     p.add_argument(
+        "--fixed_camera",
+        action="store_true",
+        help="Tell DA3 the input sequence uses a fixed camera by supplying identity extrinsics and estimated intrinsics.",
+    )
+    p.add_argument(
+        "--fixed_camera_fov_degrees",
+        type=float,
+        default=60.0,
+        help="Horizontal FOV used to estimate pinhole intrinsics when --fixed_camera is enabled.",
+    )
+    p.add_argument(
         "--ref_view_strategy",
         type=str,
-        default="saddle_balanced",
+        default="first",
         help=(
             "DA3 multi-view reference-view strategy. "
-            "Default is 'saddle_balanced' for this project."
+            "Default is 'first' for stable chunked divstream exports."
         ),
     )
     p.add_argument(
@@ -996,8 +1992,8 @@ def parse_args() -> argparse.Namespace:
         "--runtime_export_fps",
         "--kinect_rgbd_video_fps",
         dest="runtime_export_fps",
-        type=int,
-        default=30,
+        type=float,
+        default=30.0,
         help="Frame rate metadata used by the selected Stage 0 runtime export.",
     )
     p.add_argument(
@@ -1008,7 +2004,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prepare_stage1_inputs",
         action="store_true",
-        help="Also materialize the Stage 1 pre-ICP cache and before_non_rigid_icp.ply during Stage 0.",
+        help="Also materialize the Stage 1 pre-ICP filter cache and optional before_non_rigid_icp.ply during Stage 0.",
+    )
+    p.add_argument(
+        "--prepare_skip_before_non_rigid",
+        action="store_true",
+        help="Materialize the Stage 1 filter cache/config but skip before_non_rigid_icp.ply.",
+    )
+    p.add_argument(
+        "--skip_frame_materialization",
+        action="store_true",
+        help="Run DA3 on the selected frame paths directly instead of copying them into frames_subsampled.",
+    )
+    p.add_argument(
+        "--prepare_skip_debug_masks",
+        action="store_true",
+        help="Skip Stage 1 debug mask PNGs when preparing filter caches.",
     )
     p.add_argument("--prepare_num_frames", type=int, default=50, help="Pre-ICP preparation: number of DA3 frames.")
     p.add_argument("--prepare_stride", type=int, default=2, help="Pre-ICP preparation: stride over DA3 frames.")
@@ -1161,7 +2172,7 @@ def main() -> None:
         args.runtime_export_format,
         legacy_kinect_rgbd_video=bool(args.export_kinect_rgbd_video),
     )
-    runtime_export_fps = int(args.runtime_export_fps)
+    runtime_export_fps = float(args.runtime_export_fps)
 
     if streaming_enabled and args.export_gs_video:
         raise ValueError(
@@ -1205,7 +2216,7 @@ def main() -> None:
             selected_images, stride = _streaming_select_frames(images, args.max_stride)
             print(
                 "Streaming-selected frames: "
-                f"N={len(selected_images)} (full extracted clip, chunk_size={streaming_chunk_size}, "
+                f"N={len(selected_images)} (stride {stride}, chunk_size={streaming_chunk_size}, "
                 f"overlap={streaming_overlap})"
             )
         else:
@@ -1230,26 +2241,36 @@ def main() -> None:
         else:
             print(f"Using existing frames directory directly: N={len(selected_images)}")
 
-    # Materialize the selected frames into a dedicated folder so downstream code
-    # can reliably "refer back" to the exact frames DA3 was run on.
-    used_frames_dir = os.path.join(scene_root, "frames_subsampled")
-    os.makedirs(used_frames_dir, exist_ok=True)
-    # Clear destination if it already has files, to avoid mixing runs.
-    existing = glob.glob(os.path.join(used_frames_dir, f"*.{args.image_ext}"))
-    if existing:
-        for p in existing:
-            os.remove(p)
+    source_index_by_path = {os.path.abspath(path): idx for idx, path in enumerate(images)}
+    selected_source_indices = [
+        source_index_by_path.get(os.path.abspath(path), idx)
+        for idx, path in enumerate(selected_images)
+    ]
 
-    for i, src_path in enumerate(selected_images):
-        dst_path = os.path.join(used_frames_dir, f"{i:06d}.{args.image_ext}")
-        shutil.copy2(src_path, dst_path)
+    if args.skip_frame_materialization:
+        used_frames_dir = frames_dir
+        images_for_da3 = selected_images
+    else:
+        # Materialize the selected frames into a dedicated folder so downstream code
+        # can reliably "refer back" to the exact frames DA3 was run on.
+        used_frames_dir = os.path.join(scene_root, "frames_subsampled")
+        os.makedirs(used_frames_dir, exist_ok=True)
+        # Clear destination if it already has files, to avoid mixing runs.
+        existing = glob.glob(os.path.join(used_frames_dir, f"*.{args.image_ext}"))
+        if existing:
+            for p in existing:
+                os.remove(p)
 
-    images_for_da3 = sorted(glob.glob(os.path.join(used_frames_dir, f"*.{args.image_ext}")))
-    if len(images_for_da3) != len(selected_images):
-        raise RuntimeError(
-            f"Failed to materialize subsampled frames: expected {len(selected_images)} "
-            f"but found {len(images_for_da3)} in '{used_frames_dir}'."
-        )
+        for i, src_path in enumerate(selected_images):
+            dst_path = os.path.join(used_frames_dir, f"{i:06d}.{args.image_ext}")
+            shutil.copy2(src_path, dst_path)
+
+        images_for_da3 = sorted(glob.glob(os.path.join(used_frames_dir, f"*.{args.image_ext}")))
+        if len(images_for_da3) != len(selected_images):
+            raise RuntimeError(
+                f"Failed to materialize subsampled frames: expected {len(selected_images)} "
+                f"but found {len(images_for_da3)} in '{used_frames_dir}'."
+            )
 
     # Record which frames were used so downstream loaders can find "original" images.
     meta_path = os.path.join(scene_root, "preprocess_frames.json")
@@ -1262,13 +2283,24 @@ def main() -> None:
                     os.path.abspath(args.input_video) if args.input_video is not None else os.path.abspath(args.frames_dir)
                 ),
                 "image_ext": args.image_ext,
+                "model_name": args.model_name,
+                "process_res": int(args.process_res),
+                "process_res_method": args.process_res_method,
+                "export_gs_video": bool(args.export_gs_video),
+                "use_ray_pose": bool(args.use_ray_pose),
+                "fixed_camera": bool(args.fixed_camera),
+                "fixed_camera_fov_degrees": float(args.fixed_camera_fov_degrees),
+                "ref_view_strategy": ref_view_strategy,
                 "source": ("input_video" if args.input_video is not None else "frames_dir"),
                 "max_frames": max_frames_meta,
                 "max_stride": max_stride_meta,
                 "actual_stride": stride,
+                "selected_frame_indices": selected_source_indices,
+                "selected_frame_paths": [os.path.abspath(path) for path in selected_images],
                 "streaming_enabled": streaming_enabled,
                 "streaming_chunk_size": (streaming_chunk_size if streaming_enabled else None),
                 "streaming_overlap": (streaming_overlap if streaming_enabled else None),
+                "streaming_global_guide": (bool(args.streaming_global_guide) if streaming_enabled else False),
                 "runtime_export_format": runtime_export_format,
                 "runtime_export_fps": runtime_export_fps,
                 "num_frames_used": len(images_for_da3),
@@ -1300,9 +2332,12 @@ def main() -> None:
         f"process_res={args.process_res}, "
         f"process_res_method={args.process_res_method}, "
         f"use_ray_pose={args.use_ray_pose}, "
+        f"fixed_camera={args.fixed_camera}, "
+        f"fixed_camera_fov_degrees={args.fixed_camera_fov_degrees:g}, "
         f"ref_view_strategy={ref_view_strategy}, "
         f"export_gs_video={args.export_gs_video}, "
-        f"streaming={streaming_enabled}"
+        f"streaming={streaming_enabled}, "
+        f"streaming_global_guide={bool(args.streaming_global_guide) if streaming_enabled else False}"
     )
     if streaming_enabled:
         streaming_result = _run_streaming_da3(
@@ -1315,11 +2350,15 @@ def main() -> None:
             process_res_method=args.process_res_method,
             use_ray_pose=args.use_ray_pose,
             ref_view_strategy=ref_view_strategy,
+            fixed_camera=bool(args.fixed_camera),
+            fixed_camera_fov_degrees=float(args.fixed_camera_fov_degrees),
+            global_guide=bool(args.streaming_global_guide),
         )
         npz_path = str(streaming_result["npz_path"])
     else:
-        model.inference(
-            image=images_for_da3,
+        _run_da3_inference(
+            model=model,
+            image_paths=images_for_da3,
             export_dir=scene_root,
             export_format=export_format,
             process_res=args.process_res,
@@ -1327,7 +2366,8 @@ def main() -> None:
             infer_gs=args.export_gs_video,
             use_ray_pose=args.use_ray_pose,
             ref_view_strategy=ref_view_strategy,
-            align_to_input_ext_scale=False,
+            fixed_camera=bool(args.fixed_camera),
+            fixed_camera_fov_degrees=float(args.fixed_camera_fov_degrees),
         )
         npz_path = os.path.join(scene_root, "exports", "npz", "results.npz")
         _wait_for_readable_npz(npz_path)
@@ -1340,6 +2380,8 @@ def main() -> None:
         summary_lines.append(
             f"- DA3 streaming: enabled (chunk_size={streaming_chunk_size}, overlap={streaming_overlap})"
         )
+        if streaming_result.get("guide_npz_path"):
+            summary_lines.append(f"- DA3 streaming guide: {streaming_result['guide_npz_path']}")
         summary_lines.append(f"- Frames processed: {len(images_for_da3)}")
     else:
         summary_lines.append("- DA3 streaming: disabled")
@@ -1347,18 +2389,8 @@ def main() -> None:
         summary_lines.append(f"- GS video: {os.path.join(scene_root, 'gs_video')}")
     else:
         summary_lines.append("- GS video: skipped")
-    runtime_export_output = _export_stage0_runtime_format(
-        scene_root=scene_root,
-        runtime_export_format=runtime_export_format,
-        fps=runtime_export_fps,
-        overwrite=bool(args.overwrite),
-    )
-    if runtime_export_output is None:
-        summary_lines.append("- Stage 0 runtime export: skipped")
-    else:
-        summary_lines.append(
-            f"- Stage 0 runtime export ({_runtime_export_label(runtime_export_format)}): {runtime_export_output}"
-        )
+    prep_out_path = None
+    before_non_rigid_path = None
     if args.prepare_stage1_inputs:
         alignment = AlignmentDataConfig(
             num_frames=int(args.prepare_num_frames),
@@ -1404,10 +2436,28 @@ def main() -> None:
             out_suffix=str(args.prepare_out_suffix or ""),
             device="cpu",
             overwrite_before_non_rigid=bool(args.overwrite),
+            write_before_non_rigid=not bool(args.prepare_skip_before_non_rigid),
+            write_debug_masks=not bool(args.prepare_skip_debug_masks),
         )
         summary_lines.append(f"- Stage 1 prep cache: {os.path.join(scene_root, 'exports', 'ply')}")
-        summary_lines.append(f"- Pre-ICP merge: {before_non_rigid_path}")
+        if before_non_rigid_path is None:
+            summary_lines.append("- Pre-ICP merge: skipped")
+        else:
+            summary_lines.append(f"- Pre-ICP merge: {before_non_rigid_path}")
         summary_lines.append(f"- Prepared run dir: {prep_out_path}")
+    runtime_export_output = _export_stage0_runtime_format(
+        scene_root=scene_root,
+        runtime_export_format=runtime_export_format,
+        fps=runtime_export_fps,
+        overwrite=bool(args.overwrite),
+        prep_run=prep_out_path,
+    )
+    if runtime_export_output is None:
+        summary_lines.append("- Stage 0 runtime export: skipped")
+    else:
+        summary_lines.append(
+            f"- Stage 0 runtime export ({_runtime_export_label(runtime_export_format)}): {runtime_export_output}"
+        )
     print("\n".join(summary_lines))
 
 

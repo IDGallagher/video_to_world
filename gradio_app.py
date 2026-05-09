@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import re
 import shutil
@@ -39,17 +41,31 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 VIDEOS_ROOT = (PROJECT_ROOT / "videos").resolve()
 RUNS_ROOT = PROJECT_ROOT / ".gradio_runs"
 UPLOADS_ROOT = VIDEOS_ROOT / "_gradio_uploads"
+DIVSTREAM_JOBS_ROOT = RUNS_ROOT / "divstream_jobs"
+VDA_DIVSTREAM_JOBS_ROOT = RUNS_ROOT / "vda_divstream_jobs"
+DIVSTREAM_OUTPUTS_ROOT = RUNS_ROOT / "divstream_outputs"
 PICKER_ROOT = VIDEOS_ROOT if VIDEOS_ROOT.exists() else PROJECT_ROOT.resolve()
 APP_BUILD_TIME = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 APP_VERSION = APP_BUILD_TIME
 WINDOWS_DRIVE_RE = re.compile(r"^(?P<drive>[a-zA-Z]):[\\/](?P<rest>.*)$")
+WSL_MOUNT_RE = re.compile(r"^/mnt/(?P<drive>[a-zA-Z])/(?P<rest>.*)$")
 MAX_LOG_LINES = 220
 POLL_INTERVAL_SEC = 1.0
+CATALOG_CACHE_TTL_SEC = 60.0
+AUTO_SYNC_OUTPUT_COUNT = 28
+STAGE_COMPLETION_CONTROL_OUTPUT_COUNT = 14
 DEFAULT_STAGE0_MAX_FRAMES = 20
-DEFAULT_STAGE0_MAX_STRIDE = 6
+DEFAULT_STAGE0_MAX_STRIDE = 1
+DEFAULT_STAGE0_STREAMING = True
 DEFAULT_STAGE0_STREAMING_OVERLAP = 10
-DEFAULT_STAGE0_REF_VIEW_STRATEGY = "saddle_balanced"
-DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT = "directstorage_stream"
+DEFAULT_STAGE0_STREAMING_GLOBAL_GUIDE = False
+DEFAULT_STAGE0_REF_VIEW_STRATEGY = "first"
+DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT = "none"
+DIVSTREAM_PREP_NUM_FRAMES = 1
+DIVSTREAM_PREP_STRIDE = 1
+DIVSTREAM_PREP_OFFSET = 0
+DIVSTREAM_DEBUG_PREP_NUM_FRAMES = 1_000_000_000
+DEFAULT_PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 UPLOAD_SCENE_DIRNAME = "scene"
 UPLOAD_FRAMES_DIRNAME = "frames"
 RUNTIME_EXPORT_CHOICES = [
@@ -61,9 +77,22 @@ RUNTIME_EXPORT_CHOICES = [
 ]
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv"}
 IGNORED_VIDEO_DIR_NAMES = {"gs_video", "gs_video_eval"}
+PRUNED_VIDEO_DISCOVERY_DIR_NAMES = {
+    "__pycache__",
+    "after_global_optimization",
+    "after_non_rigid_icp",
+    "debug_masks",
+    "exports",
+    "frames",
+    "frames_subsampled",
+    "gs_video",
+    "gs_video_eval",
+}
 
 ACTIVE_RUNS: dict[str, subprocess.Popen] = {}
 ACTIVE_RUNS_LOCK = threading.Lock()
+CATALOG_CACHE: dict[str, tuple[float, list[Path]]] = {}
+CATALOG_CACHE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -82,6 +111,27 @@ class SceneArtifacts:
 def _ensure_workspace_dirs() -> None:
     RUNS_ROOT.mkdir(parents=True, exist_ok=True)
     UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
+    DIVSTREAM_JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    VDA_DIVSTREAM_JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+    DIVSTREAM_OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _clear_catalog_cache() -> None:
+    with CATALOG_CACHE_LOCK:
+        CATALOG_CACHE.clear()
+
+
+def _cached_catalog(key: str, builder) -> list[Path]:
+    now = time.time()
+    with CATALOG_CACHE_LOCK:
+        cached = CATALOG_CACHE.get(key)
+        if cached is not None and now - cached[0] <= CATALOG_CACHE_TTL_SEC:
+            return list(cached[1])
+
+    values = builder()
+    with CATALOG_CACHE_LOCK:
+        CATALOG_CACHE[key] = (now, list(values))
+    return list(values)
 
 
 def _prepend_active_python_bin_to_path(env: Optional[dict[str, str]] = None) -> dict[str, str]:
@@ -150,6 +200,36 @@ def _safe_stem(name: str) -> str:
     return safe or "scene"
 
 
+def _safe_divstream_filename(raw_name: object, fallback_source: Path) -> str:
+    raw = _strip_quotes(raw_name)
+    stem_source = raw or fallback_source.stem
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(stem_source).stem).strip("._-")
+    return f"{safe or 'depth_image_stream'}.divstream"
+
+
+def _next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    parent = path.parent
+    stem = path.stem
+    suffix = path.suffix
+    for idx in range(1, 10000):
+        candidate = parent / f"{stem}_{idx:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"Could not find an available output filename for {path}")
+
+
+def _ensure_pytorch_cuda_allocator_conf(env: dict[str, str]) -> None:
+    current = str(env.get("PYTORCH_CUDA_ALLOC_CONF") or "").strip()
+    if not current:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = DEFAULT_PYTORCH_CUDA_ALLOC_CONF
+        return
+    if "expandable_segments" not in current:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = f"{current},{DEFAULT_PYTORCH_CUDA_ALLOC_CONF}"
+
+
 def _new_upload_uid() -> str:
     while True:
         candidate = uuid.uuid4().hex[:8]
@@ -163,6 +243,36 @@ def _is_managed_upload_path(path: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _path_identity_key(raw: object) -> str:
+    value = _strip_quotes(raw)
+    if not value:
+        return ""
+
+    text = value.replace("\\", "/")
+    wsl_match = WSL_MOUNT_RE.match(text)
+    if wsl_match:
+        return f"{wsl_match.group('drive').lower()}:/{wsl_match.group('rest').strip('/')}".lower()
+
+    windows_match = WINDOWS_DRIVE_RE.match(value)
+    if windows_match:
+        rest = windows_match.group("rest").replace("\\", "/").strip("/")
+        return f"{windows_match.group('drive').lower()}:/{rest}".lower()
+
+    try:
+        text = str(_normalize_path(value, allow_missing=True))
+    except Exception:
+        pass
+    return text.replace("\\", "/").rstrip("/").lower()
 
 
 def _default_scene_root_for_video(input_video: Path) -> Path:
@@ -201,6 +311,80 @@ def _coerce_float(value: object, *, label: str, optional: bool = False) -> Optio
         raise ValueError(f"{label} must be a number.") from exc
 
 
+def _parse_fractional_rate(raw: object) -> Optional[float]:
+    text = str(raw or "").strip()
+    if not text or text == "0/0":
+        return None
+    try:
+        if "/" in text:
+            numerator_text, denominator_text = text.split("/", 1)
+            numerator = float(numerator_text)
+            denominator = float(denominator_text)
+            if denominator == 0.0:
+                return None
+            value = numerator / denominator
+        else:
+            value = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def _resolve_executable(name: str) -> str:
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+
+    python_bin_dir = Path(sys.executable).resolve().parent
+    for candidate in (python_bin_dir / name, python_bin_dir / f"{name}.exe"):
+        if candidate.exists():
+            return str(candidate)
+
+    raise FileNotFoundError(
+        f"Required executable '{name}' was not found on PATH and was not found next to "
+        f"the active Python interpreter at '{python_bin_dir}'."
+    )
+
+
+def _probe_video_fps(video_path: Path) -> float:
+    ffprobe = _resolve_executable("ffprobe")
+
+    result = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "json",
+            str(video_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout or "{}")
+    streams = payload.get("streams") or []
+    if not streams:
+        raise ValueError(f"No video stream found in {video_path}")
+
+    stream = streams[0]
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        fps = _parse_fractional_rate(stream.get(key))
+        if fps is not None:
+            return fps
+    raise ValueError(f"Could not read a valid FPS from {video_path}")
+
+
+def _format_fps_for_cli(fps: float) -> str:
+    return f"{float(fps):.12g}"
+
+
 def _coerce_runtime_export_format(value: object, *, label: str = "Stage 0 Runtime Export") -> str:
     normalized = str(value or "none").strip()
     valid_values = {choice_value for _, choice_value in RUNTIME_EXPORT_CHOICES}
@@ -215,6 +399,7 @@ def _append_confidence_filter_args(
     prefix: str,
     profile: str,
     percentile: float,
+    voxel_min_count_percentile: Optional[float] = 50.0,
 ) -> None:
     if percentile < 0.0 or percentile > 100.0:
         raise ValueError("DA3 confidence percentile must be between 0 and 100.")
@@ -233,10 +418,12 @@ def _append_confidence_filter_args(
                 "10",
                 f"--{prefix}.conf-voxel-size",
                 "1.0",
-                f"--{prefix}.conf-voxel-min-count-percentile",
-                "50",
             ]
         )
+        if voxel_min_count_percentile is None:
+            command.extend([f"--{prefix}.conf-voxel-min-count-percentile", "none"])
+        else:
+            command.extend([f"--{prefix}.conf-voxel-min-count-percentile", str(voxel_min_count_percentile)])
         return
 
     if normalized == "da3_per_frame":
@@ -400,6 +587,7 @@ def _append_prepare_alignment_args(
     conf_mask_max_depth: bool,
     conf_max_depth_rtol: Optional[float],
     conf_max_depth_atol: Optional[float],
+    conf_voxel_min_count_percentile: Optional[float] = 50.0,
 ) -> None:
     command.extend(
         [
@@ -426,10 +614,12 @@ def _append_prepare_alignment_args(
                 "10",
                 "--prepare_conf_voxel_size",
                 "1.0",
-                "--prepare_conf_voxel_min_count_percentile",
-                "50",
             ]
         )
+        if conf_voxel_min_count_percentile is None:
+            command.extend(["--prepare_conf_voxel_min_count_percentile", "none"])
+        else:
+            command.extend(["--prepare_conf_voxel_min_count_percentile", str(conf_voxel_min_count_percentile)])
     elif normalized == "da3_per_frame":
         command.extend(["--prepare_conf_mode", "per_frame"])
     elif normalized == "da3_global":
@@ -660,6 +850,7 @@ def _copy_uploaded_video(uploaded_path: str) -> Path:
     upload_dir.mkdir(parents=True, exist_ok=False)
     target = upload_dir / f"{upload_dir.name}{source.suffix.lower()}"
     shutil.copy2(source, target)
+    _clear_catalog_cache()
     return target.resolve()
 
 
@@ -671,6 +862,7 @@ def _copy_uploaded_frames_dir(frames_dir_path: object) -> Path:
     upload_dir = UPLOADS_ROOT / _new_upload_uid()
     target = upload_dir / UPLOAD_FRAMES_DIRNAME
     shutil.copytree(source, target)
+    _clear_catalog_cache()
     return target.resolve()
 
 
@@ -743,25 +935,39 @@ def _update_dropdown_choices(choices: list[tuple[str, str]], current_value: obje
     return gr.update(choices=choices, value=selected)
 
 
-def _discover_existing_videos() -> list[Path]:
+def _should_prune_video_discovery_dir(path: Path) -> bool:
+    name = path.name.lower()
+    if name in PRUNED_VIDEO_DISCOVERY_DIR_NAMES:
+        return True
+    if name.startswith("frame_to_model_icp_") or name.startswith("inverse_deformation"):
+        return True
+    return (path / "exports" / "npz" / "results.npz").is_file()
+
+
+def _discover_existing_videos_uncached() -> list[Path]:
     if not PICKER_ROOT.is_dir():
         return []
 
     candidates: list[Path] = []
-    for path in PICKER_ROOT.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
-            continue
-        parts = [part.lower() for part in path.parts]
-        if any(part in IGNORED_VIDEO_DIR_NAMES for part in parts):
-            continue
-        if any(part.startswith("frame_to_model_icp_") for part in path.parts):
-            continue
-        candidates.append(path.resolve())
+    for dirpath_text, dirnames, filenames in os.walk(PICKER_ROOT):
+        dirpath = Path(dirpath_text)
+        dirnames[:] = [
+            name for name in dirnames if not _should_prune_video_discovery_dir(dirpath / name)
+        ]
+        for filename in filenames:
+            path = dirpath / filename
+            if path.suffix.lower() not in VIDEO_SUFFIXES:
+                continue
+            candidates.append(path.resolve())
 
     return sorted(candidates, key=lambda item: (-item.stat().st_mtime, _display_path(item)))
 
 
-def _discover_scene_roots() -> list[Path]:
+def _discover_existing_videos() -> list[Path]:
+    return _cached_catalog("videos", _discover_existing_videos_uncached)
+
+
+def _discover_scene_roots_uncached() -> list[Path]:
     if not PICKER_ROOT.is_dir():
         return []
 
@@ -778,6 +984,81 @@ def _discover_scene_roots() -> list[Path]:
     return sorted(scene_roots.values(), key=lambda item: (-item.stat().st_mtime, _display_path(item)))
 
 
+def _discover_scene_roots() -> list[Path]:
+    return _cached_catalog("scene_roots", _discover_scene_roots_uncached)
+
+
+def _scene_root_has_stage0(scene_root: Path) -> bool:
+    return (scene_root / "exports" / "npz" / "results.npz").is_file()
+
+
+def _scene_activity_mtime(scene_root: Path) -> float:
+    candidates = [scene_root]
+    results_npz = scene_root / "exports" / "npz" / "results.npz"
+    if results_npz.exists():
+        candidates.append(results_npz)
+    candidates.extend(_find_run_dirs(scene_root))
+
+    mtimes: list[float] = []
+    for path in candidates:
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return max(mtimes) if mtimes else 0.0
+
+
+def _choose_best_scene_root(candidates: list[Path]) -> Optional[Path]:
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        unique[str(resolved)] = resolved
+
+    valid = [path for path in unique.values() if _scene_root_has_stage0(path)]
+    if not valid:
+        return None
+
+    return max(valid, key=lambda path: (len(_find_run_dirs(path)), _scene_activity_mtime(path)))
+
+
+def _load_scene_preprocess_metadata(scene_root: Path) -> dict[str, object]:
+    meta_path = scene_root / "preprocess_frames.json"
+    if not meta_path.is_file():
+        return {}
+    try:
+        with meta_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _find_scene_root_for_video(video_selection: object) -> Optional[Path]:
+    video_path = _resolve_existing_file(video_selection)
+    candidates = [
+        _default_scene_root_for_video(video_path),
+        video_path.with_suffix("").resolve(),
+    ]
+    if _is_managed_upload_path(video_path):
+        candidates.extend(
+            [
+                (video_path.parent / UPLOAD_SCENE_DIRNAME).resolve(),
+                (video_path.parent / video_path.stem).resolve(),
+            ]
+        )
+
+    video_key = _path_identity_key(video_path)
+    for scene_root in _discover_scene_roots():
+        meta = _load_scene_preprocess_metadata(scene_root)
+        if _path_identity_key(meta.get("source_input_path")) == video_key:
+            candidates.append(scene_root)
+
+    return _choose_best_scene_root(candidates)
+
+
 def _discover_output_parent_dirs() -> list[Path]:
     if not PICKER_ROOT.is_dir():
         return []
@@ -788,7 +1069,7 @@ def _discover_output_parent_dirs() -> list[Path]:
 
 
 def _video_dropdown_choices() -> list[tuple[str, str]]:
-    return _choice_tuples(_discover_existing_videos())
+    return _choice_tuples(_discover_existing_videos(), include_empty_label="Select video")
 
 
 def _scene_dropdown_choices() -> list[tuple[str, str]]:
@@ -829,9 +1110,23 @@ def _sync_catalogs_and_scene_views(
     stage_current_scene: object,
     inspect_current_scene: object,
 ):
+    preferred_scene_text = _strip_quotes(preferred_scene_root)
     video_choices = _video_dropdown_choices()
     scene_choices = _scene_dropdown_choices()
     output_parent_choices = _output_parent_dropdown_choices()
+
+    if preferred_scene_text:
+        scene_values = [value for _, value in scene_choices]
+        if preferred_scene_text not in scene_values:
+            try:
+                preferred_scene_path = _resolve_existing_dir(preferred_scene_text)
+            except Exception:
+                preferred_scene_path = None
+            if preferred_scene_path is not None and _scene_root_has_stage0(preferred_scene_path):
+                _clear_catalog_cache()
+                video_choices = _video_dropdown_choices()
+                scene_choices = _scene_dropdown_choices()
+                output_parent_choices = _output_parent_dropdown_choices()
 
     pipeline_video_update = _update_dropdown_choices(video_choices, pipeline_current_video)
     pipeline_parent_update = _update_dropdown_choices(output_parent_choices, pipeline_current_parent)
@@ -840,7 +1135,6 @@ def _sync_catalogs_and_scene_views(
 
     scene_values = [value for _, value in scene_choices]
     selected_scene = None
-    preferred_scene_text = _strip_quotes(preferred_scene_root)
     stage_scene_text = _strip_quotes(stage_current_scene)
     if preferred_scene_text == "" and stage_scene_text == "" and "" in scene_values:
         selected_scene = ""
@@ -909,6 +1203,55 @@ def _sync_catalogs_and_scene_views(
         inspect_scene_update,
         *stage_refresh,
         *inspect_refresh,
+    )
+
+
+def _sync_catalogs_after_stage_run(
+    run_state: dict[str, str],
+    pipeline_current_video: object,
+    pipeline_current_scene: object,
+    pipeline_current_parent: object,
+    stage_current_video: object,
+    stage_current_parent: object,
+    stage_current_scene: object,
+    inspect_current_scene: object,
+):
+    _clear_catalog_cache()
+    preferred_scene_root = (run_state or {}).get("scene_root", "") or stage_current_scene
+    return _sync_catalogs_and_scene_views(
+        preferred_scene_root,
+        pipeline_current_video,
+        pipeline_current_scene,
+        pipeline_current_parent,
+        stage_current_video,
+        stage_current_parent,
+        stage_current_scene,
+        inspect_current_scene,
+    )
+
+
+def _sync_catalogs_after_live_stage_run(
+    preferred_scene_root: object,
+    pipeline_current_video: object,
+    pipeline_current_scene: object,
+    pipeline_current_parent: object,
+    stage_current_video: object,
+    stage_current_parent: object,
+    stage_current_scene: object,
+    inspect_current_scene: object,
+):
+    _clear_catalog_cache()
+    if not _strip_quotes(preferred_scene_root) and not _strip_quotes(stage_current_scene):
+        return tuple(gr.update() for _ in range(AUTO_SYNC_OUTPUT_COUNT))
+    return _sync_catalogs_and_scene_views(
+        preferred_scene_root,
+        pipeline_current_video,
+        pipeline_current_scene,
+        pipeline_current_parent,
+        stage_current_video,
+        stage_current_parent,
+        stage_current_scene,
+        inspect_current_scene,
     )
 
 
@@ -1227,6 +1570,7 @@ def _build_pipeline_command(
     preprocess_max_stride: int,
     preprocess_streaming: bool,
     preprocess_streaming_overlap: int,
+    preprocess_streaming_global_guide: bool,
     preprocess_image_ext: str,
     preprocess_model_name: str,
     preprocess_process_res: int,
@@ -1282,6 +1626,8 @@ def _build_pipeline_command(
     command += ["--config.preprocess-max-stride", str(preprocess_max_stride)]
     if preprocess_streaming:
         command += ["--config.preprocess-streaming"]
+    if preprocess_streaming_global_guide:
+        command += ["--config.preprocess-streaming-global-guide"]
     command += ["--config.preprocess-streaming-overlap", str(preprocess_streaming_overlap)]
     command += ["--config.preprocess-image-ext", preprocess_image_ext]
     command += ["--config.preprocess-model-name", preprocess_model_name]
@@ -1364,14 +1710,17 @@ def _build_stage0_command(
     preprocess_max_stride: int,
     preprocess_streaming: bool,
     preprocess_streaming_overlap: int,
+    preprocess_streaming_global_guide: bool,
     preprocess_image_ext: str,
     preprocess_model_name: str,
     preprocess_process_res: int = 768,
     preprocess_process_res_method: str = "upper_bound_resize",
     preprocess_export_gs_video: bool = False,
     preprocess_runtime_export_format: str = DEFAULT_STAGE0_RUNTIME_EXPORT_FORMAT,
-    preprocess_runtime_export_fps: int = 30,
+    preprocess_runtime_export_fps: float = 30.0,
     preprocess_use_ray_pose: bool = False,
+    preprocess_fixed_camera: bool = False,
+    preprocess_fixed_camera_fov_degrees: float = 60.0,
     preprocess_ref_view_strategy: str = DEFAULT_STAGE0_REF_VIEW_STRATEGY,
     alignment_num_frames: int = 50,
     alignment_stride: int = 2,
@@ -1392,6 +1741,10 @@ def _build_stage0_command(
     conf_mask_max_depth: bool = False,
     conf_max_depth_rtol: Optional[float] = 0.001,
     conf_max_depth_atol: Optional[float] = None,
+    conf_voxel_min_count_percentile: Optional[float] = 50.0,
+    prepare_skip_before_non_rigid: bool = False,
+    prepare_skip_debug_masks: Optional[bool] = None,
+    skip_frame_materialization: bool = False,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1406,7 +1759,7 @@ def _build_stage0_command(
         "--runtime_export_format",
         preprocess_runtime_export_format,
         "--runtime_export_fps",
-        str(preprocess_runtime_export_fps),
+        _format_fps_for_cli(float(preprocess_runtime_export_fps)),
         "--process_res",
         str(preprocess_process_res),
         "--process_res_method",
@@ -1418,8 +1771,16 @@ def _build_stage0_command(
         command += ["--export_gs_video"]
     if preprocess_use_ray_pose:
         command += ["--use_ray_pose"]
+    if preprocess_fixed_camera:
+        command += [
+            "--fixed_camera",
+            "--fixed_camera_fov_degrees",
+            _format_fps_for_cli(float(preprocess_fixed_camera_fov_degrees)),
+        ]
     if preprocess_streaming:
         command += ["--streaming"]
+    if preprocess_streaming_global_guide:
+        command += ["--streaming_global_guide"]
     if input_video is not None:
         command += [
             "--input_video",
@@ -1458,7 +1819,16 @@ def _build_stage0_command(
         conf_mask_max_depth=conf_mask_max_depth,
         conf_max_depth_rtol=conf_max_depth_rtol,
         conf_max_depth_atol=conf_max_depth_atol,
+        conf_voxel_min_count_percentile=conf_voxel_min_count_percentile,
     )
+    if prepare_skip_before_non_rigid:
+        command.append("--prepare_skip_before_non_rigid")
+    if skip_frame_materialization:
+        command.append("--skip_frame_materialization")
+    if prepare_skip_debug_masks is None:
+        prepare_skip_debug_masks = prepare_skip_before_non_rigid
+    if prepare_skip_debug_masks:
+        command.append("--prepare_skip_debug_masks")
     return command
 
 
@@ -1730,6 +2100,7 @@ def _run_command_generator(
 
     env = os.environ.copy()
     _prepend_active_python_bin_to_path(env)
+    _ensure_pytorch_cuda_allocator_conf(env)
     env["PYTHONUNBUFFERED"] = "1"
 
     with log_path.open("w", encoding="utf-8", buffering=1) as log_handle:
@@ -1812,9 +2183,710 @@ def _run_command_generator(
                 ACTIVE_RUNS.pop(run_id, None)
 
 
+def _simple_divstream_status(
+    *,
+    state: str,
+    phase: str,
+    elapsed_seconds: float,
+    output_path: Path,
+    log_path: Path,
+    extra: str = "",
+) -> str:
+    lines = [
+        f"**State**: {state}",
+        f"**Phase**: {phase}",
+        f"**Elapsed**: `{_format_duration(elapsed_seconds)}`",
+        f"**Output**: `{output_path}`",
+        f"**Log**: `{log_path}`",
+    ]
+    if extra:
+        lines.extend(["", extra])
+    return "\n".join(lines)
+
+
+def _cleanup_simple_divstream_job(job_root: Path) -> None:
+    try:
+        resolved_job = job_root.resolve()
+        allowed_parents = [
+            DIVSTREAM_JOBS_ROOT.resolve(),
+            VDA_DIVSTREAM_JOBS_ROOT.resolve(),
+        ]
+        if not any(_is_relative_to(resolved_job, parent) for parent in allowed_parents):
+            return
+    except Exception:
+        return
+    shutil.rmtree(resolved_job, ignore_errors=True)
+
+
+def _run_simple_divstream_generator(
+    uploaded_video,
+    output_filename,
+    divstream_compression_level,
+    divstream_workers,
+    export_before_non_rigid_ply,
+    export_streaming_guide_ply,
+    stage0_max_frames,
+    stage0_max_stride,
+    stage0_streaming,
+    stage0_streaming_overlap,
+    stage0_streaming_global_guide,
+    stage0_image_ext,
+    stage0_model_name,
+    stage0_process_res,
+    stage0_process_res_method,
+    stage0_ref_view_strategy,
+    stage0_use_ray_pose,
+    fixed_camera,
+    fixed_camera_fov_degrees,
+    filter_conf_profile,
+    filter_conf_percentile,
+    filter_mask_sky,
+    filter_mask_sky_depth_band,
+    filter_sky_depth_band_percent,
+    filter_mask_min_depth_range_percent,
+    filter_min_depth_range_percent,
+    filter_mask_min_depth_range_meters,
+    filter_min_depth_range_meters,
+    filter_mask_depth_edges,
+    filter_edge_rtol,
+    filter_edge_atol,
+    filter_edge_kernel_size,
+    filter_mask_max_depth,
+    filter_max_depth_rtol,
+    filter_max_depth_atol,
+):
+    _ensure_workspace_dirs()
+
+    try:
+        input_video = _resolve_existing_file(uploaded_video)
+        compression_level = _coerce_int(divstream_compression_level, label="Divstream Compression Level")
+        if compression_level is None or compression_level < 1 or compression_level > 12:
+            raise ValueError("Divstream Compression Level must be between 1 and 12.")
+        workers = _coerce_int(divstream_workers, label="Divstream Workers")
+        if workers is None or workers < 0:
+            raise ValueError("Divstream Workers must be 0 or greater.")
+
+        parsed_stage0_max_frames = _coerce_int(stage0_max_frames, label="DA3 Input Max Frames / Chunk Size")
+        parsed_stage0_max_stride = _coerce_int(stage0_max_stride, label="DA3 Input Stride")
+        if parsed_stage0_max_stride is None or parsed_stage0_max_stride < 1:
+            raise ValueError("DA3 Input Stride must be at least 1.")
+        source_fps = _probe_video_fps(input_video)
+        fps = source_fps / float(parsed_stage0_max_stride)
+        if not math.isfinite(fps) or fps <= 0.0:
+            raise ValueError("Calculated output FPS must be greater than 0.")
+        parsed_stage0_overlap = _coerce_int(stage0_streaming_overlap, label="DA3 Streaming Overlap")
+        parsed_stage0_process_res = _coerce_int(stage0_process_res, label="DA3 Processing Resolution")
+        parsed_stage0_image_ext = str(stage0_image_ext or "").strip().lstrip(".")
+        parsed_stage0_model_name = str(stage0_model_name or "").strip()
+        parsed_stage0_process_res_method = str(stage0_process_res_method or "").strip()
+        parsed_stage0_ref_view_strategy = str(stage0_ref_view_strategy or "").strip()
+        if not parsed_stage0_image_ext:
+            raise ValueError("Image Extension is required.")
+        if not parsed_stage0_model_name:
+            raise ValueError("DA3 Model Name is required.")
+        if not parsed_stage0_process_res_method:
+            raise ValueError("DA3 Resolution Method is required.")
+        if not parsed_stage0_ref_view_strategy:
+            raise ValueError("DA3 Reference View is required.")
+
+        parsed_filter_conf_profile = str(filter_conf_profile or "").strip()
+        if not parsed_filter_conf_profile:
+            raise ValueError("Confidence Mode is required.")
+        parsed_filter_conf_percentile = _coerce_float(filter_conf_percentile, label="DA3 Confidence Percentile")
+        parsed_filter_sky_depth_band_percent = _coerce_float(
+            filter_sky_depth_band_percent,
+            label="Sky Depth Band Percent",
+            optional=True,
+        )
+        parsed_filter_min_depth_range_percent = _coerce_float(
+            filter_min_depth_range_percent,
+            label="Min Depth Range Percent",
+            optional=True,
+        )
+        parsed_filter_min_depth_range_meters = _coerce_float(
+            filter_min_depth_range_meters,
+            label="Min Depth Range Metres",
+            optional=True,
+        )
+        parsed_filter_edge_rtol = _coerce_float(filter_edge_rtol, label="Depth Edge Rel Threshold", optional=True)
+        parsed_filter_edge_atol = _coerce_float(filter_edge_atol, label="Depth Edge Abs Threshold", optional=True)
+        parsed_filter_edge_kernel_size = _coerce_int(filter_edge_kernel_size, label="Depth Edge Kernel")
+        parsed_filter_max_depth_rtol = _coerce_float(filter_max_depth_rtol, label="Max Depth Rel Threshold", optional=True)
+        parsed_filter_max_depth_atol = _coerce_float(filter_max_depth_atol, label="Max Depth Abs Threshold", optional=True)
+        parsed_fixed_camera_fov_degrees = _coerce_float(
+            fixed_camera_fov_degrees,
+            label="Fixed Camera Horizontal FOV",
+        )
+        if parsed_fixed_camera_fov_degrees is None or not (1.0 < parsed_fixed_camera_fov_degrees < 179.0):
+            raise ValueError("Fixed Camera Horizontal FOV must be between 1 and 179 degrees.")
+        if export_streaming_guide_ply and not (bool(stage0_streaming) and bool(stage0_streaming_global_guide)):
+            raise ValueError("Export Guide Pass PLY requires Use DA3 Streaming and Use Global Guide Pass.")
+    except Exception as exc:
+        yield {}, f"**Export failed:** `{exc}`", None, "", "", ""
+        return
+
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    job_root = (DIVSTREAM_JOBS_ROOT / run_id).resolve()
+    scene_root = job_root / "scene"
+    requested_output_path = (DIVSTREAM_OUTPUTS_ROOT / _safe_divstream_filename(output_filename, input_video)).resolve()
+    output_path = _next_available_path(requested_output_path).resolve()
+    debug_ply_output_path = None
+    if export_before_non_rigid_ply:
+        debug_ply_output_path = _next_available_path(
+            DIVSTREAM_OUTPUTS_ROOT / f"{output_path.stem}_before_non_rigid_icp.ply"
+        ).resolve()
+    guide_ply_output_path = None
+    if export_streaming_guide_ply:
+        guide_ply_output_path = _next_available_path(
+            DIVSTREAM_OUTPUTS_ROOT / f"{output_path.stem}_streaming_guide.ply"
+        ).resolve()
+    prep_num_frames = (
+        DIVSTREAM_DEBUG_PREP_NUM_FRAMES if export_before_non_rigid_ply else DIVSTREAM_PREP_NUM_FRAMES
+    )
+    prep_run = scene_root / (
+        f"frame_to_model_icp_{prep_num_frames}_{DIVSTREAM_PREP_STRIDE}_offset{DIVSTREAM_PREP_OFFSET}"
+    )
+    log_path = RUNS_ROOT / f"{run_id}_divstream.log"
+    state = {
+        "run_id": run_id,
+        "log_path": str(log_path),
+        "scene_root": str(scene_root),
+        "output_path": str(output_path),
+        "debug_ply_output_path": (str(debug_ply_output_path) if debug_ply_output_path is not None else ""),
+        "guide_ply_output_path": (str(guide_ply_output_path) if guide_ply_output_path is not None else ""),
+    }
+
+    preprocess_command = _build_stage0_command(
+        input_video=input_video,
+        frames_dir=None,
+        scene_root_override=scene_root,
+        preprocess_overwrite=True,
+        preprocess_max_frames=int(parsed_stage0_max_frames),
+        preprocess_max_stride=int(parsed_stage0_max_stride),
+        preprocess_streaming=bool(stage0_streaming),
+        preprocess_streaming_overlap=int(parsed_stage0_overlap),
+        preprocess_streaming_global_guide=bool(stage0_streaming_global_guide),
+        preprocess_image_ext=parsed_stage0_image_ext,
+        preprocess_model_name=parsed_stage0_model_name,
+        preprocess_process_res=int(parsed_stage0_process_res),
+        preprocess_process_res_method=parsed_stage0_process_res_method,
+        preprocess_export_gs_video=False,
+        preprocess_runtime_export_format="none",
+        preprocess_runtime_export_fps=fps,
+        preprocess_use_ray_pose=bool(stage0_use_ray_pose),
+        preprocess_fixed_camera=bool(fixed_camera),
+        preprocess_fixed_camera_fov_degrees=float(parsed_fixed_camera_fov_degrees),
+        preprocess_ref_view_strategy=parsed_stage0_ref_view_strategy,
+        alignment_num_frames=prep_num_frames,
+        alignment_stride=DIVSTREAM_PREP_STRIDE,
+        alignment_offset=DIVSTREAM_PREP_OFFSET,
+        conf_profile=parsed_filter_conf_profile,
+        conf_percentile=float(parsed_filter_conf_percentile),
+        conf_mask_sky=bool(filter_mask_sky),
+        conf_mask_sky_depth_band=bool(filter_mask_sky_depth_band),
+        conf_sky_depth_band_percent=parsed_filter_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent=bool(filter_mask_min_depth_range_percent),
+        conf_min_depth_range_percent=parsed_filter_min_depth_range_percent,
+        conf_mask_min_depth_range_meters=bool(filter_mask_min_depth_range_meters),
+        conf_min_depth_range_meters=parsed_filter_min_depth_range_meters,
+        conf_mask_depth_edges=bool(filter_mask_depth_edges),
+        conf_edge_rtol=parsed_filter_edge_rtol,
+        conf_edge_atol=parsed_filter_edge_atol,
+        conf_edge_kernel_size=int(parsed_filter_edge_kernel_size),
+        conf_mask_max_depth=bool(filter_mask_max_depth),
+        conf_max_depth_rtol=parsed_filter_max_depth_rtol,
+        conf_max_depth_atol=parsed_filter_max_depth_atol,
+        conf_voxel_min_count_percentile=(None if int(parsed_stage0_max_stride) > 1 else 50.0),
+        prepare_skip_before_non_rigid=not bool(export_before_non_rigid_ply),
+        prepare_skip_debug_masks=True,
+        skip_frame_materialization=True,
+    )
+    export_command = [
+        sys.executable,
+        "-u",
+        str(PROJECT_ROOT / "export_depth_image_stream_bc7.py"),
+        str(scene_root),
+        "--output",
+        str(output_path),
+        "--fps",
+        _format_fps_for_cli(fps),
+        "--compression-level",
+        str(compression_level),
+        "--workers",
+        str(workers),
+        "--prep-run",
+        str(prep_run),
+        "--require-stage1-filters",
+    ]
+    if fixed_camera:
+        export_command.append("--fixed-camera")
+    guide_ply_command = None
+    if guide_ply_output_path is not None:
+        guide_ply_command = [
+            sys.executable,
+            "-u",
+            str(PROJECT_ROOT / "export_streaming_guide_ply.py"),
+            str(scene_root),
+            "--output",
+            str(guide_ply_output_path),
+        ]
+
+    env = os.environ.copy()
+    _prepend_active_python_bin_to_path(env)
+    _ensure_pytorch_cuda_allocator_conf(env)
+    env["PYTHONUNBUFFERED"] = "1"
+    started_at = time.time()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def run_phase(command: list[str], phase: str):
+        with log_path.open("a", encoding="utf-8", buffering=1) as log_handle:
+            log_handle.write(f"\n\n=== {phase} ===\n")
+            log_handle.write(" ".join(command) + "\n\n")
+            process = subprocess.Popen(
+                command,
+                cwd=PROJECT_ROOT,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
+            with ACTIVE_RUNS_LOCK:
+                ACTIVE_RUNS[run_id] = process
+            try:
+                while True:
+                    return_code = process.poll()
+                    log_text = _tail_text(log_path)
+                    elapsed = time.time() - started_at
+                    if return_code is None:
+                        yield None, _simple_divstream_status(
+                            state="Running",
+                            phase=phase,
+                            elapsed_seconds=elapsed,
+                            output_path=output_path,
+                            log_path=log_path,
+                        ), None, log_text
+                        time.sleep(POLL_INTERVAL_SEC)
+                        continue
+                    if return_code != 0:
+                        yield return_code, _simple_divstream_status(
+                            state=f"Exited with code {return_code}",
+                            phase=phase,
+                            elapsed_seconds=elapsed,
+                            output_path=output_path,
+                            log_path=log_path,
+                            extra="The log below has the failure details.",
+                        ), None, log_text
+                        return
+                    yield 0, _simple_divstream_status(
+                        state="Running",
+                        phase=f"{phase} complete",
+                        elapsed_seconds=elapsed,
+                        output_path=output_path,
+                        log_path=log_path,
+                    ), None, log_text
+                    return
+            finally:
+                with ACTIVE_RUNS_LOCK:
+                    ACTIVE_RUNS.pop(run_id, None)
+
+    try:
+        debug_ply_path_value = ""
+        guide_ply_path_value = ""
+        for return_code, status, file_value, log_text in run_phase(preprocess_command, "Preparing video"):
+            yield state, status, file_value, debug_ply_path_value, guide_ply_path_value, log_text
+            if return_code not in (None, 0):
+                return
+
+        if guide_ply_command is not None:
+            for return_code, status, file_value, log_text in run_phase(guide_ply_command, "Writing guide PLY"):
+                guide_ply_path_value = str(guide_ply_output_path) if guide_ply_output_path.is_file() else ""
+                yield state, status, file_value, debug_ply_path_value, guide_ply_path_value, log_text
+                if return_code not in (None, 0):
+                    return
+
+        if debug_ply_output_path is not None:
+            debug_ply_source_path = prep_run / "before_non_rigid_icp.ply"
+            if not debug_ply_source_path.is_file():
+                yield (
+                    state,
+                    f"**Export failed:** expected debug PLY was not written: `{debug_ply_source_path}`",
+                    None,
+                    debug_ply_path_value,
+                    guide_ply_path_value,
+                    _tail_text(log_path),
+                )
+                return
+            debug_ply_output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(debug_ply_source_path, debug_ply_output_path)
+            debug_ply_path_value = str(debug_ply_output_path)
+
+        for return_code, status, file_value, log_text in run_phase(export_command, "Writing divstream"):
+            yield state, status, file_value, debug_ply_path_value, guide_ply_path_value, log_text
+            if return_code not in (None, 0):
+                return
+
+        if not output_path.is_file():
+            yield (
+                state,
+                f"**Export failed:** expected output was not written: `{output_path}`",
+                None,
+                debug_ply_path_value,
+                guide_ply_path_value,
+                _tail_text(log_path),
+            )
+            return
+
+        _cleanup_simple_divstream_job(job_root)
+        elapsed = time.time() - started_at
+        extra_lines = [
+            f"Output FPS: `{_format_fps_for_cli(fps)}` "
+            f"(source `{_format_fps_for_cli(source_fps)}` / stride `{parsed_stage0_max_stride}`)",
+            "",
+            f"Size: `{output_path.stat().st_size / (1024.0 * 1024.0):.2f} MiB`",
+        ]
+        if debug_ply_path_value:
+            extra_lines.extend(["", f"Debug PLY: `{debug_ply_path_value}`"])
+        if guide_ply_path_value:
+            extra_lines.extend(["", f"Guide PLY: `{guide_ply_path_value}`"])
+        yield (
+            state,
+            _simple_divstream_status(
+                state="Finished",
+                phase="Complete",
+                elapsed_seconds=elapsed,
+                output_path=output_path,
+                log_path=log_path,
+                extra="\n".join(extra_lines),
+            ),
+            str(output_path),
+            debug_ply_path_value,
+            guide_ply_path_value,
+            _tail_text(log_path),
+        )
+    except Exception as exc:
+        yield state, f"**Export failed:** `{exc}`", None, "", "", _tail_text(log_path)
+
+
+def _append_bool_cli_arg(command: list[str], *, name: str, value: bool, default: bool) -> None:
+    if bool(value) == bool(default):
+        return
+    command.append(f"--{name}" if value else f"--no-{name}")
+
+
+def _append_optional_cli_value(command: list[str], *, name: str, value: object) -> None:
+    if value is None:
+        command.extend([f"--{name}", "none"])
+        return
+    command.extend([f"--{name}", str(value)])
+
+
+def _run_vda_divstream_generator(
+    uploaded_video,
+    output_filename,
+    divstream_compression_level,
+    divstream_workers,
+    vda_encoder,
+    vda_metric,
+    vda_relative_depth_inverse,
+    vda_input_size,
+    vda_max_res,
+    vda_max_frames,
+    vda_stride,
+    vda_fp32,
+    vda_download_checkpoint,
+    vda_fixed_camera_fov_degrees,
+    vda_depth_scale,
+    vda_depth_offset,
+    filter_mask_min_depth_range_percent,
+    filter_min_depth_range_percent,
+    filter_mask_max_depth_range_percent,
+    filter_max_depth_range_percent,
+    filter_mask_min_depth_range_meters,
+    filter_min_depth_range_meters,
+    filter_mask_depth_edges,
+    filter_edge_rtol,
+    filter_edge_atol,
+    filter_edge_kernel_size,
+    filter_mask_max_depth,
+    filter_max_depth_rtol,
+    filter_max_depth_atol,
+):
+    _ensure_workspace_dirs()
+
+    try:
+        input_video = _resolve_existing_file(uploaded_video)
+        compression_level = _coerce_int(divstream_compression_level, label="Divstream Compression Level")
+        if compression_level is None or compression_level < 1 or compression_level > 12:
+            raise ValueError("Divstream Compression Level must be between 1 and 12.")
+        workers = _coerce_int(divstream_workers, label="Divstream Workers")
+        if workers is None or workers < 0:
+            raise ValueError("Divstream Workers must be 0 or greater.")
+
+        parsed_encoder = str(vda_encoder or "").strip()
+        if parsed_encoder not in {"vits", "vitb", "vitl"}:
+            raise ValueError("VDA Encoder must be one of vits, vitb, or vitl.")
+        parsed_input_size = _coerce_int(vda_input_size, label="VDA Input Size")
+        parsed_max_res = _coerce_int(vda_max_res, label="VDA Max Resolution")
+        parsed_max_frames = _coerce_int(vda_max_frames, label="VDA Max Frames")
+        parsed_stride = _coerce_int(vda_stride, label="VDA Input Stride")
+        if parsed_input_size is None or parsed_input_size < 14:
+            raise ValueError("VDA Input Size must be at least 14.")
+        if parsed_max_res is None:
+            parsed_max_res = -1
+        if parsed_max_frames is None:
+            parsed_max_frames = -1
+        if parsed_stride is None or parsed_stride < 1:
+            raise ValueError("VDA Input Stride must be at least 1.")
+
+        source_fps = _probe_video_fps(input_video)
+        fps = source_fps / float(parsed_stride)
+        if not math.isfinite(fps) or fps <= 0.0:
+            raise ValueError("Calculated output FPS must be greater than 0.")
+
+        parsed_fixed_camera_fov_degrees = _coerce_float(
+            vda_fixed_camera_fov_degrees,
+            label="Fixed Camera Horizontal FOV",
+        )
+        if parsed_fixed_camera_fov_degrees is None or not (1.0 < parsed_fixed_camera_fov_degrees < 179.0):
+            raise ValueError("Fixed Camera Horizontal FOV must be between 1 and 179 degrees.")
+        parsed_depth_scale = _coerce_float(vda_depth_scale, label="VDA Depth Scale")
+        parsed_depth_offset = _coerce_float(vda_depth_offset, label="VDA Depth Offset")
+        if parsed_depth_scale is None or not math.isfinite(parsed_depth_scale):
+            raise ValueError("VDA Depth Scale must be a finite number.")
+        if parsed_depth_offset is None or not math.isfinite(parsed_depth_offset):
+            raise ValueError("VDA Depth Offset must be a finite number.")
+
+        parsed_filter_min_depth_range_percent = _coerce_float(
+            filter_min_depth_range_percent,
+            label="Min Depth Range Percent",
+            optional=True,
+        )
+        parsed_filter_max_depth_range_percent = _coerce_float(
+            filter_max_depth_range_percent,
+            label="Max Depth Range Percent",
+            optional=True,
+        )
+        parsed_filter_min_depth_range_meters = _coerce_float(
+            filter_min_depth_range_meters,
+            label="Min Depth Range Metres",
+            optional=True,
+        )
+        parsed_filter_edge_rtol = _coerce_float(filter_edge_rtol, label="Depth Edge Rel Threshold", optional=True)
+        parsed_filter_edge_atol = _coerce_float(filter_edge_atol, label="Depth Edge Abs Threshold", optional=True)
+        parsed_filter_edge_kernel_size = _coerce_int(filter_edge_kernel_size, label="Depth Edge Kernel")
+        parsed_filter_max_depth_rtol = _coerce_float(filter_max_depth_rtol, label="Max Depth Rel Threshold", optional=True)
+        parsed_filter_max_depth_atol = _coerce_float(filter_max_depth_atol, label="Max Depth Abs Threshold", optional=True)
+    except Exception as exc:
+        yield {}, f"**Export failed:** `{exc}`", None, ""
+        return
+
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    job_root = (VDA_DIVSTREAM_JOBS_ROOT / run_id).resolve()
+    scene_root = job_root / "scene"
+    requested_output_path = (DIVSTREAM_OUTPUTS_ROOT / _safe_divstream_filename(output_filename, input_video)).resolve()
+    output_path = _next_available_path(requested_output_path).resolve()
+    log_path = RUNS_ROOT / f"{run_id}_vda_divstream.log"
+    state = {
+        "run_id": run_id,
+        "log_path": str(log_path),
+        "scene_root": str(scene_root),
+        "output_path": str(output_path),
+    }
+
+    command = [
+        sys.executable,
+        "-u",
+        str(PROJECT_ROOT / "export_vda_divstream.py"),
+        "--input-video",
+        str(input_video),
+        "--scene-root",
+        str(scene_root),
+        "--output",
+        str(output_path),
+        "--encoder",
+        parsed_encoder,
+        "--input-size",
+        str(int(parsed_input_size)),
+        "--max-res",
+        str(int(parsed_max_res)),
+        "--max-frames",
+        str(int(parsed_max_frames)),
+        "--stride",
+        str(int(parsed_stride)),
+        "--fixed-camera-fov-degrees",
+        _format_fps_for_cli(float(parsed_fixed_camera_fov_degrees)),
+        "--depth-scale",
+        str(float(parsed_depth_scale)),
+        "--depth-offset",
+        str(float(parsed_depth_offset)),
+        "--compression-level",
+        str(int(compression_level)),
+        "--workers",
+        str(int(workers)),
+    ]
+    _append_bool_cli_arg(command, name="metric", value=bool(vda_metric), default=True)
+    _append_bool_cli_arg(
+        command,
+        name="relative-depth-inverse",
+        value=bool(vda_relative_depth_inverse),
+        default=True,
+    )
+    _append_bool_cli_arg(command, name="download-checkpoint", value=bool(vda_download_checkpoint), default=True)
+    if vda_fp32:
+        command.append("--fp32")
+    _append_bool_cli_arg(
+        command,
+        name="mask-min-depth-range-percent",
+        value=bool(filter_mask_min_depth_range_percent),
+        default=False,
+    )
+    command.extend([
+        "--min-depth-range-percent",
+        str(50.0 if parsed_filter_min_depth_range_percent is None else parsed_filter_min_depth_range_percent),
+    ])
+    _append_bool_cli_arg(
+        command,
+        name="mask-max-depth-range-percent",
+        value=bool(filter_mask_max_depth_range_percent),
+        default=False,
+    )
+    command.extend([
+        "--max-depth-range-percent",
+        str(50.0 if parsed_filter_max_depth_range_percent is None else parsed_filter_max_depth_range_percent),
+    ])
+    _append_bool_cli_arg(
+        command,
+        name="mask-min-depth-range-meters",
+        value=bool(filter_mask_min_depth_range_meters),
+        default=False,
+    )
+    command.extend([
+        "--min-depth-range-meters",
+        str(3.0 if parsed_filter_min_depth_range_meters is None else parsed_filter_min_depth_range_meters),
+    ])
+    _append_bool_cli_arg(command, name="mask-depth-edges", value=bool(filter_mask_depth_edges), default=True)
+    _append_optional_cli_value(command, name="edge-rtol", value=parsed_filter_edge_rtol)
+    _append_optional_cli_value(command, name="edge-atol", value=parsed_filter_edge_atol)
+    command.extend([
+        "--edge-kernel-size",
+        str(int(3 if parsed_filter_edge_kernel_size is None else parsed_filter_edge_kernel_size)),
+    ])
+    _append_bool_cli_arg(command, name="mask-max-depth", value=bool(filter_mask_max_depth), default=False)
+    _append_optional_cli_value(command, name="max-depth-rtol", value=parsed_filter_max_depth_rtol)
+    _append_optional_cli_value(command, name="max-depth-atol", value=parsed_filter_max_depth_atol)
+
+    env = os.environ.copy()
+    _prepend_active_python_bin_to_path(env)
+    _ensure_pytorch_cuda_allocator_conf(env)
+    env["PYTHONUNBUFFERED"] = "1"
+    started_at = time.time()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_path.open("a", encoding="utf-8", buffering=1) as log_handle:
+        log_handle.write("\n\n=== VDA divstream export ===\n")
+        log_handle.write(" ".join(command) + "\n\n")
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        with ACTIVE_RUNS_LOCK:
+            ACTIVE_RUNS[run_id] = process
+        try:
+            while True:
+                return_code = process.poll()
+                log_text = _tail_text(log_path)
+                elapsed = time.time() - started_at
+                if return_code is None:
+                    yield (
+                        state,
+                        _simple_divstream_status(
+                            state="Running",
+                            phase="Running Video Depth Anything",
+                            elapsed_seconds=elapsed,
+                            output_path=output_path,
+                            log_path=log_path,
+                        ),
+                        None,
+                        log_text,
+                    )
+                    time.sleep(POLL_INTERVAL_SEC)
+                    continue
+                if return_code != 0:
+                    yield (
+                        state,
+                        _simple_divstream_status(
+                            state=f"Exited with code {return_code}",
+                            phase="Failed",
+                            elapsed_seconds=elapsed,
+                            output_path=output_path,
+                            log_path=log_path,
+                            extra="The log below has the failure details.",
+                        ),
+                        None,
+                        log_text,
+                    )
+                    return
+                break
+        finally:
+            with ACTIVE_RUNS_LOCK:
+                ACTIVE_RUNS.pop(run_id, None)
+
+    if not output_path.is_file():
+        yield state, f"**Export failed:** expected output was not written: `{output_path}`", None, _tail_text(log_path)
+        return
+
+    _cleanup_simple_divstream_job(job_root)
+    elapsed = time.time() - started_at
+    yield (
+        state,
+        _simple_divstream_status(
+            state="Finished",
+            phase="Complete",
+            elapsed_seconds=elapsed,
+            output_path=output_path,
+            log_path=log_path,
+            extra=(
+                f"Output FPS: `{_format_fps_for_cli(fps)}` "
+                f"(source `{_format_fps_for_cli(source_fps)}` / stride `{parsed_stride}`)\n\n"
+                f"Size: `{output_path.stat().st_size / (1024.0 * 1024.0):.2f} MiB`"
+            ),
+        ),
+        str(output_path),
+        _tail_text(log_path),
+    )
+
+
 def _emit_launch_failure(message: str):
     empty_state: dict[str, str] = {}
     yield empty_state, message, "Idle", "", "", "", None, None, [], ""
+
+
+def _emit_stage_launch_failure(message: str):
+    for outputs in _emit_launch_failure(message):
+        yield (*outputs, *_stage_completion_control_no_updates())
+
+
+def _run_stage_command_generator(
+    *,
+    command: list[str],
+    effective_scene_root: Path,
+    input_note: str,
+    stage_hint: str,
+):
+    for outputs in _run_command_generator(
+        command=command,
+        effective_scene_root=effective_scene_root,
+        input_note=input_note,
+        stage_hint=stage_hint,
+    ):
+        control_outputs = (
+            _stage_completion_control_outputs(outputs[3])
+            if outputs[2] == "Complete"
+            else _stage_completion_control_no_updates()
+        )
+        yield (*outputs, *control_outputs)
 
 
 def _run_pipeline_generator(*args, **kwargs):
@@ -1832,6 +2904,7 @@ def _run_pipeline_generator(*args, **kwargs):
         preprocess_max_stride,
         preprocess_streaming,
         preprocess_streaming_overlap,
+        preprocess_streaming_global_guide,
         preprocess_image_ext,
         preprocess_model_name,
         preprocess_process_res,
@@ -2000,11 +3073,12 @@ def _run_pipeline_generator(*args, **kwargs):
             renderer_choice=renderer_choice,
             preprocess_overwrite=preprocess_overwrite,
             preprocess_max_frames=_coerce_int(preprocess_max_frames, label="Stage 0 Max Frames") or DEFAULT_STAGE0_MAX_FRAMES,
-            preprocess_max_stride=_coerce_int(preprocess_max_stride, label="Stage 0 Max Stride") or DEFAULT_STAGE0_MAX_STRIDE,
+            preprocess_max_stride=_coerce_int(preprocess_max_stride, label="Stage 0 Input Stride") or DEFAULT_STAGE0_MAX_STRIDE,
             preprocess_streaming=bool(preprocess_streaming),
             preprocess_streaming_overlap=(
                 _coerce_int(preprocess_streaming_overlap, label="DA3 Streaming Overlap") or DEFAULT_STAGE0_STREAMING_OVERLAP
             ),
+            preprocess_streaming_global_guide=bool(preprocess_streaming_global_guide),
             preprocess_image_ext=str(preprocess_image_ext or "png"),
             preprocess_model_name=str(preprocess_model_name or "depth-anything/DA3NESTED-GIANT-LARGE"),
             preprocess_process_res=_coerce_int(preprocess_process_res, label="DA3 Processing Resolution") or 768,
@@ -2252,6 +3326,7 @@ def _export_runtime_format(
     scene_root_selection,
     runtime_export_format,
     runtime_export_fps,
+    run_name=None,
 ):
     import traceback as _tb
 
@@ -2269,6 +3344,7 @@ def _export_runtime_format(
                 scene_root=scene_root_selection,
                 fps=int(fps),
                 overwrite=True,
+                prep_run=(run_name or None),
             )
             return (
                 f"**Stage 0 runtime export complete!**\n\n"
@@ -2566,6 +3642,7 @@ def _run_stage_generator(*args, **kwargs):
         stage0_max_stride,
         stage0_streaming,
         stage0_streaming_overlap,
+        stage0_streaming_global_guide,
         stage0_image_ext,
         stage0_model_name,
         stage0_process_res,
@@ -2738,11 +3815,12 @@ def _run_stage_generator(*args, **kwargs):
                 scene_root_override=scene_root_override,
                 preprocess_overwrite=stage0_overwrite,
                 preprocess_max_frames=_coerce_int(stage0_max_frames, label="Stage 0 Max Frames") or DEFAULT_STAGE0_MAX_FRAMES,
-                preprocess_max_stride=_coerce_int(stage0_max_stride, label="Stage 0 Max Stride") or DEFAULT_STAGE0_MAX_STRIDE,
+                preprocess_max_stride=_coerce_int(stage0_max_stride, label="Stage 0 Input Stride") or DEFAULT_STAGE0_MAX_STRIDE,
                 preprocess_streaming=bool(stage0_streaming),
                 preprocess_streaming_overlap=(
                     _coerce_int(stage0_streaming_overlap, label="DA3 Streaming Overlap") or DEFAULT_STAGE0_STREAMING_OVERLAP
                 ),
+                preprocess_streaming_global_guide=bool(stage0_streaming_global_guide),
                 preprocess_image_ext=str(stage0_image_ext or "png"),
                 preprocess_model_name=str(stage0_model_name or "depth-anything/DA3NESTED-GIANT-LARGE"),
                 preprocess_process_res=_coerce_int(stage0_process_res, label="DA3 Processing Resolution") or 768,
@@ -2978,10 +4056,10 @@ def _run_stage_generator(*args, **kwargs):
                 else:
                     raise ValueError(f"Unknown stage: {stage_key}")
     except Exception as exc:
-        yield from _emit_launch_failure(f"**State**: Failed before launch\n\n`{exc}`")
+        yield from _emit_stage_launch_failure(f"**State**: Failed before launch\n\n`{exc}`")
         return
 
-    yield from _run_command_generator(
+    yield from _run_stage_command_generator(
         command=command,
         effective_scene_root=effective_scene_root,
         input_note=input_note,
@@ -3084,6 +4162,42 @@ def _refresh_stage_scene(scene_root_selection: object):
     )
 
 
+def _stage_completion_control_no_updates():
+    return tuple(gr.update() for _ in range(STAGE_COMPLETION_CONTROL_OUTPUT_COUNT))
+
+
+def _stage_completion_control_outputs(scene_root_selection: object):
+    scene_text = _strip_quotes(scene_root_selection)
+    if not scene_text:
+        return _stage_completion_control_no_updates()
+
+    try:
+        scene_root = _resolve_existing_dir(scene_text)
+        if _scene_root_has_stage0(scene_root):
+            _clear_catalog_cache()
+        refresh = _refresh_stage_scene(str(scene_root.resolve()))
+    except Exception:
+        return _stage_completion_control_no_updates()
+
+    scene_root_text = refresh[1] or str(scene_root.resolve())
+    return (
+        _update_dropdown_choices(_scene_dropdown_choices(), scene_root_text),
+        scene_root_text,
+        refresh[2],
+        refresh[3],
+        refresh[4],
+        refresh[5],
+        refresh[6],
+        refresh[7],
+        refresh[8],
+        refresh[9],
+        refresh[10],
+        refresh[11],
+        refresh[12],
+        refresh[13],
+    )
+
+
 def _refresh_stage_run(scene_root_selection: object, run_name: str):
     if not _strip_quotes(scene_root_selection):
         return (
@@ -3141,8 +4255,312 @@ def _refresh_stage_run(scene_root_selection: object, run_name: str):
     )
 
 
+STAGE_PARAMETER_OUTPUT_NAMES = [
+    "stage0_max_frames",
+    "stage0_max_stride",
+    "stage0_streaming",
+    "stage0_streaming_overlap",
+    "stage0_streaming_global_guide",
+    "stage0_image_ext",
+    "stage0_model_name",
+    "stage0_process_res",
+    "stage0_process_res_method",
+    "stage0_export_gs_video",
+    "stage0_runtime_export_format",
+    "stage0_runtime_export_fps",
+    "stage0_use_ray_pose",
+    "stage0_ref_view_strategy",
+    "stage1_num_frames",
+    "stage1_stride",
+    "stage1_offset",
+    "stage1_conf_profile",
+    "stage1_conf_percentile",
+    "stage1_conf_mask_sky",
+    "stage1_conf_mask_sky_depth_band",
+    "stage1_conf_sky_depth_band_percent",
+    "stage1_conf_mask_min_depth_range_percent",
+    "stage1_conf_min_depth_range_percent",
+    "stage1_conf_mask_min_depth_range_meters",
+    "stage1_conf_min_depth_range_meters",
+    "stage1_conf_mask_depth_edges",
+    "stage1_conf_edge_rtol",
+    "stage1_conf_edge_atol",
+    "stage1_conf_edge_kernel_size",
+    "stage1_conf_mask_max_depth",
+    "stage1_conf_max_depth_rtol",
+    "stage1_conf_max_depth_atol",
+    "stage1_use_roma_matching",
+    "stage1_roma_version",
+    "stage1_roma_model",
+    "stage1_roma_num_samples",
+    "stage1_roma_certainty_threshold",
+    "stage1_roma_max_references",
+    "stage1_roma_reference_sampling",
+    "stage1_roma_loss_weight",
+    "stage1_roma_max_corr_dist",
+    "stage1_knn_backend",
+    "stage1_tensorboard",
+    "stage1_max_corr_dist",
+    "stage1_merge_voxel_size",
+    "stage1_icp_n_iter",
+    "stage1_icp_early_stopping_patience",
+    "stage1_icp_early_stopping_min_iters",
+    "stage1_icp_early_stopping_min_delta",
+    "stage1_icp_lr",
+    "stage1_icp_method",
+    "stage1_icp_local_twist_reg",
+    "stage1_icp_tv_reg",
+    "stage1_icp_tv_voxel_size",
+    "stage1_icp_tv_every_k",
+    "stage1_icp_tv_sample_ratio",
+    "stage1_icp_color_icp_weight",
+    "stage1_icp_color_icp_max_color_dist",
+    "stage1_icp_color_icp_k",
+    "stage1_save_intermediate_every",
+    "stage1_deform_log2_hashmap_size",
+    "stage1_deform_num_levels",
+    "stage1_deform_n_neurons",
+    "stage1_deform_n_hidden_layers",
+    "stage1_deform_min_res",
+    "stage1_deform_max_res",
+    "stage1_filter_points",
+    "stage1_filter_geom_sigma",
+    "stage1_filter_color_sigma",
+    "stage1_filter_worst_pct",
+    "stage1_filter_min_frames",
+    "stage1_filter_base_percentile",
+]
+
+
+def _blank_stage_parameter_updates():
+    return tuple(gr.update() for _ in STAGE_PARAMETER_OUTPUT_NAMES)
+
+
+def _read_json_object(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _selected_or_latest_run_dir(scene_root: Path, run_name: object = None) -> Optional[Path]:
+    run_name_text = _strip_quotes(run_name)
+    if run_name_text:
+        candidate = scene_root / run_name_text
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    run_dirs = _find_run_dirs(scene_root)
+    return run_dirs[-1].resolve() if run_dirs else None
+
+
+def _conf_profile_from_alignment(alignment: dict[str, object]) -> str:
+    mode = str(alignment.get("conf_mode") or "").strip().lower()
+    if mode == "per_frame":
+        return "da3_per_frame"
+    if mode == "global":
+        return "da3_global"
+    if mode == "per_frame_guided":
+        return "da3_per_frame_guided"
+    return "default_mixed"
+
+
+def _apply_alignment_param_values(values: dict[str, object], alignment: dict[str, object]) -> None:
+    if not alignment:
+        return
+
+    mapping = {
+        "stage1_num_frames": "num_frames",
+        "stage1_stride": "stride",
+        "stage1_offset": "offset",
+        "stage1_conf_percentile": "conf_thresh_percentile",
+        "stage1_conf_mask_sky": "conf_mask_sky",
+        "stage1_conf_mask_sky_depth_band": "conf_mask_sky_depth_band",
+        "stage1_conf_sky_depth_band_percent": "conf_sky_depth_band_percent",
+        "stage1_conf_mask_min_depth_range_percent": "conf_mask_min_depth_range_percent",
+        "stage1_conf_min_depth_range_percent": "conf_min_depth_range_percent",
+        "stage1_conf_mask_min_depth_range_meters": "conf_mask_min_depth_range_meters",
+        "stage1_conf_min_depth_range_meters": "conf_min_depth_range_meters",
+        "stage1_conf_mask_depth_edges": "conf_mask_depth_edges",
+        "stage1_conf_edge_rtol": "conf_edge_rtol",
+        "stage1_conf_edge_atol": "conf_edge_atol",
+        "stage1_conf_edge_kernel_size": "conf_edge_kernel_size",
+        "stage1_conf_mask_max_depth": "conf_mask_max_depth",
+        "stage1_conf_max_depth_rtol": "conf_max_depth_rtol",
+        "stage1_conf_max_depth_atol": "conf_max_depth_atol",
+    }
+    values["stage1_conf_profile"] = _conf_profile_from_alignment(alignment)
+    for output_name, alignment_key in mapping.items():
+        if alignment_key in alignment:
+            values[output_name] = alignment.get(alignment_key)
+
+
+def _load_stage0_values_from_log(scene_root: Path) -> dict[str, object]:
+    scene_text = str(scene_root).replace("\\", "/")
+    values: dict[str, object] = {}
+    try:
+        log_paths = sorted(RUNS_ROOT.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return values
+
+    for log_path in log_paths[:80]:
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if scene_text not in text.replace("\\", "/"):
+            continue
+
+        match = re.search(
+            r"DA3 inference settings:\s*"
+            r"process_res=(?P<process_res>\d+),\s*"
+            r"process_res_method=(?P<process_res_method>[^,]+),\s*"
+            r"use_ray_pose=(?P<use_ray_pose>True|False),\s*"
+            r"(?:fixed_camera=(?P<fixed_camera>True|False),\s*"
+            r"fixed_camera_fov_degrees=(?P<fixed_camera_fov_degrees>[^,]+),\s*)?"
+            r"ref_view_strategy=(?P<ref_view_strategy>[^,]+),\s*"
+            r"export_gs_video=(?P<export_gs_video>True|False),\s*"
+            r"streaming=(?P<streaming>True|False)"
+            r"(?:,\s*streaming_global_guide=(?P<streaming_global_guide>True|False))?",
+            text,
+            flags=re.MULTILINE,
+        )
+        if not match:
+            continue
+
+        values["stage0_process_res"] = int(match.group("process_res"))
+        values["stage0_process_res_method"] = match.group("process_res_method").strip()
+        values["stage0_use_ray_pose"] = match.group("use_ray_pose") == "True"
+        values["stage0_ref_view_strategy"] = match.group("ref_view_strategy").strip()
+        values["stage0_export_gs_video"] = match.group("export_gs_video") == "True"
+        values["stage0_streaming"] = match.group("streaming") == "True"
+        if match.group("streaming_global_guide") is not None:
+            values["stage0_streaming_global_guide"] = match.group("streaming_global_guide") == "True"
+        return values
+
+    return values
+
+
+def _load_stage_parameter_values(scene_root: Path, run_name: object = None) -> dict[str, object]:
+    values: dict[str, object] = {}
+
+    meta = _read_json_object(scene_root / "preprocess_frames.json")
+    stage0_mapping = {
+        "stage0_max_frames": "max_frames",
+        "stage0_max_stride": "max_stride",
+        "stage0_streaming": "streaming_enabled",
+        "stage0_streaming_overlap": "streaming_overlap",
+        "stage0_streaming_global_guide": "streaming_global_guide",
+        "stage0_image_ext": "image_ext",
+        "stage0_model_name": "model_name",
+        "stage0_process_res": "process_res",
+        "stage0_process_res_method": "process_res_method",
+        "stage0_export_gs_video": "export_gs_video",
+        "stage0_runtime_export_format": "runtime_export_format",
+        "stage0_runtime_export_fps": "runtime_export_fps",
+        "stage0_use_ray_pose": "use_ray_pose",
+        "stage0_ref_view_strategy": "ref_view_strategy",
+    }
+    for output_name, meta_key in stage0_mapping.items():
+        if meta_key in meta and meta.get(meta_key) is not None:
+            values[output_name] = meta.get(meta_key)
+    for output_name, value in _load_stage0_values_from_log(scene_root).items():
+        values.setdefault(output_name, value)
+    if "stage0_streaming_overlap" not in values and meta.get("streaming_enabled") is False:
+        values["stage0_streaming_overlap"] = DEFAULT_STAGE0_STREAMING_OVERLAP
+
+    run_dir = _selected_or_latest_run_dir(scene_root, run_name)
+    if run_dir is None:
+        return values
+
+    prep_payload = _read_json_object(run_dir / "stage0_prep_config.json")
+    alignment = prep_payload.get("alignment")
+    if isinstance(alignment, dict):
+        _apply_alignment_param_values(values, alignment)
+
+    stage1_config = _read_json_object(run_dir / "after_non_rigid_icp" / "config.json")
+    stage1_alignment = stage1_config.get("alignment")
+    if isinstance(stage1_alignment, dict):
+        _apply_alignment_param_values(values, stage1_alignment)
+
+    roma = stage1_config.get("roma")
+    if isinstance(roma, dict):
+        roma_mapping = {
+            "stage1_use_roma_matching": "use_roma_matching",
+            "stage1_roma_version": "roma_version",
+            "stage1_roma_model": "roma_model",
+            "stage1_roma_num_samples": "roma_num_samples",
+            "stage1_roma_certainty_threshold": "roma_certainty_threshold",
+            "stage1_roma_max_references": "roma_max_references",
+            "stage1_roma_reference_sampling": "roma_reference_sampling",
+            "stage1_roma_loss_weight": "roma_loss_weight",
+            "stage1_roma_max_corr_dist": "roma_max_corr_dist",
+        }
+        for output_name, config_key in roma_mapping.items():
+            if config_key in roma:
+                values[output_name] = roma.get(config_key)
+
+    stage1_mapping = {
+        "stage1_knn_backend": "knn_backend",
+        "stage1_tensorboard": "tensorboard",
+        "stage1_max_corr_dist": "max_corr_dist",
+        "stage1_merge_voxel_size": "merge_voxel_size",
+        "stage1_icp_n_iter": "icp_n_iter",
+        "stage1_icp_early_stopping_patience": "icp_early_stopping_patience",
+        "stage1_icp_early_stopping_min_iters": "icp_early_stopping_min_iters",
+        "stage1_icp_early_stopping_min_delta": "icp_early_stopping_min_delta",
+        "stage1_icp_lr": "icp_lr",
+        "stage1_icp_method": "icp_method",
+        "stage1_icp_local_twist_reg": "icp_local_twist_reg",
+        "stage1_icp_tv_reg": "icp_tv_reg",
+        "stage1_icp_tv_voxel_size": "icp_tv_voxel_size",
+        "stage1_icp_tv_every_k": "icp_tv_every_k",
+        "stage1_icp_tv_sample_ratio": "icp_tv_sample_ratio",
+        "stage1_icp_color_icp_weight": "icp_color_icp_weight",
+        "stage1_icp_color_icp_max_color_dist": "icp_color_icp_max_color_dist",
+        "stage1_icp_color_icp_k": "icp_color_icp_k",
+        "stage1_save_intermediate_every": "save_intermediate_every",
+        "stage1_deform_log2_hashmap_size": "deform_log2_hashmap_size",
+        "stage1_deform_num_levels": "deform_num_levels",
+        "stage1_deform_n_neurons": "deform_n_neurons",
+        "stage1_deform_n_hidden_layers": "deform_n_hidden_layers",
+        "stage1_deform_min_res": "deform_min_res",
+        "stage1_deform_max_res": "deform_max_res",
+        "stage1_filter_points": "filter_points",
+        "stage1_filter_geom_sigma": "filter_geom_sigma",
+        "stage1_filter_color_sigma": "filter_color_sigma",
+        "stage1_filter_worst_pct": "filter_worst_pct",
+        "stage1_filter_min_frames": "filter_min_frames",
+        "stage1_filter_base_percentile": "filter_base_percentile",
+    }
+    for output_name, config_key in stage1_mapping.items():
+        if config_key in stage1_config:
+            values[output_name] = stage1_config.get(config_key)
+
+    return values
+
+
+def _stage_parameter_updates_for_scene(scene_root_selection: object, run_name: object = None):
+    if not _strip_quotes(scene_root_selection):
+        return _blank_stage_parameter_updates()
+    try:
+        scene_root = _resolve_existing_dir(scene_root_selection)
+        values = _load_stage_parameter_values(scene_root, run_name)
+    except Exception:
+        return _blank_stage_parameter_updates()
+
+    return tuple(
+        gr.update(value=values[name]) if name in values else gr.update()
+        for name in STAGE_PARAMETER_OUTPUT_NAMES
+    )
+
+
 def _stage_button_update(*, active: bool, enabled: bool) -> dict:
-    return gr.update(variant="primary" if active else "secondary", interactive=enabled)
+    return gr.update(variant="primary" if active else "secondary", interactive=True)
 
 
 def _empty_dropdown_update() -> dict:
@@ -3296,6 +4714,18 @@ def _reset_stage_panel_for_new_source(
         raw_path = _strip_quotes(existing_video_selection)
         if raw_path:
             source_name = Path(raw_path).name
+            try:
+                scene_root = _find_scene_root_for_video(raw_path)
+            except Exception:
+                scene_root = None
+            if scene_root is not None:
+                run_dir = _selected_or_latest_run_dir(scene_root)
+                run_name = run_dir.name if run_dir is not None else None
+                return (
+                    _update_dropdown_choices(_scene_dropdown_choices(), str(scene_root.resolve())),
+                    *_refresh_stage_scene(str(scene_root.resolve())),
+                    *_stage_parameter_updates_for_scene(str(scene_root.resolve()), run_name),
+                )
     elif normalized_mode == "existing_frames":
         raw_path = _strip_quotes(existing_frames_dir)
         if raw_path:
@@ -3325,6 +4755,7 @@ def _reset_stage_panel_for_new_source(
         _stage_button_update(active=False, enabled=False),
         _stage_button_update(active=False, enabled=False),
         _stage_button_update(active=False, enabled=False),
+        *_blank_stage_parameter_updates(),
     )
 
 
@@ -3338,6 +4769,8 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="Video-to-World Studio") as demo:
         pipeline_run_state = gr.State({})
         stage_run_state = gr.State({})
+        divstream_run_state = gr.State({})
+        vda_divstream_run_state = gr.State({})
 
         gr.Markdown(
             f"""
@@ -3350,6 +4783,358 @@ def build_app() -> gr.Blocks:
             The explicit stage runner launches the native Stage 0 through Stage 3.2 commands directly.
             """
         )
+
+        with gr.Tab("Divstream Export"):
+            with gr.Row():
+                simple_divstream_video = gr.File(
+                    label="Video",
+                    file_types=[".mp4", ".mov", ".avi", ".mkv"],
+                    type="filepath",
+                )
+                with gr.Column():
+                    simple_divstream_filename = gr.Textbox(
+                        label="Output Filename",
+                        placeholder="Optional. Defaults to the uploaded video name.",
+                    )
+                    simple_divstream_compression = gr.Number(label="Compression Level", value=9, precision=0)
+                    simple_divstream_workers = gr.Number(
+                        label="Compression Workers",
+                        value=0,
+                        precision=0,
+                    )
+                    simple_export_before_non_rigid_ply = gr.Checkbox(
+                        label="Export Debug before_non_rigid_icp.ply",
+                        value=False,
+                        info="Also write and keep the filtered pre-ICP merged point cloud for all selected DA3 frames.",
+                    )
+                    simple_export_streaming_guide_ply = gr.Checkbox(
+                        label="Export Guide Pass PLY",
+                        value=False,
+                        info="Write the sparse global-guide pass point cloud. Requires Use DA3 Streaming and Use Global Guide Pass.",
+                    )
+            with gr.Accordion("Stage 0 DA3", open=True):
+                with gr.Row():
+                    simple_stage0_max_frames = gr.Number(
+                        label="DA3 Input Max Frames / Chunk Size",
+                        value=DEFAULT_STAGE0_MAX_FRAMES,
+                        precision=0,
+                    )
+                    simple_stage0_max_stride = gr.Number(
+                        label="DA3 Input Stride",
+                        value=DEFAULT_STAGE0_MAX_STRIDE,
+                        precision=0,
+                    )
+                    simple_stage0_streaming = gr.Checkbox(label="Use DA3 Streaming", value=DEFAULT_STAGE0_STREAMING)
+                    simple_stage0_streaming_overlap = gr.Number(
+                        label="DA3 Streaming Overlap",
+                        value=DEFAULT_STAGE0_STREAMING_OVERLAP,
+                        precision=0,
+                    )
+                    simple_stage0_streaming_global_guide = gr.Checkbox(
+                        label="Use Global Guide Pass",
+                        value=DEFAULT_STAGE0_STREAMING_GLOBAL_GUIDE,
+                        info="Run one sparse whole-video DA3 pass and anchor dense chunks to exact matching guide frames.",
+                    )
+                with gr.Row():
+                    simple_stage0_image_ext = gr.Textbox(label="Image Extension", value="png")
+                    simple_stage0_model_name = gr.Textbox(
+                        label="DA3 Model Name",
+                        value="depth-anything/DA3NESTED-GIANT-LARGE",
+                    )
+                    simple_stage0_process_res = gr.Number(label="DA3 Processing Resolution", value=768, precision=0)
+                with gr.Row():
+                    simple_stage0_process_res_method = gr.Dropdown(
+                        choices=["upper_bound_resize", "upper_bound_crop"],
+                        value="upper_bound_resize",
+                        label="DA3 Resolution Method",
+                    )
+                    simple_stage0_ref_view_strategy = gr.Dropdown(
+                        choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
+                        value=DEFAULT_STAGE0_REF_VIEW_STRATEGY,
+                        label="DA3 Reference View",
+                    )
+                    simple_stage0_use_ray_pose = gr.Checkbox(label="Use DA3 Ray Pose", value=False)
+                    simple_fixed_camera = gr.Checkbox(
+                        label="Fixed Camera",
+                        value=False,
+                        info="Tell DA3 the camera is static by supplying identity extrinsics and estimated intrinsics.",
+                    )
+                    simple_fixed_camera_fov = gr.Number(
+                        label="Fixed Camera HFOV",
+                        value=60.0,
+                        info="Horizontal field of view used to estimate DA3 intrinsics when Fixed Camera is enabled.",
+                    )
+
+            with gr.Accordion("Stage 0 Filters Included In Divstream", open=True):
+                with gr.Row():
+                    simple_filter_conf_profile = gr.Dropdown(
+                        choices=[
+                            ("Default Mixed (voxel + DA3)", "default_mixed"),
+                            ("DA3 Only (Per Frame)", "da3_per_frame"),
+                            ("DA3 Only (Global)", "da3_global"),
+                            ("DA3 Only (Per Frame Guided)", "da3_per_frame_guided"),
+                        ],
+                        value="default_mixed",
+                        label="Confidence Mode",
+                    )
+                    simple_filter_conf_percentile = gr.Number(label="DA3 Confidence Percentile", value=1.0)
+                with gr.Row():
+                    simple_filter_mask_sky = gr.Checkbox(label="Use DA3 Sky Mask", value=False)
+                    simple_filter_mask_sky_depth_band = gr.Checkbox(label="Expand Sky By Depth Band", value=False)
+                    simple_filter_sky_depth_band_percent = gr.Number(label="Sky Depth Band Percent", value=50.0)
+                with gr.Row():
+                    simple_filter_mask_min_depth_range_percent = gr.Checkbox(label="Limit By Min Depth Range %", value=False)
+                    simple_filter_min_depth_range_percent = gr.Number(label="Min Depth Range Percent", value=50.0)
+                    simple_filter_mask_min_depth_range_meters = gr.Checkbox(label="Limit By Min Depth Metres", value=False)
+                    simple_filter_min_depth_range_meters = gr.Number(label="Min Depth Range Metres", value=3.0)
+                with gr.Row():
+                    simple_filter_mask_depth_edges = gr.Checkbox(label="Suppress Depth Edges", value=True)
+                    simple_filter_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.1)
+                    simple_filter_edge_atol = gr.Number(label="Depth Edge Abs Threshold", value=0.0)
+                    simple_filter_edge_kernel_size = gr.Number(label="Depth Edge Kernel", value=3, precision=0)
+                with gr.Row():
+                    simple_filter_mask_max_depth = gr.Checkbox(label="Suppress Max DA3 Depth Plateau", value=False)
+                    simple_filter_max_depth_rtol = gr.Number(label="Max Depth Rel Threshold", value=0.001)
+                    simple_filter_max_depth_atol = gr.Number(label="Max Depth Abs Threshold", value=None)
+            with gr.Row():
+                simple_divstream_button = gr.Button("Export Divstream", variant="primary")
+                simple_divstream_stop_button = gr.Button("Stop", variant="stop")
+            simple_divstream_status = gr.Markdown()
+            simple_divstream_file = gr.File(label="Divstream", interactive=False)
+            simple_before_non_rigid_ply_path = gr.Textbox(
+                label="Debug before_non_rigid_icp.ply Path",
+                interactive=False,
+            )
+            simple_streaming_guide_ply_path = gr.Textbox(
+                label="Guide Pass PLY Path",
+                interactive=False,
+            )
+            simple_divstream_stop_feedback = gr.Markdown()
+            with gr.Accordion("Log", open=False):
+                simple_divstream_log = gr.Textbox(lines=18, interactive=False)
+
+            simple_divstream_button.click(
+                fn=_run_simple_divstream_generator,
+                inputs=[
+                    simple_divstream_video,
+                    simple_divstream_filename,
+                    simple_divstream_compression,
+                    simple_divstream_workers,
+                    simple_export_before_non_rigid_ply,
+                    simple_export_streaming_guide_ply,
+                    simple_stage0_max_frames,
+                    simple_stage0_max_stride,
+                    simple_stage0_streaming,
+                    simple_stage0_streaming_overlap,
+                    simple_stage0_streaming_global_guide,
+                    simple_stage0_image_ext,
+                    simple_stage0_model_name,
+                    simple_stage0_process_res,
+                    simple_stage0_process_res_method,
+                    simple_stage0_ref_view_strategy,
+                    simple_stage0_use_ray_pose,
+                    simple_fixed_camera,
+                    simple_fixed_camera_fov,
+                    simple_filter_conf_profile,
+                    simple_filter_conf_percentile,
+                    simple_filter_mask_sky,
+                    simple_filter_mask_sky_depth_band,
+                    simple_filter_sky_depth_band_percent,
+                    simple_filter_mask_min_depth_range_percent,
+                    simple_filter_min_depth_range_percent,
+                    simple_filter_mask_min_depth_range_meters,
+                    simple_filter_min_depth_range_meters,
+                    simple_filter_mask_depth_edges,
+                    simple_filter_edge_rtol,
+                    simple_filter_edge_atol,
+                    simple_filter_edge_kernel_size,
+                    simple_filter_mask_max_depth,
+                    simple_filter_max_depth_rtol,
+                    simple_filter_max_depth_atol,
+                ],
+                outputs=[
+                    divstream_run_state,
+                    simple_divstream_status,
+                    simple_divstream_file,
+                    simple_before_non_rigid_ply_path,
+                    simple_streaming_guide_ply_path,
+                    simple_divstream_log,
+                ],
+            )
+            simple_divstream_stop_button.click(
+                fn=_stop_active_run,
+                inputs=[divstream_run_state],
+                outputs=[simple_divstream_stop_feedback, divstream_run_state],
+            )
+
+        with gr.Tab("VDA Divstream Export"):
+            with gr.Row():
+                vda_divstream_video = gr.File(
+                    label="Video",
+                    file_types=[".mp4", ".mov", ".avi", ".mkv"],
+                    type="filepath",
+                )
+                with gr.Column():
+                    vda_divstream_filename = gr.Textbox(
+                        label="Output Filename",
+                        placeholder="Optional. Defaults to the uploaded video name.",
+                    )
+                    vda_divstream_compression = gr.Number(label="Compression Level", value=9, precision=0)
+                    vda_divstream_workers = gr.Number(label="Compression Workers", value=0, precision=0)
+            with gr.Accordion("Video Depth Anything", open=True):
+                with gr.Row():
+                    vda_encoder = gr.Dropdown(
+                        choices=[
+                            ("Small / vits", "vits"),
+                            ("Base / vitb", "vitb"),
+                            ("Large / vitl", "vitl"),
+                        ],
+                        value="vitl",
+                        label="VDA Encoder",
+                        info="Installed checkpoints are reused. Missing checkpoints only download when enabled below.",
+                    )
+                    vda_metric = gr.Checkbox(
+                        label="Metric Depth",
+                        value=False,
+                        info="Uses metric_video_depth_anything_*.pth. Disable only if you want the separate relative-depth checkpoint.",
+                    )
+                    vda_relative_depth_inverse = gr.Checkbox(
+                        label="Invert Non-Metric Depth",
+                        value=True,
+                        info="For relative VDA checkpoints, globally normalize model values and reverse them with 1 - depth before export.",
+                    )
+                    vda_fp32 = gr.Checkbox(
+                        label="Use FP32",
+                        value=False,
+                        info="Higher precision but much slower and uses more VRAM. Leave off for Large/vitl unless you need to debug precision.",
+                    )
+                    vda_download_checkpoint = gr.Checkbox(
+                        label="Download Missing Checkpoint",
+                        value=False,
+                        info="When off, the run fails instead of downloading a missing metric/relative encoder checkpoint.",
+                    )
+                with gr.Row():
+                    vda_input_size = gr.Number(
+                        label="VDA Input Size",
+                        value=518,
+                        precision=0,
+                        info="Model inference size. Large/vitl at 768 can exceed 24 GB VRAM; use 384 or 518 if CUDA OOM.",
+                    )
+                    vda_max_res = gr.Number(
+                        label="Video Max Resolution",
+                        value=1280,
+                        precision=0,
+                        info="Resize input video so the longest side is at most this value. Use -1 for original resolution.",
+                    )
+                    vda_max_frames = gr.Number(
+                        label="Max Output Frames",
+                        value=-1,
+                        precision=0,
+                        info="-1 exports the whole video after stride.",
+                    )
+                    vda_stride = gr.Number(
+                        label="Input Stride",
+                        value=1,
+                        precision=0,
+                        info="Take every Nth input frame. Output FPS is input FPS divided by this stride.",
+                    )
+                with gr.Row():
+                    vda_fixed_camera_fov = gr.Number(
+                        label="Fixed Camera HFOV",
+                        value=60.0,
+                        info="VDA does not estimate camera poses, so the divstream uses identity poses and this pinhole HFOV.",
+                    )
+                    vda_depth_scale = gr.Number(
+                        label="Depth Scale",
+                        value=100.0,
+                        info="Applied before export. For non-metric depth, far pseudo-depth is 1 before this scale.",
+                    )
+                    vda_depth_offset = gr.Number(
+                        label="Depth Offset",
+                        value=0.0,
+                        info="Applied after scaling before invalid depths are removed.",
+                    )
+            with gr.Accordion("Depth Filters Included In Divstream", open=True):
+                with gr.Row():
+                    vda_filter_mask_min_depth_range_percent = gr.Checkbox(
+                        label="Limit By Min Depth Range %",
+                        value=False,
+                    )
+                    vda_filter_min_depth_range_percent = gr.Number(label="Min Depth Range Percent", value=50.0)
+                    vda_filter_mask_max_depth_range_percent = gr.Checkbox(
+                        label="Limit By Max Depth Range %",
+                        value=False,
+                    )
+                    vda_filter_max_depth_range_percent = gr.Number(label="Max Depth Range Percent", value=50.0)
+                with gr.Row():
+                    vda_filter_mask_min_depth_range_meters = gr.Checkbox(
+                        label="Limit By Min Depth Metres",
+                        value=False,
+                    )
+                    vda_filter_min_depth_range_meters = gr.Number(label="Min Depth Range Metres", value=3.0)
+                with gr.Row():
+                    vda_filter_mask_depth_edges = gr.Checkbox(label="Suppress Depth Edges", value=True)
+                    vda_filter_edge_rtol = gr.Number(label="Depth Edge Rel Threshold", value=0.1)
+                    vda_filter_edge_atol = gr.Number(label="Depth Edge Abs Threshold", value=0.0)
+                    vda_filter_edge_kernel_size = gr.Number(label="Depth Edge Kernel", value=3, precision=0)
+                with gr.Row():
+                    vda_filter_mask_max_depth = gr.Checkbox(label="Suppress Max Depth Plateau", value=False)
+                    vda_filter_max_depth_rtol = gr.Number(label="Max Depth Rel Threshold", value=0.001)
+                    vda_filter_max_depth_atol = gr.Number(label="Max Depth Abs Threshold", value=None)
+            with gr.Row():
+                vda_divstream_button = gr.Button("Export VDA Divstream", variant="primary")
+                vda_divstream_stop_button = gr.Button("Stop", variant="stop")
+            vda_divstream_status = gr.Markdown()
+            vda_divstream_file = gr.File(label="Divstream", interactive=False)
+            vda_divstream_stop_feedback = gr.Markdown()
+            with gr.Accordion("Log", open=False):
+                vda_divstream_log = gr.Textbox(lines=18, interactive=False)
+
+            vda_divstream_button.click(
+                fn=_run_vda_divstream_generator,
+                inputs=[
+                    vda_divstream_video,
+                    vda_divstream_filename,
+                    vda_divstream_compression,
+                    vda_divstream_workers,
+                    vda_encoder,
+                    vda_metric,
+                    vda_relative_depth_inverse,
+                    vda_input_size,
+                    vda_max_res,
+                    vda_max_frames,
+                    vda_stride,
+                    vda_fp32,
+                    vda_download_checkpoint,
+                    vda_fixed_camera_fov,
+                    vda_depth_scale,
+                    vda_depth_offset,
+                    vda_filter_mask_min_depth_range_percent,
+                    vda_filter_min_depth_range_percent,
+                    vda_filter_mask_max_depth_range_percent,
+                    vda_filter_max_depth_range_percent,
+                    vda_filter_mask_min_depth_range_meters,
+                    vda_filter_min_depth_range_meters,
+                    vda_filter_mask_depth_edges,
+                    vda_filter_edge_rtol,
+                    vda_filter_edge_atol,
+                    vda_filter_edge_kernel_size,
+                    vda_filter_mask_max_depth,
+                    vda_filter_max_depth_rtol,
+                    vda_filter_max_depth_atol,
+                ],
+                outputs=[
+                    vda_divstream_run_state,
+                    vda_divstream_status,
+                    vda_divstream_file,
+                    vda_divstream_log,
+                ],
+            )
+            vda_divstream_stop_button.click(
+                fn=_stop_active_run,
+                inputs=[vda_divstream_run_state],
+                outputs=[vda_divstream_stop_feedback, vda_divstream_run_state],
+            )
 
         with gr.Tab("Run Full Pipeline"):
             gr.Markdown(
@@ -3382,6 +5167,7 @@ def build_app() -> gr.Blocks:
                             choices=video_choices,
                             value=default_video,
                             info="Discovered under the videos workspace.",
+                            allow_custom_value=True,
                         )
                     with gr.Group(visible=False) as pipeline_existing_scene_group:
                         existing_scene_root_selection = gr.Dropdown(
@@ -3422,10 +5208,10 @@ def build_app() -> gr.Blocks:
                             info="Global DA3 frame cap in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                         )
                         preprocess_max_stride = gr.Number(
-                            label="DA3 Input Max Stride",
+                            label="DA3 Input Stride",
                             value=DEFAULT_STAGE0_MAX_STRIDE,
                             precision=0,
-                            info="Upper bound on raw-video frame spacing in standard mode. Ignored in streaming mode, which now processes the full extracted clip by default.",
+                            info="Raw-video frame stride. In streaming mode this is applied before chunking.",
                         )
                         preprocess_streaming_overlap = gr.Number(
                             label="DA3 Streaming Overlap",
@@ -3452,7 +5238,7 @@ def build_app() -> gr.Blocks:
                             choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
                             value=DEFAULT_STAGE0_REF_VIEW_STRATEGY,
                             label="DA3 Reference View",
-                            info="Default is `saddle_balanced` for this project.",
+                            info="Default is `first` for stable chunked divstream exports.",
                         )
                         preprocess_export_gs_video = gr.Checkbox(
                             label="Export DA3 GS Preview Video",
@@ -3479,20 +5265,25 @@ def build_app() -> gr.Blocks:
                         )
                         preprocess_streaming = gr.Checkbox(
                             label="Use DA3 Streaming",
-                            value=False,
+                            value=DEFAULT_STAGE0_STREAMING,
                             info="Process the full selected sequence in overlapping chunks instead of one global DA3 batch.",
+                        )
+                        preprocess_streaming_global_guide = gr.Checkbox(
+                            label="Use Global Guide Pass",
+                            value=DEFAULT_STAGE0_STREAMING_GLOBAL_GUIDE,
+                            info="Run a sparse whole-video DA3 pass and anchor dense chunks to exact matching guide frames.",
                         )
                     gr.Markdown(
                         "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus "
                         "`before_non_rigid_icp.ply` for the selected pre-ICP settings. The DA3 GS preview video is optional, and `Stage 0 Runtime Export` chooses the runtime-ready output to write after preprocessing. "
-                        "When `Use DA3 Streaming` is enabled, `DA3 Input Max Frames / Chunk Size` becomes the chunk size and Stage 0 covers the full extracted clip with overlapping chunks."
+                        "When `Use DA3 Streaming` is enabled, `DA3 Input Max Frames / Chunk Size` becomes the chunk size and Stage 0 covers the selected strided clip with overlapping chunks."
                     )
                     gr.Markdown(
-                        "Reference-view note: this app now defaults DA3 to `saddle_balanced`."
+                        "Reference-view note: this app now defaults DA3 to `first`."
                     )
                     gr.Markdown(
-                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Max Stride=6` usually gives about every 6th raw frame. "
-                        "With `Use DA3 Streaming` off, raw `5000` frames with the same settings still only covers the earlier part of the clip. With streaming on, Stage 0 now uses 20-frame chunks with the chosen overlap across the full extracted clip."
+                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Stride=6` uses every 6th raw frame before chunking. "
+                        "With `Use DA3 Streaming` off, raw `5000` frames with the same settings still only covers the earlier part of the clip. With streaming on, Stage 0 uses 20-frame chunks with the chosen overlap across the selected strided clip."
                     )
                     gr.Markdown(
                         "When available, Stage 0 also stores DA3's sky mask in `results.npz`. The pre-ICP filtering controls below use it to drop sky pixels before the non-rigid ICP stage."
@@ -3781,6 +5572,7 @@ def build_app() -> gr.Blocks:
                     preprocess_max_stride,
                     preprocess_streaming,
                     preprocess_streaming_overlap,
+                    preprocess_streaming_global_guide,
                     preprocess_image_ext,
                     preprocess_model_name,
                     preprocess_process_res,
@@ -3981,6 +5773,7 @@ def build_app() -> gr.Blocks:
                             choices=video_choices,
                             value=default_video,
                             info="Discovered under the videos workspace.",
+                            allow_custom_value=True,
                         )
                     with gr.Group(visible=False) as stage0_existing_frames_group:
                         stage0_existing_frames_dir = gr.Textbox(
@@ -4008,10 +5801,10 @@ def build_app() -> gr.Blocks:
                         info="Global DA3 frame cap in standard mode. In streaming mode, this becomes the per-chunk DA3 batch size.",
                     )
                     stage0_max_stride = gr.Number(
-                        label="DA3 Input Max Stride",
+                        label="DA3 Input Stride",
                         value=DEFAULT_STAGE0_MAX_STRIDE,
                         precision=0,
-                        info="Upper bound on raw-video frame spacing in standard mode. Ignored in streaming mode, which now processes the full extracted clip by default.",
+                        info="Raw-video frame stride. In streaming mode this is applied before chunking.",
                     )
                     stage0_streaming_overlap = gr.Number(
                         label="DA3 Streaming Overlap",
@@ -4038,7 +5831,7 @@ def build_app() -> gr.Blocks:
                         choices=["first", "middle", "saddle_balanced", "saddle_sim_range"],
                         value=DEFAULT_STAGE0_REF_VIEW_STRATEGY,
                         label="DA3 Reference View",
-                        info="Default is `saddle_balanced` for this project.",
+                        info="Default is `first` for stable chunked divstream exports.",
                     )
                     stage0_export_gs_video = gr.Checkbox(
                         label="Export DA3 GS Preview Video",
@@ -4065,18 +5858,23 @@ def build_app() -> gr.Blocks:
                     )
                     stage0_streaming = gr.Checkbox(
                         label="Use DA3 Streaming",
-                        value=False,
+                        value=DEFAULT_STAGE0_STREAMING,
                         info="Process the full selected sequence in overlapping chunks instead of one global DA3 batch.",
+                    )
+                    stage0_streaming_global_guide = gr.Checkbox(
+                        label="Use Global Guide Pass",
+                        value=DEFAULT_STAGE0_STREAMING_GLOBAL_GUIDE,
+                        info="Run a sparse whole-video DA3 pass and anchor dense chunks to exact matching guide frames.",
                     )
                     gr.Markdown(
                         "Stage 0 samples from the original video before DA3 runs, then prepares the filtered point-cloud cache plus `before_non_rigid_icp.ply`. "
-                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Max Stride=6` usually gives about every 6th raw frame. "
-                        "With `Use DA3 Streaming` off, raw `5000` frames with those settings still only covers the earlier part of the clip. With streaming on, Stage 0 now uses 20-frame chunks with the chosen overlap across the full extracted clip. "
-                        "If `Stage 0 Source Mode` is `Existing Image Folder`, the app first copies that folder into `videos/_gradio_uploads/<uid>/frames/`, then runs Stage 0 from the copied images. Uploaded videos likewise land under `videos/_gradio_uploads/<uid>/<uid>.*` with a short default scene root at `videos/_gradio_uploads/<uid>/scene/`. In that mode `DA3 Input Max Stride` is ignored; `DA3 Input Max Frames / Chunk Size` is only used when streaming mode is enabled. "
+                        "Example: raw `500` frames with `DA3 Input Max Frames / Chunk Size=20`, `DA3 Input Stride=6` uses every 6th raw frame before chunking. "
+                        "With `Use DA3 Streaming` off, raw `5000` frames with those settings still only covers the earlier part of the clip. With streaming on, Stage 0 uses 20-frame chunks with the chosen overlap across the selected strided clip. "
+                        "If `Stage 0 Source Mode` is `Existing Image Folder`, the app first copies that folder into `videos/_gradio_uploads/<uid>/frames/`, then runs Stage 0 from the copied images. Uploaded videos likewise land under `videos/_gradio_uploads/<uid>/<uid>.*` with a short default scene root at `videos/_gradio_uploads/<uid>/scene/`. In that mode `DA3 Input Stride` is ignored; `DA3 Input Max Frames / Chunk Size` is only used when streaming mode is enabled. "
                         "The optional DA3 GS preview video is skipped by default. `Stage 0 Runtime Export` defaults to DirectStorage stream."
                     )
                 gr.Markdown(
-                    "Reference-view note: this app now defaults DA3 to `saddle_balanced`."
+                "Reference-view note: this app now defaults DA3 to `first`."
                 )
 
             with gr.Accordion("Existing Scene / Run", open=True):
@@ -4424,6 +6222,7 @@ def build_app() -> gr.Blocks:
                 stage0_max_stride,
                 stage0_streaming,
                 stage0_streaming_overlap,
+                stage0_streaming_global_guide,
                 stage0_image_ext,
                 stage0_model_name,
                 stage0_process_res,
@@ -4590,6 +6389,20 @@ def build_app() -> gr.Blocks:
                 stage_secondary_preview,
                 stage_key_files,
                 stage_live_log,
+                stage_scene_root_selection,
+                stage_scene_root_text,
+                stage_run_name,
+                stage_selected_run_dir_text,
+                stage31_checkpoint_subdir,
+                stage32_checkpoint_subdir,
+                stage32_inverse_dir_name,
+                stage32_original_images_dir,
+                stage_next_step_md,
+                run_stage0_button,
+                run_stage1_button,
+                run_stage2_button,
+                run_stage31_button,
+                run_stage32_button,
             ]
 
             stage0_run_event = run_stage0_button.click(
@@ -4644,6 +6457,7 @@ def build_app() -> gr.Blocks:
                     stage_scene_root_selection,
                     stage0_runtime_export_format,
                     stage0_runtime_export_fps,
+                    stage_run_name,
                 ],
                 outputs=[stage_status_md],
             )
@@ -4663,6 +6477,82 @@ def build_app() -> gr.Blocks:
                 outputs=[stage_status_md],
             )
 
+            stage_parameter_outputs = [
+                stage0_max_frames,
+                stage0_max_stride,
+                stage0_streaming,
+                stage0_streaming_overlap,
+                stage0_streaming_global_guide,
+                stage0_image_ext,
+                stage0_model_name,
+                stage0_process_res,
+                stage0_process_res_method,
+                stage0_export_gs_video,
+                stage0_runtime_export_format,
+                stage0_runtime_export_fps,
+                stage0_use_ray_pose,
+                stage0_ref_view_strategy,
+                stage1_num_frames,
+                stage1_stride,
+                stage1_offset,
+                stage1_conf_profile,
+                stage1_conf_percentile,
+                stage1_conf_mask_sky,
+                stage1_conf_mask_sky_depth_band,
+                stage1_conf_sky_depth_band_percent,
+                stage1_conf_mask_min_depth_range_percent,
+                stage1_conf_min_depth_range_percent,
+                stage1_conf_mask_min_depth_range_meters,
+                stage1_conf_min_depth_range_meters,
+                stage1_conf_mask_depth_edges,
+                stage1_conf_edge_rtol,
+                stage1_conf_edge_atol,
+                stage1_conf_edge_kernel_size,
+                stage1_conf_mask_max_depth,
+                stage1_conf_max_depth_rtol,
+                stage1_conf_max_depth_atol,
+                stage1_use_roma_matching,
+                stage1_roma_version,
+                stage1_roma_model,
+                stage1_roma_num_samples,
+                stage1_roma_certainty_threshold,
+                stage1_roma_max_references,
+                stage1_roma_reference_sampling,
+                stage1_roma_loss_weight,
+                stage1_roma_max_corr_dist,
+                stage1_knn_backend,
+                stage1_tensorboard,
+                stage1_max_corr_dist,
+                stage1_merge_voxel_size,
+                stage1_icp_n_iter,
+                stage1_icp_early_stopping_patience,
+                stage1_icp_early_stopping_min_iters,
+                stage1_icp_early_stopping_min_delta,
+                stage1_icp_lr,
+                stage1_icp_method,
+                stage1_icp_local_twist_reg,
+                stage1_icp_tv_reg,
+                stage1_icp_tv_voxel_size,
+                stage1_icp_tv_every_k,
+                stage1_icp_tv_sample_ratio,
+                stage1_icp_color_icp_weight,
+                stage1_icp_color_icp_max_color_dist,
+                stage1_icp_color_icp_k,
+                stage1_save_intermediate_every,
+                stage1_deform_log2_hashmap_size,
+                stage1_deform_num_levels,
+                stage1_deform_n_neurons,
+                stage1_deform_n_hidden_layers,
+                stage1_deform_min_res,
+                stage1_deform_max_res,
+                stage1_filter_points,
+                stage1_filter_geom_sigma,
+                stage1_filter_color_sigma,
+                stage1_filter_worst_pct,
+                stage1_filter_min_frames,
+                stage1_filter_base_percentile,
+            ]
+
             stage_reset_outputs = [
                 stage_scene_root_selection,
                 stage_scene_report_md,
@@ -4679,7 +6569,7 @@ def build_app() -> gr.Blocks:
                 run_stage2_button,
                 run_stage31_button,
                 run_stage32_button,
-            ]
+            ] + stage_parameter_outputs
 
             scene_choice_outputs = [
                 stage_scene_report_md,
@@ -4702,6 +6592,11 @@ def build_app() -> gr.Blocks:
                 fn=_refresh_stage_scene,
                 inputs=[stage_scene_root_selection],
                 outputs=scene_choice_outputs,
+            )
+            stage_scene_root_selection.change(
+                fn=_stage_parameter_updates_for_scene,
+                inputs=[stage_scene_root_selection, stage_run_name],
+                outputs=stage_parameter_outputs,
             )
             stage0_source_mode.change(
                 fn=_reset_stage_panel_for_new_source,
@@ -4735,6 +6630,11 @@ def build_app() -> gr.Blocks:
                     run_stage31_button,
                     run_stage32_button,
                 ],
+            )
+            stage_run_name.change(
+                fn=_stage_parameter_updates_for_scene,
+                inputs=[stage_scene_root_selection, stage_run_name],
+                outputs=stage_parameter_outputs,
             )
 
         with gr.Tab("Inspect Existing Scene"):
@@ -4819,6 +6719,16 @@ def build_app() -> gr.Blocks:
                 inspect_scene_root_selection,
             ]
             stage_sync_inputs = [
+                stage_run_state,
+                existing_video_selection,
+                existing_scene_root_selection,
+                output_parent_selection,
+                stage0_existing_video_selection,
+                stage0_output_parent_selection,
+                stage_scene_root_selection,
+                inspect_scene_root_selection,
+            ]
+            stage_live_sync_inputs = [
                 stage_live_scene_root,
                 existing_video_selection,
                 existing_scene_root_selection,
@@ -4841,7 +6751,7 @@ def build_app() -> gr.Blocks:
             )
             stage0_uploaded_event.then(
                 fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             ).then(
                 fn=_reset_stage_panel_for_new_source,
@@ -4855,7 +6765,7 @@ def build_app() -> gr.Blocks:
             )
             stage_live_scene_root.change(
                 fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             )
             existing_scene_root_selection.change(
@@ -4906,28 +6816,28 @@ def build_app() -> gr.Blocks:
                 outputs=auto_sync_outputs,
             )
             stage0_run_event.then(
-                fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                fn=_sync_catalogs_after_live_stage_run,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             )
             stage1_run_event.then(
-                fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                fn=_sync_catalogs_after_live_stage_run,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             )
             stage2_run_event.then(
-                fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                fn=_sync_catalogs_after_live_stage_run,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             )
             stage31_run_event.then(
-                fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                fn=_sync_catalogs_after_live_stage_run,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             )
             stage32_run_event.then(
-                fn=_sync_catalogs_and_scene_views,
-                inputs=stage_sync_inputs,
+                fn=_sync_catalogs_after_live_stage_run,
+                inputs=stage_live_sync_inputs,
                 outputs=auto_sync_outputs,
             )
 

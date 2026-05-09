@@ -74,6 +74,44 @@ def _sky_mask_suffix(*, enabled: bool) -> str:
     return "_sky" if enabled else ""
 
 
+def _load_preprocess_frame_metadata(root_path: str) -> dict[str, object]:
+    meta_path = os.path.join(root_path, "preprocess_frames.json")
+    if not os.path.exists(meta_path):
+        return {}
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed reading %s (%s).", meta_path, exc)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _frame_selection_suffix(root_path: str) -> str:
+    meta = _load_preprocess_frame_metadata(root_path)
+    if not meta:
+        return ""
+
+    selected = meta.get("selected_frame_indices")
+    if isinstance(selected, list) and selected:
+        try:
+            selected_ints = [int(value) for value in selected]
+        except (TypeError, ValueError):
+            selected_ints = []
+        if selected_ints:
+            import hashlib
+
+            digest = hashlib.sha1(",".join(str(value) for value in selected_ints).encode("utf-8")).hexdigest()[:10]
+            stride = meta.get("actual_stride", "na")
+            return f"_sel{len(selected_ints)}_stride{stride}_{digest}"
+
+    num_frames_used = meta.get("num_frames_used")
+    if num_frames_used is not None:
+        return f"_sel{num_frames_used}"
+
+    return ""
+
+
 def _write_boolean_mask_png(path: str, mask: np.ndarray) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     image = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
@@ -344,6 +382,129 @@ def _apply_max_depth_suppression(
     return conf_filtered, valid_filtered
 
 
+def resolve_pcl_conf_folder(
+    root_path: str,
+    *,
+    conf_thresh_percentile: float,
+    conf_mode: str,
+    conf_local_percentile: float | None = None,
+    conf_global_percentile: float | None = None,
+    voxel_size: float = 0.1,
+    voxel_min_count_percentile: float | None = None,
+    conf_mask_sky: bool = False,
+    conf_mask_sky_depth_band: bool = False,
+    conf_sky_depth_band_percent: float = 2.0,
+    conf_mask_min_depth_range_percent: bool = True,
+    conf_min_depth_range_percent: float = 50.0,
+    conf_mask_min_depth_range_meters: bool = False,
+    conf_min_depth_range_meters: float = 3.0,
+    conf_mask_depth_edges: bool = False,
+    conf_edge_rtol: float | None = 0.1,
+    conf_edge_atol: float | None = None,
+    conf_edge_kernel_size: int = 3,
+    conf_mask_max_depth: bool = False,
+    conf_max_depth_rtol: float | None = 0.001,
+    conf_max_depth_atol: float | None = None,
+) -> str:
+    """Return the point-cloud cache folder for a Stage 1 prep filter config."""
+
+    if conf_local_percentile is None:
+        conf_local_percentile = conf_thresh_percentile
+    if conf_global_percentile is None:
+        conf_global_percentile = conf_thresh_percentile
+
+    conf_mode = conf_mode.lower()
+    if conf_mode not in {
+        "global",
+        "per_frame",
+        "per_frame_guided",
+        "voxel",
+        "voxel_guided",
+        "voxel_or",
+    }:
+        raise ValueError(
+            f"Unknown conf_mode '{conf_mode}'. "
+            "Expected one of: 'global', 'per_frame', 'per_frame_guided', 'voxel', 'voxel_guided'."
+        )
+
+    pcl_folder = os.path.join(root_path, "exports", "ply")
+    if conf_mode == "global":
+        pcl_conf_folder = os.path.join(pcl_folder, f"conf_percentile_{conf_thresh_percentile}")
+    elif conf_mode == "per_frame":
+        pcl_conf_folder = os.path.join(pcl_folder, f"conf_perframe_{conf_thresh_percentile}")
+    elif conf_mode == "per_frame_guided":
+        pcl_conf_folder = os.path.join(
+            pcl_folder,
+            f"conf_perframe_guided_g{conf_global_percentile}_l{conf_local_percentile}",
+        )
+    elif conf_mode == "voxel":
+        if voxel_min_count_percentile is None:
+            pcl_conf_folder = os.path.join(
+                pcl_folder,
+                f"conf_voxel_vs{voxel_size}_p{conf_thresh_percentile}",
+            )
+        else:
+            pcl_conf_folder = os.path.join(
+                pcl_folder,
+                f"conf_voxel_vs{voxel_size}_p{conf_thresh_percentile}_min{voxel_min_count_percentile}",
+            )
+    elif conf_mode == "voxel_guided":
+        pcl_conf_folder = os.path.join(
+            pcl_folder,
+            f"conf_voxel_guided_vs{voxel_size}_g{conf_global_percentile}_l{conf_local_percentile}",
+        )
+    else:
+        name = (
+            f"conf_voxel_or_vs{voxel_size}_g{conf_global_percentile}_l{conf_local_percentile}_p{conf_thresh_percentile}"
+        )
+        if voxel_min_count_percentile is not None:
+            name += f"_min{voxel_min_count_percentile}"
+        pcl_conf_folder = os.path.join(pcl_folder, name)
+
+    edge_suffix = _depth_edge_suffix(
+        enabled=conf_mask_depth_edges,
+        edge_rtol=conf_edge_rtol,
+        edge_atol=conf_edge_atol,
+        edge_kernel_size=conf_edge_kernel_size,
+    )
+    if edge_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{edge_suffix}"
+    max_depth_suffix = _max_depth_suffix(
+        enabled=conf_mask_max_depth,
+        max_depth_rtol=conf_max_depth_rtol,
+        max_depth_atol=conf_max_depth_atol,
+    )
+    if max_depth_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{max_depth_suffix}"
+    sky_suffix = _sky_mask_suffix(enabled=conf_mask_sky)
+    if sky_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{sky_suffix}"
+    sky_depth_band_suffix = _sky_depth_band_suffix(
+        enabled=conf_mask_sky_depth_band,
+        band_percent=conf_sky_depth_band_percent,
+    )
+    if sky_depth_band_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{sky_depth_band_suffix}"
+    min_depth_range_percent_suffix = _min_depth_range_percent_suffix(
+        enabled=conf_mask_min_depth_range_percent,
+        min_depth_range_percent=conf_min_depth_range_percent,
+    )
+    if min_depth_range_percent_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{min_depth_range_percent_suffix}"
+    min_depth_range_meters_suffix = _min_depth_range_meters_suffix(
+        enabled=conf_mask_min_depth_range_meters,
+        min_depth_range_meters=conf_min_depth_range_meters,
+    )
+    if min_depth_range_meters_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{min_depth_range_meters_suffix}"
+
+    selection_suffix = _frame_selection_suffix(root_path)
+    if selection_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{selection_suffix}"
+
+    return pcl_conf_folder
+
+
 def _find_preprocess_frames_dir(root_path: str) -> str:
     """
     Locate the frame folder produced/used by `preprocess_video.py`.
@@ -353,17 +514,12 @@ def _find_preprocess_frames_dir(root_path: str) -> str:
 
     Fallback: `<scene_root>/frames/`.
     """
-    meta_path = os.path.join(root_path, "preprocess_frames.json")
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-            frames_dir = meta.get("frames_dir", None)
-            if isinstance(frames_dir, str) and os.path.isdir(frames_dir):
-                return frames_dir
-        except Exception as e:
-            logger.warning("Failed reading %s (%s); falling back to <scene_root>/frames", meta_path, e)
+    meta = _load_preprocess_frame_metadata(root_path)
+    frames_dir = meta.get("frames_dir", None)
+    if isinstance(frames_dir, str) and os.path.isdir(frames_dir):
+        return frames_dir
 
+    meta_path = os.path.join(root_path, "preprocess_frames.json")
     frames_dir = os.path.join(root_path, "frames")
     if not os.path.isdir(frames_dir):
         raise FileNotFoundError(
@@ -430,6 +586,7 @@ def depths_to_world_points_with_colors(
     conf: np.ndarray | None = None,
     conf_thr: float = 0.0,
     valid_mask: np.ndarray | None = None,
+    include_colors: bool = True,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Back-project depth maps to world-space 3-D points with colours.
 
@@ -484,7 +641,10 @@ def depths_to_world_points_with_colors(
         Xc_h = np.vstack([Xc, np.ones((1, Xc.shape[1]))])
         Xw = (c2w @ Xc_h)[:3].T.astype(np.float32)  # (M, 3)
 
-        cols = images_u8[i].reshape(-1, 3)[vidx].astype(np.uint8)  # (M, 3)
+        if include_colors:
+            cols = images_u8[i].reshape(-1, 3)[vidx].astype(np.uint8)  # (M, 3)
+        else:
+            cols = np.zeros((0, 3), dtype=np.uint8)
 
         pts_all.append(Xw)
         col_all.append(cols)
@@ -506,6 +666,10 @@ def _voxelized_conf_filter_da3(
     global_percentile: float | None = None,
     min_count_percentile: float | None = None,
     valid_mask: np.ndarray | None = None,
+    return_point_data: bool = True,
+    or_local_percentile: float | None = None,
+    or_global_percentile: float | None = None,
+    or_min_count_percentile: float | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """
     Compute per-voxel confidence thresholds in world space and filter points.
@@ -526,6 +690,7 @@ def _voxelized_conf_filter_da3(
         conf=None,
         conf_thr=0.0,
         valid_mask=depth_valid,
+        include_colors=return_point_data,
     )
 
     pts_all_list: list[np.ndarray] = []
@@ -547,13 +712,13 @@ def _voxelized_conf_filter_da3(
 
         conf_flat = c.reshape(-1)[vidx]
         pts_i = pts3d_per_frame[i]
-        cols_i = colors_per_frame[i].astype(np.float32)
 
         valid_flat_indices_per_frame.append(vidx)
 
         pts_all_list.append(pts_i)
         conf_all_list.append(conf_flat)
-        color_all_list.append(cols_i)
+        if return_point_data:
+            color_all_list.append(colors_per_frame[i].astype(np.float32))
         frame_ids_list.append(np.full(vidx.shape[0], i, dtype=np.int64))
         pix_ids_list.append(vidx)
 
@@ -567,7 +732,7 @@ def _voxelized_conf_filter_da3(
 
     pts_all = np.concatenate(pts_all_list, axis=0)  # (P, 3)
     conf_all = np.concatenate(conf_all_list, axis=0)  # (P,)
-    colors_all = np.concatenate(color_all_list, axis=0)  # (P, 3)
+    colors_all = np.concatenate(color_all_list, axis=0) if return_point_data else None  # (P, 3)
     frame_ids_all = np.concatenate(frame_ids_list, axis=0)  # (P,)
     pix_ids_all = np.concatenate(pix_ids_list, axis=0)  # (P,)
 
@@ -579,12 +744,6 @@ def _voxelized_conf_filter_da3(
     # Per-voxel occupancy counts (for optional min_count_percentile filtering).
     voxel_counts = np.bincount(inv, minlength=num_vox)
 
-    # Optional global threshold (across all frames/voxels).
-    global_thr = None
-    if global_percentile is not None:
-        global_thr = float(np.percentile(conf_all, global_percentile))
-
-    # Compute per-voxel confidence thresholds.
     order = np.argsort(inv)
     inv_sorted = inv[order]
     conf_sorted = conf_all[order]
@@ -593,28 +752,48 @@ def _voxelized_conf_filter_da3(
     starts = np.flatnonzero(change)
     ends = np.r_[starts[1:], len(inv_sorted)]
 
-    voxel_thr = np.empty(num_vox, dtype=np.float32)
-    for j, (s, e) in enumerate(zip(starts, ends)):
-        vals = conf_sorted[s:e]
-        if vals.size == 0:
-            voxel_thr[j] = -np.inf
-            continue
-        local_thr = float(np.percentile(vals, local_percentile))
-        if global_thr is not None:
-            voxel_thr[j] = max(global_thr, local_thr)
+    def compute_voxel_keep_mask(
+        *,
+        local_pct: float,
+        global_pct: float | None,
+        min_count_pct: float | None,
+    ) -> np.ndarray:
+        global_thr = None
+        if global_pct is not None:
+            global_thr = float(np.percentile(conf_all, global_pct))
+
+        voxel_thr = np.empty(num_vox, dtype=np.float32)
+        for j, (s, e) in enumerate(zip(starts, ends)):
+            vals = conf_sorted[s:e]
+            if vals.size == 0:
+                voxel_thr[j] = -np.inf
+                continue
+            local_thr = float(np.percentile(vals, local_pct))
+            if global_thr is not None:
+                voxel_thr[j] = max(global_thr, local_thr)
+            else:
+                voxel_thr[j] = local_thr
+
+        if min_count_pct is not None:
+            count_thr = float(np.percentile(voxel_counts, min_count_pct))
+            keep_voxels = voxel_counts >= count_thr
         else:
-            voxel_thr[j] = local_thr
+            keep_voxels = np.ones(num_vox, dtype=bool)
 
-    # Optional voxel removal based on occupancy percentile.
-    if min_count_percentile is not None:
-        count_thr = float(np.percentile(voxel_counts, min_count_percentile))
-        keep_voxels = voxel_counts >= count_thr  # (num_vox,)
-    else:
-        keep_voxels = np.ones(num_vox, dtype=bool)
+        point_thr = voxel_thr[inv]
+        return (conf_all >= point_thr) & keep_voxels[inv]
 
-    # Map thresholds back to individual points.
-    point_thr = voxel_thr[inv]  # (P,)
-    keep_mask = (conf_all >= point_thr) & keep_voxels[inv]  # (P,)
+    keep_mask = compute_voxel_keep_mask(
+        local_pct=local_percentile,
+        global_pct=global_percentile,
+        min_count_pct=min_count_percentile,
+    )
+    if or_local_percentile is not None:
+        keep_mask |= compute_voxel_keep_mask(
+            local_pct=or_local_percentile,
+            global_pct=or_global_percentile,
+            min_count_pct=or_min_count_percentile,
+        )
 
     # Rebuild per-frame outputs using the filtered points.
     pts3d_filtered_per_frame: list[np.ndarray] = []
@@ -627,8 +806,12 @@ def _voxelized_conf_filter_da3(
             colors_filtered_per_frame.append(np.zeros((0, 3), dtype=np.float32))
             valid_flat_filtered_per_frame.append(np.zeros((0,), dtype=np.int64))
         else:
-            pts3d_filtered_per_frame.append(pts_all[sel])
-            colors_filtered_per_frame.append(colors_all[sel])
+            if return_point_data:
+                pts3d_filtered_per_frame.append(pts_all[sel])
+                colors_filtered_per_frame.append(colors_all[sel])
+            else:
+                pts3d_filtered_per_frame.append(np.zeros((0, 3), dtype=np.float32))
+                colors_filtered_per_frame.append(np.zeros((0, 3), dtype=np.float32))
             valid_flat_filtered_per_frame.append(pix_ids_all[sel])
 
     return (
@@ -666,6 +849,9 @@ def load_data(
     conf_max_depth_atol: float | None = None,
     offset: int = 0,
     load_original_images_and_intrinsics: bool = False,
+    write_ply_cache: bool = True,
+    load_point_clouds: bool = True,
+    write_debug_masks: bool = True,
 ):
     predictions = np.load(os.path.join(root_path, "exports", "npz", "results.npz"))
     N_total = predictions["conf"].shape[0]
@@ -763,10 +949,6 @@ def load_data(
             str(conf_edge_atol),
         )
 
-    pcl_folder = os.path.join(root_path, "exports", "ply")
-    if not os.path.exists(pcl_folder):
-        os.makedirs(pcl_folder, exist_ok=True)
-
     # Resolve local/global percentiles (for guided modes) with sensible defaults.
     if conf_local_percentile is None:
         conf_local_percentile = conf_thresh_percentile
@@ -787,81 +969,48 @@ def load_data(
             "Expected one of: 'global', 'per_frame', 'per_frame_guided', 'voxel', 'voxel_guided'."
         )
 
-    # Naming scheme for confidence-filtered PLY folders.
-    if conf_mode == "global":
-        pcl_conf_folder = os.path.join(pcl_folder, f"conf_percentile_{conf_thresh_percentile}")
-    elif conf_mode == "per_frame":
-        pcl_conf_folder = os.path.join(pcl_folder, f"conf_perframe_{conf_thresh_percentile}")
-    elif conf_mode == "per_frame_guided":
-        pcl_conf_folder = os.path.join(
-            pcl_folder,
-            f"conf_perframe_guided_g{conf_global_percentile}_l{conf_local_percentile}",
-        )
-    elif conf_mode == "voxel":
-        if voxel_min_count_percentile is None:
-            pcl_conf_folder = os.path.join(
-                pcl_folder,
-                f"conf_voxel_vs{voxel_size}_p{conf_thresh_percentile}",
-            )
-        else:
-            pcl_conf_folder = os.path.join(
-                pcl_folder,
-                f"conf_voxel_vs{voxel_size}_p{conf_thresh_percentile}_min{voxel_min_count_percentile}",
-            )
-    elif conf_mode == "voxel_guided":
-        pcl_conf_folder = os.path.join(
-            pcl_folder,
-            f"conf_voxel_guided_vs{voxel_size}_g{conf_global_percentile}_l{conf_local_percentile}",
-        )
-    else:  # "voxel_or"
-        name = (
-            f"conf_voxel_or_vs{voxel_size}_g{conf_global_percentile}_l{conf_local_percentile}_p{conf_thresh_percentile}"
-        )
-        if voxel_min_count_percentile is not None:
-            name += f"_min{voxel_min_count_percentile}"
-        pcl_conf_folder = os.path.join(pcl_folder, name)
+    pcl_folder = os.path.join(root_path, "exports", "ply")
+    if not os.path.exists(pcl_folder):
+        os.makedirs(pcl_folder, exist_ok=True)
 
-    edge_suffix = _depth_edge_suffix(
-        enabled=conf_mask_depth_edges,
-        edge_rtol=conf_edge_rtol,
-        edge_atol=conf_edge_atol,
-        edge_kernel_size=conf_edge_kernel_size,
+    pcl_conf_folder = resolve_pcl_conf_folder(
+        root_path,
+        conf_thresh_percentile=conf_thresh_percentile,
+        conf_mode=conf_mode,
+        conf_local_percentile=conf_local_percentile,
+        conf_global_percentile=conf_global_percentile,
+        voxel_size=voxel_size,
+        voxel_min_count_percentile=voxel_min_count_percentile,
+        conf_mask_sky=conf_mask_sky,
+        conf_mask_sky_depth_band=conf_mask_sky_depth_band,
+        conf_sky_depth_band_percent=conf_sky_depth_band_percent,
+        conf_mask_min_depth_range_percent=conf_mask_min_depth_range_percent,
+        conf_min_depth_range_percent=conf_min_depth_range_percent,
+        conf_mask_min_depth_range_meters=conf_mask_min_depth_range_meters,
+        conf_min_depth_range_meters=conf_min_depth_range_meters,
+        conf_mask_depth_edges=conf_mask_depth_edges,
+        conf_edge_rtol=conf_edge_rtol,
+        conf_edge_atol=conf_edge_atol,
+        conf_edge_kernel_size=conf_edge_kernel_size,
+        conf_mask_max_depth=conf_mask_max_depth,
+        conf_max_depth_rtol=conf_max_depth_rtol,
+        conf_max_depth_atol=conf_max_depth_atol,
     )
-    if edge_suffix:
-        pcl_conf_folder = f"{pcl_conf_folder}{edge_suffix}"
-    max_depth_suffix = _max_depth_suffix(
-        enabled=conf_mask_max_depth,
-        max_depth_rtol=conf_max_depth_rtol,
-        max_depth_atol=conf_max_depth_atol,
-    )
-    if max_depth_suffix:
-        pcl_conf_folder = f"{pcl_conf_folder}{max_depth_suffix}"
-    sky_suffix = _sky_mask_suffix(enabled=conf_mask_sky)
-    if sky_suffix:
-        pcl_conf_folder = f"{pcl_conf_folder}{sky_suffix}"
-    sky_depth_band_suffix = _sky_depth_band_suffix(
-        enabled=conf_mask_sky_depth_band,
-        band_percent=conf_sky_depth_band_percent,
-    )
-    if sky_depth_band_suffix:
-        pcl_conf_folder = f"{pcl_conf_folder}{sky_depth_band_suffix}"
-    min_depth_range_percent_suffix = _min_depth_range_percent_suffix(
-        enabled=conf_mask_min_depth_range_percent,
-        min_depth_range_percent=conf_min_depth_range_percent,
-    )
-    if min_depth_range_percent_suffix:
-        pcl_conf_folder = f"{pcl_conf_folder}{min_depth_range_percent_suffix}"
-    min_depth_range_meters_suffix = _min_depth_range_meters_suffix(
-        enabled=conf_mask_min_depth_range_meters,
-        min_depth_range_meters=conf_min_depth_range_meters,
-    )
-    if min_depth_range_meters_suffix:
-        pcl_conf_folder = f"{pcl_conf_folder}{min_depth_range_meters_suffix}"
 
-    if not os.path.exists(pcl_conf_folder):
+    valid_indices_path = os.path.join(pcl_conf_folder, "valid_pixel_indices.npz")
+    need_selected_plys = bool(write_ply_cache or load_point_clouds)
+    selected_ply_paths = [os.path.join(pcl_conf_folder, f"frame_{i:05d}.ply") for i in indices]
+    cache_ready = os.path.exists(valid_indices_path)
+    if need_selected_plys:
+        cache_ready = cache_ready and all(os.path.exists(path) for path in selected_ply_paths)
+
+    if not cache_ready:
         os.makedirs(pcl_conf_folder, exist_ok=True)
 
-        logger.info("Preprocessing {image, depth, extrinsics, intrinsics} to point clouds...")
+        if write_ply_cache:
+            logger.info("Preprocessing {image, depth, extrinsics, intrinsics} to point clouds...")
+        else:
+            logger.info("Preprocessing Stage 1 valid-pixel filter cache...")
 
         all_extrinsics = predictions["extrinsics"]  # w2c matrices as np array of shape (N, 3, 4)
         all_intrinsics = predictions["intrinsics"]  # intrinsics in pixel space as np array of shape (N, 3, 3)
@@ -874,18 +1023,19 @@ def load_data(
         if conf_mode == "global":
             conf_thresh = np.percentile(all_conf_filtered, conf_thresh_percentile)
             valid_mask = base_valid_mask & (all_conf_filtered >= conf_thresh)
-            pts3d, colors = depths_to_world_points_with_colors(
-                all_depth,
-                all_intrinsics,
-                all_extrinsics,
-                all_images,
-                conf=None,
-                conf_thr=0.0,
-                valid_mask=valid_mask,
-            )
             valid_flat_indices_all = [
                 np.flatnonzero(valid_mask[i].reshape(-1)).astype(np.int64) for i in range(N_total)
             ]
+            if write_ply_cache:
+                pts3d, colors = depths_to_world_points_with_colors(
+                    all_depth,
+                    all_intrinsics,
+                    all_extrinsics,
+                    all_images,
+                    conf=None,
+                    conf_thr=0.0,
+                    valid_mask=valid_mask,
+                )
         elif conf_mode == "per_frame":
             valid_mask = np.zeros_like(all_depth, dtype=bool)
             for i in tqdm(range(N_total), desc="Computing per-frame conf masks"):
@@ -893,18 +1043,19 @@ def load_data(
                 c = all_conf_filtered[i]
                 vm = base_valid_mask[i] & (c >= conf_thr_i)
                 valid_mask[i] = vm
-            pts3d, colors = depths_to_world_points_with_colors(
-                all_depth,
-                all_intrinsics,
-                all_extrinsics,
-                all_images,
-                conf=None,
-                conf_thr=0.0,
-                valid_mask=valid_mask,
-            )
             valid_flat_indices_all = [
                 np.flatnonzero(valid_mask[i].reshape(-1)).astype(np.int64) for i in range(N_total)
             ]
+            if write_ply_cache:
+                pts3d, colors = depths_to_world_points_with_colors(
+                    all_depth,
+                    all_intrinsics,
+                    all_extrinsics,
+                    all_images,
+                    conf=None,
+                    conf_thr=0.0,
+                    valid_mask=valid_mask,
+                )
         elif conf_mode == "per_frame_guided":
             global_thr = np.percentile(all_conf_filtered, conf_global_percentile)
             valid_mask = np.zeros_like(all_depth, dtype=bool)
@@ -914,18 +1065,19 @@ def load_data(
                 conf_thr_i = max(global_thr, local_thr)
                 vm = base_valid_mask[i] & (c >= conf_thr_i)
                 valid_mask[i] = vm
-            pts3d, colors = depths_to_world_points_with_colors(
-                all_depth,
-                all_intrinsics,
-                all_extrinsics,
-                all_images,
-                conf=None,
-                conf_thr=0.0,
-                valid_mask=valid_mask,
-            )
             valid_flat_indices_all = [
                 np.flatnonzero(valid_mask[i].reshape(-1)).astype(np.int64) for i in range(N_total)
             ]
+            if write_ply_cache:
+                pts3d, colors = depths_to_world_points_with_colors(
+                    all_depth,
+                    all_intrinsics,
+                    all_extrinsics,
+                    all_images,
+                    conf=None,
+                    conf_thr=0.0,
+                    valid_mask=valid_mask,
+                )
         elif conf_mode == "voxel":
             pts3d, colors, valid_flat_indices_all = _voxelized_conf_filter_da3(
                 all_depth,
@@ -938,6 +1090,7 @@ def load_data(
                 global_percentile=None,
                 min_count_percentile=voxel_min_count_percentile,
                 valid_mask=base_valid_mask,
+                return_point_data=write_ply_cache,
             )
         elif conf_mode == "voxel_guided":
             pts3d, colors, valid_flat_indices_all = _voxelized_conf_filter_da3(
@@ -950,10 +1103,10 @@ def load_data(
                 local_percentile=conf_local_percentile,
                 global_percentile=conf_global_percentile,
                 valid_mask=base_valid_mask,
+                return_point_data=write_ply_cache,
             )
         else:  # "voxel_or" – OR-combine voxel_guided and voxel(min-count) selections
-            # First: voxel_guided branch (global/local guided)
-            pts3d_g, colors_g, flat_idx_g = _voxelized_conf_filter_da3(
+            pts3d, colors, valid_flat_indices_all = _voxelized_conf_filter_da3(
                 all_depth,
                 all_conf_filtered,
                 all_intrinsics,
@@ -963,72 +1116,29 @@ def load_data(
                 local_percentile=conf_local_percentile,
                 global_percentile=conf_global_percentile,
                 valid_mask=base_valid_mask,
-            )
-            # Second: plain voxel branch with strong local/min-count filtering
-            pts3d_v, colors_v, flat_idx_v = _voxelized_conf_filter_da3(
-                all_depth,
-                all_conf_filtered,
-                all_intrinsics,
-                all_extrinsics,
-                all_images,
-                voxel_size,
-                local_percentile=conf_thresh_percentile,
-                global_percentile=None,
-                min_count_percentile=voxel_min_count_percentile,
-                valid_mask=base_valid_mask,
+                return_point_data=write_ply_cache,
+                or_local_percentile=conf_thresh_percentile,
+                or_min_count_percentile=voxel_min_count_percentile,
             )
 
-            pts3d = []
-            colors = []
-            valid_flat_indices_all = []
-            for i in range(N_total):
-                idx_g = flat_idx_g[i]
-                idx_v = flat_idx_v[i]
-                if idx_g.size == 0 and idx_v.size == 0:
-                    pts3d.append(np.zeros((0, 3), dtype=np.float32))
-                    colors.append(np.zeros((0, 3), dtype=np.float32))
-                    valid_flat_indices_all.append(np.zeros((0,), dtype=np.int64))
-                    continue
+        if write_ply_cache:
+            def make_pcd(p: np.ndarray, c: np.ndarray) -> o3d.geometry.PointCloud:
+                pc = o3d.geometry.PointCloud()
+                pc.points = o3d.utility.Vector3dVector(p)
+                pc.colors = o3d.utility.Vector3dVector(c / 255.0 if c.size > 0 and c.max() > 1 else c)
+                return pc
 
-                # Concatenate indices and corresponding points/colors, then
-                # deduplicate by flat index to realise the OR-combination.
-                idx_all = np.concatenate([idx_g, idx_v], axis=0)
-                pts_all = np.concatenate([pts3d_g[i], pts3d_v[i]], axis=0)
-                cols_all = np.concatenate([colors_g[i], colors_v[i]], axis=0)
+            pcls_to_write = [make_pcd(pts3d[i], colors[i].astype(np.float32)) for i in range(len(pts3d))]
+            for i in tqdm(range(len(pcls_to_write)), desc="Saving point clouds"):
+                o3d.io.write_point_cloud(os.path.join(pcl_conf_folder, f"frame_{i:05d}.ply"), pcls_to_write[i])
 
-                order = np.argsort(idx_all)
-                idx_sorted = idx_all[order]
-                pts_sorted = pts_all[order]
-                cols_sorted = cols_all[order]
-
-                first_of_run = np.r_[True, idx_sorted[1:] != idx_sorted[:-1]]
-                idx_unique = idx_sorted[first_of_run]
-                pts_unique = pts_sorted[first_of_run]
-                cols_unique = cols_sorted[first_of_run]
-
-                valid_flat_indices_all.append(idx_unique.astype(np.int64))
-                pts3d.append(pts_unique.astype(np.float32))
-                colors.append(cols_unique.astype(np.float32))
-
-        def make_pcd(p: np.ndarray, c: np.ndarray) -> o3d.geometry.PointCloud:
-            pc = o3d.geometry.PointCloud()
-            pc.points = o3d.utility.Vector3dVector(p)
-            pc.colors = o3d.utility.Vector3dVector(c / 255.0 if c.size > 0 and c.max() > 1 else c)
-            return pc
-
-        pcls = [make_pcd(pts3d[i], colors[i].astype(np.float32)) for i in range(len(pts3d))]
-
-        for i in tqdm(range(len(pcls)), desc="Saving point clouds"):
-            o3d.io.write_point_cloud(os.path.join(pcl_conf_folder, f"frame_{i:05d}.ply"), pcls[i])
-
-        # Persist valid pixel indices for all frames alongside the PLYs so that
-        # future data loading never has to recompute them.
-        valid_indices_path = os.path.join(pcl_conf_folder, "valid_pixel_indices.npz")
+        # Persist valid pixel indices for all frames so the divstream exporter
+        # and future data loading never have to recompute them.
         np.savez_compressed(
             valid_indices_path,
             **{f"frame_{i:05d}": arr for i, arr in enumerate(valid_flat_indices_all)},
         )
-        if conf_mask_sky:
+        if conf_mask_sky and write_debug_masks:
             _write_debug_mask_pngs(
                 output_dir=os.path.join(pcl_conf_folder, "debug_masks"),
                 depth_shape=all_depth.shape,
@@ -1036,13 +1146,15 @@ def load_data(
                 valid_flat_indices_all=valid_flat_indices_all,
             )
 
-    pcls = [o3d.io.read_point_cloud(os.path.join(pcl_conf_folder, f"frame_{i:05d}.ply")) for i in indices]
+    if load_point_clouds:
+        pcls = [o3d.io.read_point_cloud(os.path.join(pcl_conf_folder, f"frame_{i:05d}.ply")) for i in indices]
+    else:
+        pcls = []
     extrinsics = [ext for ext in extrinsics]
     intrinsics = [intr for intr in intrinsics]
     images = torch.from_numpy(images).permute(0, 3, 1, 2).to(torch.float32).to(device) / 255.0
 
     # Load valid pixel indices for each frame from disk (same filtering as for PLYs).
-    valid_indices_path = os.path.join(pcl_conf_folder, "valid_pixel_indices.npz")
 
     def _load_valid_indices() -> list[torch.Tensor]:
         if not os.path.exists(valid_indices_path):
@@ -1096,11 +1208,14 @@ def load_data(
             conf_max_depth_atol=conf_max_depth_atol,
             offset=offset,
             load_original_images_and_intrinsics=load_original_images_and_intrinsics,
+            write_ply_cache=write_ply_cache,
+            load_point_clouds=load_point_clouds,
+            write_debug_masks=write_debug_masks,
         )
 
     debug_mask_dir = os.path.join(pcl_conf_folder, "debug_masks")
     need_sky_dir = sky_mask is not None
-    if conf_mask_sky and (
+    if write_debug_masks and conf_mask_sky and (
         not os.path.isdir(os.path.join(debug_mask_dir, "kept"))
         or (need_sky_dir and not os.path.isdir(os.path.join(debug_mask_dir, "sky")))
     ):
@@ -1298,13 +1413,20 @@ def load_da3_original_images_from_folder(
     base_images = predictions["image"][indices]  # (N, H_pred, W_pred, 3) uint8
     base_intrinsics = predictions["intrinsics"][indices]  # (N, 3, 3)
 
+    meta = _load_preprocess_frame_metadata(root_path)
+    selected_frame_paths = meta.get("selected_frame_paths")
+    if isinstance(selected_frame_paths, list) and len(selected_frame_paths) >= N_total:
+        image_paths = [str(path) for path in selected_frame_paths]
+    else:
+        image_paths = []
+
     # Support common image extensions written by preprocess_video.py.
     exts = ["png", "jpg", "jpeg", "webp"]
-    image_paths: list[str] = []
-    for ext in exts:
-        image_paths.extend(glob.glob(os.path.join(images_dir, f"*.{ext}")))
-        image_paths.extend(glob.glob(os.path.join(images_dir, f"*.{ext.upper()}")))
-    image_paths = sorted(set(image_paths))
+    if not image_paths:
+        for ext in exts:
+            image_paths.extend(glob.glob(os.path.join(images_dir, f"*.{ext}")))
+            image_paths.extend(glob.glob(os.path.join(images_dir, f"*.{ext.upper()}")))
+        image_paths = sorted(set(image_paths))
     if len(image_paths) == 0:
         raise FileNotFoundError(
             f"No images found in folder: {images_dir}. "

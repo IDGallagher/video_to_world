@@ -72,6 +72,9 @@ class PipelineConfig:
     preprocess_streaming_overlap: int = 10
     """Stage 0: number of frames overlapped between adjacent DA3 streaming chunks."""
 
+    preprocess_streaming_global_guide: bool = False
+    """Stage 0: run a sparse whole-video guide pass and anchor dense chunks to exact matching guide frames."""
+
     preprocess_image_ext: str = "png"
     """Stage 0: frame file extension (used for extraction + folder globbing)."""
 
@@ -471,6 +474,8 @@ def main(config: PipelineConfig) -> None:
                 stage0_cmd += ["--use_ray_pose"]
             if config.preprocess_streaming:
                 stage0_cmd += ["--streaming"]
+            if config.preprocess_streaming_global_guide:
+                stage0_cmd += ["--streaming_global_guide"]
             if config.input_video is not None:
                 stage0_cmd += ["--input_video", os.path.abspath(config.input_video)]
             else:

@@ -17,11 +17,13 @@ import re
 import shutil
 import struct
 import tempfile
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
+from configs.common import AlignmentDataConfig
 from export_depth_image_stream import (
     _align_up,
     _build_gdeflate_helper,
@@ -50,6 +52,7 @@ _HEADER_STRUCT = struct.Struct("<8sIIIIIIIIIdQQQ")
 _FRAME_STRUCT = struct.Struct("<12f6fQIQI")
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_STAGE0_PREP_CONFIG_FILENAME = "stage0_prep_config.json"
 
 
 @dataclass(frozen=True)
@@ -93,6 +96,127 @@ def default_depth_image_stream_bc7_output_path(scene_root: str) -> str:
     base_name = source_name or scene_name
 
     return str(scene_root_path / "exports" / "depth_image_stream" / f"{base_name}.divstream")
+
+
+def _resolve_stage1_prep_config(scene_root: str, prep_run: str | None = None) -> Path | None:
+    scene_root_path = Path(scene_root).resolve()
+    prep_run_text = str(prep_run or "").strip()
+    if prep_run_text:
+        prep_path = Path(prep_run_text)
+        if not prep_path.is_absolute():
+            prep_path = scene_root_path / prep_path
+        config_path = prep_path if prep_path.name == _STAGE0_PREP_CONFIG_FILENAME else prep_path / _STAGE0_PREP_CONFIG_FILENAME
+        if not config_path.exists():
+            raise FileNotFoundError(f"Stage 1 prep config was not found: {config_path}")
+        return config_path
+
+    configs = [path for path in scene_root_path.glob(f"*/{_STAGE0_PREP_CONFIG_FILENAME}") if path.is_file()]
+    if not configs:
+        return None
+    return max(configs, key=lambda path: path.stat().st_mtime)
+
+
+def _load_stage1_alignment_payload(config_path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Failed to read Stage 1 prep config at {config_path}: {exc}") from exc
+
+    alignment_payload = payload.get("alignment", payload)
+    if not isinstance(alignment_payload, dict):
+        raise ValueError(f"Invalid Stage 1 prep config at {config_path}: missing alignment object.")
+
+    defaults = asdict(AlignmentDataConfig())
+    defaults.update(alignment_payload)
+    return defaults
+
+
+def _stage1_valid_indices_path(scene_root: str, alignment: dict[str, object]) -> Path:
+    from data.data_loading import resolve_pcl_conf_folder
+
+    pcl_conf_folder = resolve_pcl_conf_folder(
+        scene_root,
+        conf_thresh_percentile=float(alignment["conf_thresh_percentile"]),
+        conf_mode=str(alignment["conf_mode"]),
+        conf_local_percentile=(
+            None if alignment.get("conf_local_percentile") is None else float(alignment["conf_local_percentile"])
+        ),
+        conf_global_percentile=(
+            None if alignment.get("conf_global_percentile") is None else float(alignment["conf_global_percentile"])
+        ),
+        voxel_size=float(alignment["conf_voxel_size"]),
+        voxel_min_count_percentile=(
+            None
+            if alignment.get("conf_voxel_min_count_percentile") is None
+            else float(alignment["conf_voxel_min_count_percentile"])
+        ),
+        conf_mask_sky=bool(alignment["conf_mask_sky"]),
+        conf_mask_sky_depth_band=bool(alignment["conf_mask_sky_depth_band"]),
+        conf_sky_depth_band_percent=float(alignment["conf_sky_depth_band_percent"]),
+        conf_mask_min_depth_range_percent=bool(alignment["conf_mask_min_depth_range_percent"]),
+        conf_min_depth_range_percent=float(alignment["conf_min_depth_range_percent"]),
+        conf_mask_min_depth_range_meters=bool(alignment["conf_mask_min_depth_range_meters"]),
+        conf_min_depth_range_meters=float(alignment["conf_min_depth_range_meters"]),
+        conf_mask_depth_edges=bool(alignment["conf_mask_depth_edges"]),
+        conf_edge_rtol=None if alignment.get("conf_edge_rtol") is None else float(alignment["conf_edge_rtol"]),
+        conf_edge_atol=None if alignment.get("conf_edge_atol") is None else float(alignment["conf_edge_atol"]),
+        conf_edge_kernel_size=int(alignment["conf_edge_kernel_size"]),
+        conf_mask_max_depth=bool(alignment["conf_mask_max_depth"]),
+        conf_max_depth_rtol=None if alignment.get("conf_max_depth_rtol") is None else float(alignment["conf_max_depth_rtol"]),
+        conf_max_depth_atol=None if alignment.get("conf_max_depth_atol") is None else float(alignment["conf_max_depth_atol"]),
+    )
+    return Path(pcl_conf_folder) / "valid_pixel_indices.npz"
+
+
+def _load_stage1_filter_mask(
+    *,
+    scene_root: str,
+    prep_run: str | None,
+    num_frames: int,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray | None, Path | None]:
+    config_path = _resolve_stage1_prep_config(scene_root, prep_run=prep_run)
+    if config_path is None:
+        return None, None
+
+    alignment = _load_stage1_alignment_payload(config_path)
+    valid_indices_path = _stage1_valid_indices_path(scene_root, alignment)
+    if not valid_indices_path.exists():
+        raise FileNotFoundError(
+            "Stage 1 prep config exists, but its valid-pixel mask cache is missing. "
+            f"Expected: {valid_indices_path}"
+        )
+
+    pixels_per_frame = height * width
+    flat_masks = np.zeros((num_frames, pixels_per_frame), dtype=bool)
+    missing_keys: list[str] = []
+    with np.load(valid_indices_path) as valid_indices_npz:
+        for frame_idx in range(num_frames):
+            key = f"frame_{frame_idx:05d}"
+            if key not in valid_indices_npz:
+                missing_keys.append(key)
+                continue
+            flat_indices = np.asarray(valid_indices_npz[key], dtype=np.int64)
+            if flat_indices.size == 0:
+                continue
+            if int(flat_indices.min()) < 0 or int(flat_indices.max()) >= pixels_per_frame:
+                raise ValueError(
+                    f"Valid-pixel indices in {valid_indices_path} key {key} are outside the frame bounds."
+                )
+            flat_masks[frame_idx, flat_indices] = True
+
+    if missing_keys:
+        preview = ", ".join(missing_keys[:8])
+        raise KeyError(f"Missing frame masks in {valid_indices_path}: {preview}")
+
+    kept_pixels = int(flat_masks.sum())
+    total_pixels = int(flat_masks.size)
+    print(
+        "Applying Stage 1 prep filters to DirectStorage stream: "
+        f"{kept_pixels:,}/{total_pixels:,} pixels kept using {valid_indices_path}"
+    )
+    return flat_masks.reshape((num_frames, height, width)), config_path
 
 
 def _build_bc7_helper() -> Path:
@@ -155,7 +279,9 @@ def _build_bc7_helper() -> Path:
 
 
 def _compress_bc7_rgba_with_helper(helper_path: Path, rgba_bytes: bytes, *, width: int, height: int, stride: int) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="divstream_bc7_") as temp_dir:
+    temp_parent = helper_path.parent / "_tmp"
+    temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="divstream_bc7_", dir=temp_parent) as temp_dir:
         temp_dir_path = Path(temp_dir)
         input_path = temp_dir_path / "input.rgba"
         output_path = temp_dir_path / "output.bc7"
@@ -238,9 +364,10 @@ def _filter_depth_residual_frame_bytes(depth_frame_bytes: bytes, *, width: int, 
     return _row_sub_filter_bytes(low_plane) + _row_sub_filter_bytes(high_plane)
 
 
-def _infer_scene_fps(scene_root: str) -> int:
+def _infer_scene_fps(scene_root: str) -> float:
     scene_root_path = Path(scene_root)
     sequence_info_candidates = (
+        scene_root_path / "preprocess_frames.json",
         scene_root_path / "exports" / "kinect_rgbd_sequence" / "sequence_info.json",
         scene_root_path / "exports" / "kinect_rgbd_sequence_depth8" / "sequence_info.json",
         scene_root_path / "exports" / "kinect_rgbd_video" / "sequence_info.json",
@@ -254,31 +381,48 @@ def _infer_scene_fps(scene_root: str) -> int:
         except Exception:
             continue
 
-        frame_rate = payload.get("frame_rate")
+        frame_rate = payload.get("runtime_export_fps")
+        if frame_rate is None:
+            frame_rate = payload.get("frame_rate")
         if frame_rate is None:
             frame_rate = payload.get("fps")
         if frame_rate is None:
             continue
 
-        inferred_fps = int(round(float(frame_rate)))
-        if inferred_fps >= 1:
+        inferred_fps = float(frame_rate)
+        if inferred_fps > 0.0:
             return inferred_fps
 
-    return 30
+    return 30.0
+
+
+def _resolve_export_worker_count(max_workers: int | None, num_frames: int) -> int:
+    if num_frames <= 1:
+        return 1
+    if max_workers is None or int(max_workers) <= 0:
+        cpu_count = os.cpu_count() or 4
+        return max(1, min(num_frames, cpu_count, 8))
+    return max(1, min(num_frames, int(max_workers)))
 
 
 def export_depth_image_stream_bc7(
     *,
     scene_root: str,
     output_path: str | None = None,
-    fps: int | None = None,
+    fps: float | None = None,
     compression_level: int = 9,
     overwrite: bool = False,
+    prep_run: str | None = None,
+    apply_stage1_filters: bool = True,
+    require_stage1_filters: bool = False,
+    max_workers: int | None = None,
+    fixed_camera: bool = False,
 ) -> str:
     if fps is None:
         fps = _infer_scene_fps(scene_root)
-    if fps < 1:
-        raise ValueError("fps must be at least 1.")
+    fps = float(fps)
+    if fps <= 0.0:
+        raise ValueError("fps must be greater than 0.")
     if compression_level < 1 or compression_level > 12:
         raise ValueError("compression_level must be between 1 and 12.")
 
@@ -298,6 +442,13 @@ def export_depth_image_stream_bc7(
     bc7_helper_path = _build_bc7_helper()
     images, depth_maps_m, extrinsics, intrinsics = _load_stage0_results(scene_root)
     relative_c2w = _relative_c2w_from_extrinsics(extrinsics)
+    if fixed_camera:
+        relative_c2w = np.repeat(
+            np.eye(4, dtype=np.float32)[None, :, :],
+            relative_c2w.shape[0],
+            axis=0,
+        )
+        print("Fixed-camera export enabled: writing identity camera transform for every frame.")
 
     if images.ndim != 4 or images.shape[-1] != 3:
         raise ValueError(f"Expected images to be (N,H,W,3), got {images.shape}")
@@ -309,6 +460,25 @@ def export_depth_image_stream_bc7(
         raise ValueError("results.npz contains zero frames.")
     if depth_maps_m.shape[0] != num_frames or intrinsics.shape[0] != num_frames or relative_c2w.shape[0] != num_frames:
         raise ValueError("Stage 0 arrays disagree on frame count.")
+
+    stage1_filter_mask = None
+    if apply_stage1_filters:
+        stage1_filter_mask, stage1_config_path = _load_stage1_filter_mask(
+            scene_root=scene_root,
+            prep_run=prep_run,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+        )
+        if stage1_config_path is None:
+            if require_stage1_filters:
+                raise FileNotFoundError(
+                    "No Stage 1 prep config found. Run Stage 0 prep first, or select a prepared "
+                    "frame_to_model_icp_* run so the divstream can include the Stage 1 filters."
+                )
+            print("No Stage 1 prep config found; exporting unfiltered Stage 0 depth stream.")
+    elif require_stage1_filters:
+        raise ValueError("require_stage1_filters=True needs apply_stage1_filters=True.")
 
     block_width, block_height, color_frame_size = _bc7_copyable_layout(width, height)
     color_row_pitch = _align_up(block_width * 16, _D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)
@@ -327,6 +497,8 @@ def export_depth_image_stream_bc7(
     next_offset = payload_offset
 
     valid_depth = np.isfinite(depth_maps_m) & (depth_maps_m > 0.0)
+    if stage1_filter_mask is not None:
+        valid_depth &= stage1_filter_mask
     if not np.any(valid_depth):
         raise ValueError("No valid positive depths found in results.npz.")
     global_near_cm = float(depth_maps_m[valid_depth].min()) * 100.0
@@ -334,7 +506,7 @@ def export_depth_image_stream_bc7(
     if global_far_cm <= global_near_cm:
         global_far_cm = global_near_cm + 1.0e-3
 
-    for frame_idx in range(num_frames):
+    def build_frame_payload(frame_idx: int) -> tuple[int, bytes, bytes, float, float]:
         color_rgb = images[frame_idx]
         if color_rgb.dtype != np.uint8:
             color_rgb = np.clip(color_rgb, 0, 255).astype(np.uint8)
@@ -354,12 +526,16 @@ def export_depth_image_stream_bc7(
             frame_size=color_frame_size,
         )
 
+        frame_depth_m = depth_maps_m[frame_idx]
+        if stage1_filter_mask is not None:
+            frame_depth_m = np.where(stage1_filter_mask[frame_idx], frame_depth_m, 0.0)
+
         near_cm, far_cm = _frame_depth_range_cm(
-            depth_maps_m[frame_idx],
+            frame_depth_m,
             fallback_near_cm=global_near_cm,
             fallback_far_cm=global_far_cm,
         )
-        depth_u16 = _encode_depth_map_u16(depth_maps_m[frame_idx] * 100.0, near_cm=near_cm, far_cm=far_cm)
+        depth_u16 = _encode_depth_map_u16(frame_depth_m * 100.0, near_cm=near_cm, far_cm=far_cm)
         depth_blob = _compress_payload_with_helper(
             gdeflate_helper_path,
             _filter_depth_residual_frame_bytes(
@@ -369,6 +545,19 @@ def export_depth_image_stream_bc7(
             ),
             level=compression_level,
         )
+
+        return frame_idx, color_blob, depth_blob, float(near_cm), float(far_cm)
+
+    worker_count = _resolve_export_worker_count(max_workers, num_frames)
+    if worker_count > 1:
+        print(f"Compressing DirectStorage stream frames with {worker_count} workers.")
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            frame_payloads = list(executor.map(build_frame_payload, range(num_frames)))
+    else:
+        print("Compressing DirectStorage stream frames with 1 worker.")
+        frame_payloads = [build_frame_payload(frame_idx) for frame_idx in range(num_frames)]
+
+    for frame_idx, color_blob, depth_blob, near_cm, far_cm in frame_payloads:
 
         color_offset = next_offset
         next_offset += len(color_blob)
@@ -381,8 +570,8 @@ def export_depth_image_stream_bc7(
         frame_entries.append(
             _FrameEntry(
                 relative_c2w_video=_relative_c2w_video_3x4(relative_c2w[frame_idx]),
-                near_cm=float(near_cm),
-                far_cm=float(far_cm),
+                near_cm=near_cm,
+                far_cm=far_cm,
                 focal_x=float(intrinsics[frame_idx, 0, 0]),
                 focal_y=float(intrinsics[frame_idx, 1, 1]),
                 principal_x=float(intrinsics[frame_idx, 0, 2]),
@@ -453,7 +642,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Output path for the DIVBC7F1 DirectStorage stream. Defaults under exports/depth_image_stream/.",
     )
-    parser.add_argument("--fps", type=int, default=None, help="Playback fps metadata for the stream. Defaults to scene metadata.")
+    parser.add_argument("--fps", type=float, default=None, help="Playback fps metadata for the stream. Defaults to scene metadata.")
     parser.add_argument(
         "--compression-level",
         type=int,
@@ -461,9 +650,38 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="GDeflate compression level [1..12] for per-frame depth payloads.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel frame compression workers. Use 0 for auto.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite an existing output file if present.",
+    )
+    parser.add_argument(
+        "--prep-run",
+        default="",
+        help=(
+            "Stage 1 prep run directory or run name whose valid-pixel mask should filter the stream. "
+            "Defaults to the newest prep run under the scene root."
+        ),
+    )
+    parser.add_argument(
+        "--no-stage1-filters",
+        action="store_true",
+        help="Export raw Stage 0 depths even if a Stage 1 prep mask exists.",
+    )
+    parser.add_argument(
+        "--require-stage1-filters",
+        action="store_true",
+        help="Fail instead of exporting raw depth when no Stage 1 prep filter cache is available.",
+    )
+    parser.add_argument(
+        "--fixed-camera",
+        action="store_true",
+        help="Write identity first-frame-relative camera transforms for all frames.",
     )
     return parser
 
@@ -477,6 +695,11 @@ def main() -> None:
         fps=args.fps,
         compression_level=args.compression_level,
         overwrite=args.overwrite,
+        prep_run=args.prep_run or None,
+        apply_stage1_filters=not args.no_stage1_filters,
+        require_stage1_filters=bool(args.require_stage1_filters),
+        max_workers=int(args.workers),
+        fixed_camera=bool(args.fixed_camera),
     )
     size_bytes = os.path.getsize(output_path)
     print(f"Exported: {output_path}")

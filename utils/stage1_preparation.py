@@ -83,11 +83,13 @@ def prepare_stage1_inputs(
     out_suffix: str = "",
     device: str = "cpu",
     overwrite_before_non_rigid: bool = False,
-) -> tuple[str, str]:
+    write_before_non_rigid: bool = True,
+    write_debug_masks: bool = True,
+) -> tuple[str, str | None]:
     """Materialize Stage 1's pre-ICP inputs from Stage 0 outputs.
 
     This ensures the filtered `exports/ply/...` cache exists for the selected
-    alignment/filter configuration, writes the merged
+    alignment/filter configuration, optionally writes the merged
     `before_non_rigid_icp.ply` file into the Stage 1 run directory, and
     persists the prep config alongside that run for Stage 1 reuse.
     """
@@ -127,15 +129,22 @@ def prepare_stage1_inputs(
         conf_max_depth_rtol=alignment.conf_max_depth_rtol,
         conf_max_depth_atol=alignment.conf_max_depth_atol,
         offset=alignment.offset,
+        write_ply_cache=write_before_non_rigid,
+        load_point_clouds=write_before_non_rigid,
+        write_debug_masks=write_debug_masks,
     )
 
-    before_non_rigid_path = os.path.join(resolved_out_path, "before_non_rigid_icp.ply")
-    if overwrite_before_non_rigid or not os.path.exists(before_non_rigid_path):
-        merged = merge_point_clouds(pcls)
-        o3d.io.write_point_cloud(before_non_rigid_path, merged)
-        logger.info("Prepared pre-ICP merged point cloud at %s", before_non_rigid_path)
+    before_non_rigid_path = None
+    if write_before_non_rigid:
+        before_non_rigid_path = os.path.join(resolved_out_path, "before_non_rigid_icp.ply")
+        if overwrite_before_non_rigid or not os.path.exists(before_non_rigid_path):
+            merged = merge_point_clouds(pcls)
+            o3d.io.write_point_cloud(before_non_rigid_path, merged)
+            logger.info("Prepared pre-ICP merged point cloud at %s", before_non_rigid_path)
+        else:
+            logger.info("Reusing existing pre-ICP merged point cloud at %s", before_non_rigid_path)
     else:
-        logger.info("Reusing existing pre-ICP merged point cloud at %s", before_non_rigid_path)
+        logger.info("Skipped pre-ICP merged point cloud for %s", resolved_out_path)
 
     write_stage0_prep_config(
         root_path=resolved_root,
