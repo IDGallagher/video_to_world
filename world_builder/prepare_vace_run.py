@@ -169,7 +169,13 @@ def _write_download_launch_script(out_dir: Path, *, download_script: Path) -> No
     )
 
 
-def _write_run_scripts(out_dir: Path, *, wan2gp_dir: Path, settings_path: Path) -> None:
+def _write_run_scripts(
+    out_dir: Path,
+    *,
+    wan2gp_dir: Path,
+    settings_path: Path,
+    perc_reserved_mem_max: float,
+) -> None:
     run_sh = out_dir / "run_vace.sh"
     out_wsl = _to_wsl_path(out_dir / "vace_out")
     log_wsl = _to_wsl_path(out_dir / "gen.log")
@@ -186,7 +192,7 @@ def _write_run_scripts(out_dir: Path, *, wan2gp_dir: Path, settings_path: Path) 
                 f"mkdir -p {out_wsl!r}",
                 (
                     f"setsid nohup ./env_conda/bin/python3 wgp.py --process {settings_wsl!r} "
-                    f"--output-dir {out_wsl!r} --profile 4 --perc-reserved-mem-max 0.25 "
+                    f"--output-dir {out_wsl!r} --profile 4 --perc-reserved-mem-max {perc_reserved_mem_max:g} "
                     f"--attention sage > {log_wsl!r} 2>&1 < /dev/null &"
                 ),
                 "pid=$!",
@@ -229,6 +235,12 @@ def main() -> None:
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
     ap.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--perc_reserved_mem_max",
+        type=float,
+        default=0.10,
+        help="Wan2GP CPU RAM reservation fraction for model pinning. Lower values reduce WSL OOM risk.",
+    )
     args = ap.parse_args()
 
     conditioning_dir = Path(args.conditioning_dir)
@@ -277,7 +289,12 @@ def main() -> None:
     download_script = out_dir / "dl_vace_lightning.sh"
     _write_download_script(download_script, wan2gp_dir=wan2gp_dir, ckpt_urls=ckpt_urls, lora_urls=lora_urls)
     _write_download_launch_script(out_dir, download_script=download_script)
-    _write_run_scripts(out_dir, wan2gp_dir=wan2gp_dir, settings_path=settings_path)
+    _write_run_scripts(
+        out_dir,
+        wan2gp_dir=wan2gp_dir,
+        settings_path=settings_path,
+        perc_reserved_mem_max=float(args.perc_reserved_mem_max),
+    )
     manifest = {
         "conditioning_dir": str(conditioning_dir.resolve()),
         "volume_dir": str(volume_dir.resolve()),
