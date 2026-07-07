@@ -74,6 +74,18 @@ def _sky_mask_suffix(*, enabled: bool) -> str:
     return "_sky" if enabled else ""
 
 
+def _white_background_suffix(
+    *,
+    enabled: bool,
+    min_rgb: float,
+    max_channel_delta: float,
+    grow_px: int,
+) -> str:
+    if not enabled:
+        return ""
+    return f"_whitebg_rgb{float(min_rgb):.1f}_d{float(max_channel_delta):.1f}_g{int(grow_px)}"
+
+
 def _load_preprocess_frame_metadata(root_path: str) -> dict[str, object]:
     meta_path = os.path.join(root_path, "preprocess_frames.json")
     if not os.path.exists(meta_path):
@@ -211,6 +223,53 @@ def _apply_sky_depth_band_suppression(
         valid_filtered[i][band_mask] = False
 
     return conf_filtered, valid_filtered
+
+
+def _apply_white_background_suppression(
+    images: np.ndarray,
+    depth: np.ndarray,
+    conf: np.ndarray,
+    *,
+    enabled: bool,
+    min_rgb: float,
+    max_channel_delta: float,
+    grow_px: int,
+    base_valid_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    base_valid = base_valid_mask if base_valid_mask is not None else (np.isfinite(depth) & (depth > 0))
+    if not enabled:
+        return conf, base_valid, np.zeros_like(base_valid, dtype=bool)
+    if images.shape[:3] != depth.shape:
+        raise ValueError(f"Image shape {images.shape[:3]} does not match depth shape {depth.shape}.")
+    if min_rgb < 0.0 or min_rgb > 255.0:
+        raise ValueError(f"White background min RGB must be between 0 and 255, got {min_rgb}.")
+    if max_channel_delta < 0.0 or max_channel_delta > 255.0:
+        raise ValueError(
+            f"White background max channel delta must be between 0 and 255, got {max_channel_delta}."
+        )
+    grow_px = int(grow_px)
+    if grow_px < 0:
+        raise ValueError(f"White background grow pixels must be non-negative, got {grow_px}.")
+
+    rgb = images.astype(np.float32, copy=False)
+    if rgb.max(initial=0.0) <= 1.0:
+        rgb = rgb * 255.0
+
+    channel_min = rgb.min(axis=-1)
+    channel_max = rgb.max(axis=-1)
+    white_mask = (channel_min >= float(min_rgb)) & ((channel_max - channel_min) <= float(max_channel_delta))
+    white_mask &= base_valid
+
+    if grow_px > 0 and np.any(white_mask):
+        mask_t = torch.from_numpy(white_mask.astype(np.float32, copy=False)).reshape(-1, 1, *white_mask.shape[-2:])
+        kernel = grow_px * 2 + 1
+        grown = F.max_pool2d(mask_t, kernel_size=kernel, stride=1, padding=grow_px) > 0
+        white_mask = grown.reshape(white_mask.shape).cpu().numpy() & base_valid
+
+    conf_filtered = conf.copy()
+    conf_filtered[white_mask] = 0.0
+    valid_filtered = base_valid & (~white_mask)
+    return conf_filtered, valid_filtered, white_mask
 
 
 def _apply_min_depth_range_suppression(
@@ -405,6 +464,10 @@ def resolve_pcl_conf_folder(
     conf_mask_max_depth: bool = False,
     conf_max_depth_rtol: float | None = 0.001,
     conf_max_depth_atol: float | None = None,
+    conf_mask_white_background: bool = False,
+    conf_white_bg_min_rgb: float = 220.0,
+    conf_white_bg_max_channel_delta: float = 25.0,
+    conf_white_bg_grow_px: int = 0,
 ) -> str:
     """Return the point-cloud cache folder for a Stage 1 prep filter config."""
 
@@ -485,6 +548,14 @@ def resolve_pcl_conf_folder(
     )
     if sky_depth_band_suffix:
         pcl_conf_folder = f"{pcl_conf_folder}{sky_depth_band_suffix}"
+    white_background_suffix = _white_background_suffix(
+        enabled=conf_mask_white_background,
+        min_rgb=conf_white_bg_min_rgb,
+        max_channel_delta=conf_white_bg_max_channel_delta,
+        grow_px=conf_white_bg_grow_px,
+    )
+    if white_background_suffix:
+        pcl_conf_folder = f"{pcl_conf_folder}{white_background_suffix}"
     min_depth_range_percent_suffix = _min_depth_range_percent_suffix(
         enabled=conf_mask_min_depth_range_percent,
         min_depth_range_percent=conf_min_depth_range_percent,
@@ -847,6 +918,11 @@ def load_data(
     conf_mask_max_depth: bool = False,
     conf_max_depth_rtol: float | None = 0.001,
     conf_max_depth_atol: float | None = None,
+    conf_mask_white_background: bool = False,
+    conf_white_bg_min_rgb: float = 220.0,
+    conf_white_bg_max_channel_delta: float = 25.0,
+    conf_white_bg_grow_px: int = 0,
+    manual_valid_indices_path: str | None = None,
     offset: int = 0,
     load_original_images_and_intrinsics: bool = False,
     write_ply_cache: bool = True,
@@ -866,6 +942,7 @@ def load_data(
     # Load depth and conf for computing valid pixel indices
     all_depth = predictions["depth"]  # (N_total, H, W)
     all_conf = predictions["conf"]  # (N_total, H, W)
+    all_images_for_mask = predictions["image"]  # (N_total, H, W, 3)
     sky_mask = predictions["sky"] if "sky" in predictions.files else None
     all_conf_filtered, base_valid_mask = _apply_sky_mask_suppression(
         all_depth,
@@ -890,6 +967,27 @@ def load_data(
             "Sky-depth-band suppression removed %d pixels before confidence filtering (band_percent=%s)",
             masked_pixels,
             str(conf_sky_depth_band_percent),
+        )
+    white_valid_before = base_valid_mask.copy()
+    all_conf_filtered, base_valid_mask, white_background_mask = _apply_white_background_suppression(
+        all_images_for_mask,
+        all_depth,
+        all_conf_filtered,
+        enabled=conf_mask_white_background,
+        min_rgb=conf_white_bg_min_rgb,
+        max_channel_delta=conf_white_bg_max_channel_delta,
+        grow_px=conf_white_bg_grow_px,
+        base_valid_mask=base_valid_mask,
+    )
+    if conf_mask_white_background:
+        masked_pixels = int((white_valid_before & white_background_mask).sum())
+        logger.info(
+            "White-background suppression removed %d pixels before confidence filtering "
+            "(min_rgb=%s, max_channel_delta=%s, grow_px=%s)",
+            masked_pixels,
+            str(conf_white_bg_min_rgb),
+            str(conf_white_bg_max_channel_delta),
+            str(conf_white_bg_grow_px),
         )
     min_depth_valid_before = base_valid_mask.copy()
     all_conf_filtered, base_valid_mask = _apply_min_depth_range_suppression(
@@ -995,6 +1093,10 @@ def load_data(
         conf_mask_max_depth=conf_mask_max_depth,
         conf_max_depth_rtol=conf_max_depth_rtol,
         conf_max_depth_atol=conf_max_depth_atol,
+        conf_mask_white_background=conf_mask_white_background,
+        conf_white_bg_min_rgb=conf_white_bg_min_rgb,
+        conf_white_bg_max_channel_delta=conf_white_bg_max_channel_delta,
+        conf_white_bg_grow_px=conf_white_bg_grow_px,
     )
 
     valid_indices_path = os.path.join(pcl_conf_folder, "valid_pixel_indices.npz")
@@ -1138,11 +1240,11 @@ def load_data(
             valid_indices_path,
             **{f"frame_{i:05d}": arr for i, arr in enumerate(valid_flat_indices_all)},
         )
-        if conf_mask_sky and write_debug_masks:
+        if write_debug_masks and (conf_mask_sky or conf_mask_white_background):
             _write_debug_mask_pngs(
                 output_dir=os.path.join(pcl_conf_folder, "debug_masks"),
                 depth_shape=all_depth.shape,
-                sky_mask=sky_mask,
+                sky_mask=sky_mask if conf_mask_sky else None,
                 valid_flat_indices_all=valid_flat_indices_all,
             )
 
@@ -1206,6 +1308,11 @@ def load_data(
             conf_mask_max_depth=conf_mask_max_depth,
             conf_max_depth_rtol=conf_max_depth_rtol,
             conf_max_depth_atol=conf_max_depth_atol,
+            conf_mask_white_background=conf_mask_white_background,
+            conf_white_bg_min_rgb=conf_white_bg_min_rgb,
+            conf_white_bg_max_channel_delta=conf_white_bg_max_channel_delta,
+            conf_white_bg_grow_px=conf_white_bg_grow_px,
+            manual_valid_indices_path=manual_valid_indices_path,
             offset=offset,
             load_original_images_and_intrinsics=load_original_images_and_intrinsics,
             write_ply_cache=write_ply_cache,
@@ -1213,9 +1320,63 @@ def load_data(
             write_debug_masks=write_debug_masks,
         )
 
+    if manual_valid_indices_path:
+        manual_path = os.path.abspath(str(manual_valid_indices_path))
+        if not os.path.exists(manual_path):
+            raise FileNotFoundError(f"Manual valid-pixel pruning mask not found: {manual_path}")
+
+        with np.load(manual_path) as manual_npz:
+            pruned_valid_pixel_indices: list[torch.Tensor] = []
+            keep_masks_np: list[np.ndarray] = []
+            for frame_idx, frame_valid_indices in zip(indices, valid_pixel_indices):
+                key = f"frame_{int(frame_idx):05d}"
+                if key not in manual_npz:
+                    raise KeyError(f"Missing key {key} in manual valid-pixel pruning mask: {manual_path}")
+
+                current_np = frame_valid_indices.detach().cpu().numpy().astype(np.int64, copy=False)
+                manual_np = np.asarray(manual_npz[key], dtype=np.int64)
+                keep_np = np.isin(current_np, manual_np, assume_unique=False)
+                keep_masks_np.append(keep_np)
+                pruned_valid_pixel_indices.append(
+                    torch.from_numpy(current_np[keep_np]).long().to(frame_valid_indices.device)
+                )
+
+        if pcls:
+            if len(pcls) != len(keep_masks_np):
+                raise ValueError(
+                    f"Manual pruning expected {len(keep_masks_np)} point clouds, but load_data has {len(pcls)}."
+                )
+            pruned_pcls: list[o3d.geometry.PointCloud] = []
+            for pcd, keep_np in zip(pcls, keep_masks_np):
+                points_np = np.asarray(pcd.points)
+                if points_np.shape[0] != keep_np.shape[0]:
+                    raise ValueError(
+                        "Manual pruning cannot be applied because the cached PLY point count "
+                        f"({points_np.shape[0]}) does not match valid-pixel count ({keep_np.shape[0]})."
+                    )
+                pruned_pcd = o3d.geometry.PointCloud()
+                pruned_pcd.points = o3d.utility.Vector3dVector(points_np[keep_np])
+                if pcd.has_colors():
+                    pruned_pcd.colors = o3d.utility.Vector3dVector(np.asarray(pcd.colors)[keep_np])
+                if pcd.has_normals():
+                    pruned_pcd.normals = o3d.utility.Vector3dVector(np.asarray(pcd.normals)[keep_np])
+                pruned_pcls.append(pruned_pcd)
+            pcls = pruned_pcls
+
+        removed_pixels = sum(
+            int(before.shape[0] - after.shape[0])
+            for before, after in zip(valid_pixel_indices, pruned_valid_pixel_indices)
+        )
+        valid_pixel_indices = pruned_valid_pixel_indices
+        logger.info(
+            "Applied manual valid-pixel pruning mask from %s; removed %d points.",
+            manual_path,
+            removed_pixels,
+        )
+
     debug_mask_dir = os.path.join(pcl_conf_folder, "debug_masks")
-    need_sky_dir = sky_mask is not None
-    if write_debug_masks and conf_mask_sky and (
+    need_sky_dir = conf_mask_sky and sky_mask is not None
+    if write_debug_masks and (conf_mask_sky or conf_mask_white_background) and (
         not os.path.isdir(os.path.join(debug_mask_dir, "kept"))
         or (need_sky_dir and not os.path.isdir(os.path.join(debug_mask_dir, "sky")))
     ):
@@ -1227,7 +1388,7 @@ def load_data(
         _write_debug_mask_pngs(
             output_dir=debug_mask_dir,
             depth_shape=all_depth.shape,
-            sky_mask=sky_mask,
+            sky_mask=sky_mask if conf_mask_sky else None,
             valid_flat_indices_all=valid_flat_indices_all,
         )
 

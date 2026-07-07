@@ -164,6 +164,10 @@ def _stage1_valid_indices_path(scene_root: str, alignment: dict[str, object]) ->
         conf_mask_max_depth=bool(alignment["conf_mask_max_depth"]),
         conf_max_depth_rtol=None if alignment.get("conf_max_depth_rtol") is None else float(alignment["conf_max_depth_rtol"]),
         conf_max_depth_atol=None if alignment.get("conf_max_depth_atol") is None else float(alignment["conf_max_depth_atol"]),
+        conf_mask_white_background=bool(alignment.get("conf_mask_white_background", False)),
+        conf_white_bg_min_rgb=float(alignment.get("conf_white_bg_min_rgb", 220.0)),
+        conf_white_bg_max_channel_delta=float(alignment.get("conf_white_bg_max_channel_delta", 25.0)),
+        conf_white_bg_grow_px=int(alignment.get("conf_white_bg_grow_px", 0)),
     )
     return Path(pcl_conf_folder) / "valid_pixel_indices.npz"
 
@@ -209,6 +213,26 @@ def _load_stage1_filter_mask(
     if missing_keys:
         preview = ", ".join(missing_keys[:8])
         raise KeyError(f"Missing frame masks in {valid_indices_path}: {preview}")
+
+    manual_valid_indices_path = alignment.get("manual_valid_indices_path")
+    if manual_valid_indices_path:
+        manual_path = Path(str(manual_valid_indices_path))
+        if not manual_path.exists():
+            raise FileNotFoundError(f"Manual valid-pixel pruning mask was not found: {manual_path}")
+        with np.load(manual_path) as manual_npz:
+            for frame_idx in range(num_frames):
+                key = f"frame_{frame_idx:05d}"
+                if key not in manual_npz:
+                    continue
+                manual_indices = np.asarray(manual_npz[key], dtype=np.int64)
+                manual_mask = np.zeros(pixels_per_frame, dtype=bool)
+                if manual_indices.size:
+                    if int(manual_indices.min()) < 0 or int(manual_indices.max()) >= pixels_per_frame:
+                        raise ValueError(
+                            f"Manual valid-pixel indices in {manual_path} key {key} are outside the frame bounds."
+                        )
+                    manual_mask[manual_indices] = True
+                flat_masks[frame_idx] &= manual_mask
 
     kept_pixels = int(flat_masks.sum())
     total_pixels = int(flat_masks.size)

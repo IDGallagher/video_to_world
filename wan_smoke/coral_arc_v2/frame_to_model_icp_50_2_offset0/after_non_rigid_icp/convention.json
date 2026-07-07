@@ -1,0 +1,6 @@
+{
+  "variant": "c2w",
+  "global_deform_is": "c2w",
+  "local_deform_space": "camera",
+  "description": "per_frame_global_deform contains full c2w SE3 twists (not corrections). local_deform operates in camera space.  To reconstruct canonical points: canonical = se3_apply(c2w_i, local_deform_i(camera_pts_i))."
+}

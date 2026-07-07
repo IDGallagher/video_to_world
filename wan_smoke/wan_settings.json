@@ -1,0 +1,15 @@
+{
+  "model_type": "i2v_2_2",
+  "prompt": "Underwater coral reef scene. Massive coral pillars rise from the seabed toward the bright water surface, covered in dense clusters of orange, pink and teal coral polyps. A small submarine hovers between the pillars. The camera slowly and smoothly arcs to the right around the nearest coral pillar, gradually revealing the reef structures hidden behind it. Steady continuous camera motion, consistent lighting, clear blue water, photorealistic, high detail.",
+  "negative_prompt": "blur, distortion, warping, morphing, text, watermark, sudden cuts, flicker",
+  "image_start": "/mnt/d/dev/video_to_world/wan_smoke/seed_final.png",
+  "resolution": "1280x720",
+  "video_length": 49,
+  "num_inference_steps": 20,
+  "seed": 42,
+  "guidance_phases": 2,
+  "switch_threshold": 900,
+  "guidance_scale": 3.5,
+  "guidance2_scale": 3.5,
+  "flow_shift": 5
+}

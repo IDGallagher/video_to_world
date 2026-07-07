@@ -229,6 +229,11 @@ def main(config: FrameToModelICPConfig):
         conf_mask_max_depth=config.alignment.conf_mask_max_depth,
         conf_max_depth_rtol=config.alignment.conf_max_depth_rtol,
         conf_max_depth_atol=config.alignment.conf_max_depth_atol,
+        conf_mask_white_background=config.alignment.conf_mask_white_background,
+        conf_white_bg_min_rgb=config.alignment.conf_white_bg_min_rgb,
+        conf_white_bg_max_channel_delta=config.alignment.conf_white_bg_max_channel_delta,
+        conf_white_bg_grow_px=config.alignment.conf_white_bg_grow_px,
+        manual_valid_indices_path=config.alignment.manual_valid_indices_path,
         offset=config.alignment.offset,
     )
 

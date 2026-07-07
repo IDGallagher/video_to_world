@@ -43,3 +43,8 @@ class AlignmentDataConfig:
     conf_mask_max_depth: bool = False
     conf_max_depth_rtol: Optional[float] = 0.001
     conf_max_depth_atol: Optional[float] = None
+    conf_mask_white_background: bool = False
+    conf_white_bg_min_rgb: float = 220.0
+    conf_white_bg_max_channel_delta: float = 25.0
+    conf_white_bg_grow_px: int = 0
+    manual_valid_indices_path: Optional[str] = None

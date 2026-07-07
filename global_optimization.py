@@ -141,6 +141,11 @@ def main(config: GlobalOptimizationConfig):
         conf_mask_max_depth=align_params.conf_mask_max_depth,
         conf_max_depth_rtol=align_params.conf_max_depth_rtol,
         conf_max_depth_atol=align_params.conf_max_depth_atol,
+        conf_mask_white_background=align_params.conf_mask_white_background,
+        conf_white_bg_min_rgb=align_params.conf_white_bg_min_rgb,
+        conf_white_bg_max_channel_delta=align_params.conf_white_bg_max_channel_delta,
+        conf_white_bg_grow_px=align_params.conf_white_bg_grow_px,
+        manual_valid_indices_path=align_params.manual_valid_indices_path,
         offset=align_params.offset,
     )
 

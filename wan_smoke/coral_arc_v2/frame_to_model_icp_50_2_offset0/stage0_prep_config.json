@@ -1,0 +1,33 @@
+{
+  "root_path": "/mnt/d/dev/video_to_world/wan_smoke/coral_arc_v2",
+  "alignment": {
+    "num_frames": 50,
+    "stride": 2,
+    "offset": 0,
+    "conf_thresh_percentile": 80.0,
+    "conf_mode": "voxel_or",
+    "conf_global_percentile": 10.0,
+    "conf_local_percentile": 10.0,
+    "conf_voxel_size": 1.0,
+    "conf_voxel_min_count_percentile": 50.0,
+    "conf_mask_sky": false,
+    "conf_mask_sky_depth_band": false,
+    "conf_sky_depth_band_percent": 2.0,
+    "conf_mask_min_depth_range_percent": true,
+    "conf_min_depth_range_percent": 50.0,
+    "conf_mask_min_depth_range_meters": false,
+    "conf_min_depth_range_meters": 3.0,
+    "conf_mask_depth_edges": true,
+    "conf_edge_rtol": 0.1,
+    "conf_edge_atol": null,
+    "conf_edge_kernel_size": 3,
+    "conf_mask_max_depth": false,
+    "conf_max_depth_rtol": 0.001,
+    "conf_max_depth_atol": null,
+    "conf_mask_white_background": false,
+    "conf_white_bg_min_rgb": 220.0,
+    "conf_white_bg_max_channel_delta": 25.0,
+    "conf_white_bg_grow_px": 0,
+    "manual_valid_indices_path": null
+  }
+}

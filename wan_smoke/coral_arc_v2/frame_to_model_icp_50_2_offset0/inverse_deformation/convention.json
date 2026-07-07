@@ -1,0 +1,5 @@
+{
+  "variant": "c2w",
+  "global_deform_is": "c2w",
+  "local_deform_space": "camera"
+}

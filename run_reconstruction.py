@@ -429,6 +429,12 @@ def main(config: PipelineConfig) -> None:
                 else str(prep_alignment_cfg.conf_voxel_min_count_percentile),
                 "--prepare_conf_sky_depth_band_percent",
                 str(prep_alignment_cfg.conf_sky_depth_band_percent),
+                "--prepare_conf_white_bg_min_rgb",
+                str(prep_alignment_cfg.conf_white_bg_min_rgb),
+                "--prepare_conf_white_bg_max_channel_delta",
+                str(prep_alignment_cfg.conf_white_bg_max_channel_delta),
+                "--prepare_conf_white_bg_grow_px",
+                str(prep_alignment_cfg.conf_white_bg_grow_px),
                 "--prepare_conf_min_depth_range_percent",
                 str(prep_alignment_cfg.conf_min_depth_range_percent),
                 "--prepare_conf_min_depth_range_meters",
@@ -456,6 +462,8 @@ def main(config: PipelineConfig) -> None:
                 stage0_cmd += ["--prepare_conf_mask_sky"]
             if prep_alignment_cfg.conf_mask_sky_depth_band:
                 stage0_cmd += ["--prepare_conf_mask_sky_depth_band"]
+            if prep_alignment_cfg.conf_mask_white_background:
+                stage0_cmd += ["--prepare_conf_mask_white_background"]
             if prep_alignment_cfg.conf_mask_min_depth_range_percent:
                 stage0_cmd += ["--prepare_conf_mask_min_depth_range_percent"]
             else:

@@ -335,6 +335,13 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
 
     conf_edge_kernel_size = int(a.get("conf_edge_kernel_size", 3))
     conf_mask_max_depth = bool(a.get("conf_mask_max_depth", False))
+    conf_mask_white_background = bool(a.get("conf_mask_white_background", False))
+    conf_white_bg_min_rgb = float(a.get("conf_white_bg_min_rgb", 220.0))
+    conf_white_bg_max_channel_delta = float(a.get("conf_white_bg_max_channel_delta", 25.0))
+    conf_white_bg_grow_px = int(a.get("conf_white_bg_grow_px", 0))
+    manual_valid_indices_path = a.get("manual_valid_indices_path", None)
+    if manual_valid_indices_path is not None:
+        manual_valid_indices_path = str(manual_valid_indices_path)
 
     conf_max_depth_rtol = a.get("conf_max_depth_rtol", None)
     if conf_max_depth_rtol is not None:
@@ -353,7 +360,10 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         "conf_mask_min_depth_range_percent=%s, conf_min_depth_range_percent=%s, "
         "conf_mask_min_depth_range_meters=%s, conf_min_depth_range_meters=%s, "
         "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d, "
-        "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s",
+        "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s, "
+        "conf_mask_white_background=%s, conf_white_bg_min_rgb=%s, "
+        "conf_white_bg_max_channel_delta=%s, conf_white_bg_grow_px=%s, "
+        "manual_valid_indices_path=%s",
         run,
         num_frames,
         stride,
@@ -378,6 +388,11 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         str(conf_mask_max_depth),
         str(conf_max_depth_rtol),
         str(conf_max_depth_atol),
+        str(conf_mask_white_background),
+        str(conf_white_bg_min_rgb),
+        str(conf_white_bg_max_channel_delta),
+        str(conf_white_bg_grow_px),
+        str(manual_valid_indices_path),
     )
 
     return AlignmentDataParams(
@@ -404,6 +419,11 @@ def load_alignment_data_params(root_path: str, run: str) -> AlignmentDataParams:
         conf_mask_max_depth=conf_mask_max_depth,
         conf_max_depth_rtol=conf_max_depth_rtol,
         conf_max_depth_atol=conf_max_depth_atol,
+        conf_mask_white_background=conf_mask_white_background,
+        conf_white_bg_min_rgb=conf_white_bg_min_rgb,
+        conf_white_bg_max_channel_delta=conf_white_bg_max_channel_delta,
+        conf_white_bg_grow_px=conf_white_bg_grow_px,
+        manual_valid_indices_path=manual_valid_indices_path,
     )
 
 

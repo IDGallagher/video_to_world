@@ -620,6 +620,11 @@ def main(config: TrainInverseDeformationConfig):
         conf_mask_max_depth=align_params.conf_mask_max_depth,
         conf_max_depth_rtol=align_params.conf_max_depth_rtol,
         conf_max_depth_atol=align_params.conf_max_depth_atol,
+        conf_mask_white_background=align_params.conf_mask_white_background,
+        conf_white_bg_min_rgb=align_params.conf_white_bg_min_rgb,
+        conf_white_bg_max_channel_delta=align_params.conf_white_bg_max_channel_delta,
+        conf_white_bg_grow_px=align_params.conf_white_bg_grow_px,
+        manual_valid_indices_path=align_params.manual_valid_indices_path,
         offset=align_params.offset,
     )
 
@@ -631,7 +636,10 @@ def main(config: TrainInverseDeformationConfig):
         "conf_mask_sky=%s, conf_mask_sky_depth_band=%s, conf_sky_depth_band_percent=%s, "
         "conf_mask_min_depth_range_percent=%s, conf_min_depth_range_percent=%s, "
         "conf_mask_min_depth_range_meters=%s, conf_min_depth_range_meters=%s, "
-        "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d",
+        "conf_mask_depth_edges=%s, conf_edge_rtol=%s, conf_edge_atol=%s, conf_edge_kernel_size=%d, "
+        "conf_mask_max_depth=%s, conf_max_depth_rtol=%s, conf_max_depth_atol=%s, "
+        "conf_mask_white_background=%s, conf_white_bg_min_rgb=%s, "
+        "conf_white_bg_max_channel_delta=%s, conf_white_bg_grow_px=%s",
         align_params.num_frames,
         align_params.stride,
         align_params.offset,
@@ -652,6 +660,13 @@ def main(config: TrainInverseDeformationConfig):
         str(align_params.conf_edge_rtol),
         str(align_params.conf_edge_atol),
         align_params.conf_edge_kernel_size,
+        str(align_params.conf_mask_max_depth),
+        str(align_params.conf_max_depth_rtol),
+        str(align_params.conf_max_depth_atol),
+        str(align_params.conf_mask_white_background),
+        str(align_params.conf_white_bg_min_rgb),
+        str(align_params.conf_white_bg_max_channel_delta),
+        str(align_params.conf_white_bg_grow_px),
     )
 
     # Load per-frame point clouds and convert to camera space

@@ -2105,6 +2105,29 @@ def parse_args() -> argparse.Namespace:
         help="Pre-ICP preparation: percent width of the sky-depth expansion band.",
     )
     p.add_argument(
+        "--prepare_conf_mask_white_background",
+        action="store_true",
+        help="Pre-ICP preparation: suppress bright low-saturation pixels before point-cloud generation.",
+    )
+    p.add_argument(
+        "--prepare_conf_white_bg_min_rgb",
+        type=float,
+        default=220.0,
+        help="Pre-ICP preparation: minimum RGB channel value for white-background suppression.",
+    )
+    p.add_argument(
+        "--prepare_conf_white_bg_max_channel_delta",
+        type=float,
+        default=25.0,
+        help="Pre-ICP preparation: maximum difference between RGB channels for white-background suppression.",
+    )
+    p.add_argument(
+        "--prepare_conf_white_bg_grow_px",
+        type=int,
+        default=0,
+        help="Pre-ICP preparation: dilate the white-background mask by this many pixels.",
+    )
+    p.add_argument(
         "--prepare_conf_mask_min_depth_range_percent",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2441,6 +2464,10 @@ def main() -> None:
             conf_mask_sky=bool(args.prepare_conf_mask_sky),
             conf_mask_sky_depth_band=bool(args.prepare_conf_mask_sky_depth_band),
             conf_sky_depth_band_percent=float(args.prepare_conf_sky_depth_band_percent),
+            conf_mask_white_background=bool(args.prepare_conf_mask_white_background),
+            conf_white_bg_min_rgb=float(args.prepare_conf_white_bg_min_rgb),
+            conf_white_bg_max_channel_delta=float(args.prepare_conf_white_bg_max_channel_delta),
+            conf_white_bg_grow_px=int(args.prepare_conf_white_bg_grow_px),
             conf_mask_min_depth_range_percent=bool(args.prepare_conf_mask_min_depth_range_percent),
             conf_min_depth_range_percent=float(args.prepare_conf_min_depth_range_percent),
             conf_mask_min_depth_range_meters=bool(args.prepare_conf_mask_min_depth_range_meters),
