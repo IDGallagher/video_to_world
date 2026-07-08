@@ -185,7 +185,7 @@ def main() -> None:
     ap.add_argument("--run_da3", action="store_true")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--image_ext", default="png")
-    ap.add_argument("--process_res", type=int, default=832)
+    ap.add_argument("--process_res", type=int, default=512)
     ap.add_argument("--keep_mask_max", type=int, default=16)
     ap.add_argument("--write_mask_min", type=int, default=1)
     ap.add_argument("--min_fit_pixels", type=int, default=1000)
