@@ -193,6 +193,29 @@ def _source_target_point(volume_dir: Path, cameras: dict, source_frame: dict) ->
     return target, z
 
 
+def _source_silhouette_meta(volume_dir: Path, cameras: dict, source_frame: dict) -> dict:
+    depth = _decode_depth_u16(
+        volume_dir / os.path.basename(source_frame["file_path"]),
+        near=float(source_frame["near"]),
+        far=float(source_frame["far"]),
+    )
+    valid = depth > 0.0
+    v, u = np.nonzero(valid)
+    if v.size == 0:
+        raise RuntimeError("Source view has no valid depth")
+    height, width = depth.shape
+    u0 = int(u.min())
+    u1 = int(u.max())
+    v0 = int(v.min())
+    v1 = int(v.max())
+    return {
+        "bbox_px": [u0, v0, u1, v1],
+        "width_fraction": float((u1 - u0 + 1) / float(width)),
+        "height_fraction": float((v1 - v0 + 1) / float(height)),
+        "margins_px": [u0, v0, width - 1 - u1, height - 1 - v1],
+    }
+
+
 def _author_camera_path(
     cameras: dict,
     volume_dir: Path,
@@ -201,6 +224,8 @@ def _author_camera_path(
     num_frames: int,
     arc_degrees: float,
     slide_cm: float,
+    start_fill_width: float,
+    min_start_distance_scale: float,
     width: int,
     height: int,
 ) -> tuple[list[dict], dict]:
@@ -213,14 +238,22 @@ def _author_camera_path(
     source_right = source_c2w[:3, 0]
     source_down = source_c2w[:3, 1]
     target, target_distance = _source_target_point(volume_dir, cameras, source)
+    silhouette = _source_silhouette_meta(volume_dir, cameras, source)
+    if start_fill_width > 0.0:
+        start_distance_scale = silhouette["width_fraction"] / start_fill_width
+    else:
+        start_distance_scale = 1.0
+    start_distance_scale = float(np.clip(start_distance_scale, min_start_distance_scale, 1.0))
 
     frames: list[dict] = []
     denom = max(1, num_frames - 1)
     initial_offset = source_center - target
     for idx in range(num_frames):
         t = float(idx) / float(denom)
+        ease_t = t * t * (3.0 - 2.0 * t)
+        distance_scale = start_distance_scale + (1.0 - start_distance_scale) * ease_t
         angle = math.radians(arc_degrees) * t
-        rotated_offset = _rotation_about_axis(source_down, angle) @ initial_offset
+        rotated_offset = _rotation_about_axis(source_down, angle) @ (initial_offset * distance_scale)
         center = target + rotated_offset + source_right * (slide_cm * t)
         look_target = target + source_right * (slide_cm * t)
         c2w = _look_at_c2w(center, look_target, down_hint=source_down)
@@ -243,6 +276,10 @@ def _author_camera_path(
         "source_view": int(source_view),
         "arc_degrees": float(arc_degrees),
         "slide_cm": float(slide_cm),
+        "start_fill_width": float(start_fill_width),
+        "min_start_distance_scale": float(min_start_distance_scale),
+        "start_distance_scale": float(start_distance_scale),
+        "source_silhouette": silhouette,
         "target_distance_cm": float(target_distance),
         "target_world_cm": target.tolist(),
         "source_camera_center_cm": source_center.tolist(),
@@ -340,6 +377,8 @@ def main() -> None:
     ap.add_argument("--fps", type=float, default=16.0)
     ap.add_argument("--arc_degrees", type=float, default=20.0)
     ap.add_argument("--slide_cm", type=float, default=0.0)
+    ap.add_argument("--start_fill_width", type=float, default=1.08)
+    ap.add_argument("--min_start_distance_scale", type=float, default=0.35)
     ap.add_argument("--max_points_per_frame", type=int, default=220_000)
     ap.add_argument("--mask_feather_px", type=int, default=8)
     ap.add_argument("--background_rgb", default="127,127,127")
@@ -375,6 +414,8 @@ def main() -> None:
         num_frames=int(args.frames),
         arc_degrees=float(args.arc_degrees),
         slide_cm=float(args.slide_cm),
+        start_fill_width=float(args.start_fill_width),
+        min_start_distance_scale=float(args.min_start_distance_scale),
         width=int(args.width),
         height=int(args.height),
     )
