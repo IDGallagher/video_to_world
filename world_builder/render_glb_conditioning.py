@@ -212,16 +212,24 @@ def _camera_frames(
     target_track: float,
     origin_z_sign: float,
     convention: str,
+    source_distance_scale: float,
+    target_down: float,
+    square_pixels: bool,
+    principal_x_offset_px: float,
+    principal_y_offset_px: float,
 ) -> tuple[list[dict], dict]:
-    origin0 = np.asarray([0.0, 0.0, float(origin_z_sign) * distance], dtype=np.float64)
-    target0 = np.zeros(3, dtype=np.float64)
+    effective_distance = float(distance) * float(source_distance_scale)
+    origin0 = np.asarray([0.0, 0.0, float(origin_z_sign) * effective_distance], dtype=np.float64)
+    target_base = np.zeros(3, dtype=np.float64)
+    right_base, axis1_base, _ = _look_at_axes(origin0, target_base, convention=convention)
+    target0 = target_base + axis1_base * float(target_down)
     right0, axis1_0, forward0 = _look_at_axes(origin0, target0, convention=convention)
 
     f = 1.0 / (2.0 * math.tan(float(camera_angle_x) * 0.5))
     fx = f * float(width)
-    fy = f * float(height)
-    cx = float(width) * 0.5
-    cy = float(height) * 0.5
+    fy = fx if square_pixels else f * float(height)
+    cx = float(width) * 0.5 + float(principal_x_offset_px)
+    cy = float(height) * 0.5 + float(principal_y_offset_px)
 
     frames: list[dict] = []
     denom = max(1, int(num_frames) - 1)
@@ -264,6 +272,12 @@ def _camera_frames(
         "cy": cy,
         "camera_angle_x": float(camera_angle_x),
         "distance": float(distance),
+        "effective_distance": float(effective_distance),
+        "source_distance_scale": float(source_distance_scale),
+        "target_down": float(target_down),
+        "square_pixels": bool(square_pixels),
+        "principal_x_offset_px": float(principal_x_offset_px),
+        "principal_y_offset_px": float(principal_y_offset_px),
     }
     return frames, meta
 
@@ -426,6 +440,11 @@ def main() -> None:
     ap.add_argument("--target_track", type=float, default=1.0)
     ap.add_argument("--origin_z_sign", type=float, default=-1.0)
     ap.add_argument("--look_at_convention", choices=["opencv", "camera_y_up"], default="opencv")
+    ap.add_argument("--source_distance_scale", type=float, default=1.0)
+    ap.add_argument("--target_down", type=float, default=0.0)
+    ap.add_argument("--square_pixels", action="store_true")
+    ap.add_argument("--principal_x_offset_px", type=float, default=0.0)
+    ap.add_argument("--principal_y_offset_px", type=float, default=0.0)
     ap.add_argument("--face_samples", type=int, default=1)
     ap.add_argument("--point_radius", type=int, default=1)
     ap.add_argument("--mask_feather_px", type=int, default=0)
@@ -472,6 +491,11 @@ def main() -> None:
         target_track=float(args.target_track),
         origin_z_sign=float(args.origin_z_sign),
         convention=str(args.look_at_convention),
+        source_distance_scale=float(args.source_distance_scale),
+        target_down=float(args.target_down),
+        square_pixels=bool(args.square_pixels),
+        principal_x_offset_px=float(args.principal_x_offset_px),
+        principal_y_offset_px=float(args.principal_y_offset_px),
     )
 
     guide_video = _open_video(out_dir / "video_guide.mp4", width=int(args.width), height=int(args.height), fps=float(args.fps), is_color=True)
@@ -549,6 +573,11 @@ def main() -> None:
             "target_track": float(args.target_track),
             "origin_z_sign": float(args.origin_z_sign),
             "look_at_convention": str(args.look_at_convention),
+            "source_distance_scale": float(args.source_distance_scale),
+            "target_down": float(args.target_down),
+            "square_pixels": bool(args.square_pixels),
+            "principal_x_offset_px": float(args.principal_x_offset_px),
+            "principal_y_offset_px": float(args.principal_y_offset_px),
         },
         "render": {
             "face_samples": int(args.face_samples),
