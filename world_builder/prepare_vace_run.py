@@ -272,7 +272,7 @@ def main() -> None:
         "model_type": "vace_14B_lightning_3p_2_2",
         "prompt": args.prompt,
         "negative_prompt": args.negative_prompt,
-        "video_prompt_type": "VAKI",
+        "video_prompt_type": "VAI",
         "video_guide": _to_wsl_path(conditioning_dir / "video_guide.mp4"),
         "video_mask": _to_wsl_path(conditioning_dir / "video_mask.mp4"),
         "image_refs": [_to_wsl_path(path) for path in refs],
