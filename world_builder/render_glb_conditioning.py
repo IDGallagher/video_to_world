@@ -282,6 +282,76 @@ def _camera_frames(
     return frames, meta
 
 
+def _local_yaw(angle_radians: float) -> np.ndarray:
+    c = math.cos(angle_radians)
+    s = math.sin(angle_radians)
+    return np.asarray(
+        [
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _camera_frames_from_base_frame(
+    base_frame: dict,
+    *,
+    num_frames: int,
+    truck_right: float,
+    truck_down: float,
+    truck_forward: float,
+    pan_yaw_degrees: float,
+) -> tuple[list[dict], dict]:
+    base_c2w = np.asarray(base_frame["transform_matrix"], dtype=np.float64)
+    base_axes = base_c2w[:3, :3]
+    base_center = base_c2w[:3, 3]
+    frames: list[dict] = []
+    denom = max(1, int(num_frames) - 1)
+    for idx in range(int(num_frames)):
+        t = float(idx) / float(denom)
+        ease = t * t * (3.0 - 2.0 * t)
+        local_move = np.asarray(
+            [
+                float(truck_right) * ease,
+                float(truck_down) * ease,
+                float(truck_forward) * ease,
+            ],
+            dtype=np.float64,
+        )
+        c2w = np.eye(4, dtype=np.float64)
+        c2w[:3, :3] = base_axes @ _local_yaw(math.radians(float(pan_yaw_degrees) * ease))
+        c2w[:3, 3] = base_center + base_axes @ local_move
+        frame = {
+            "frame_index": idx,
+            "transform_matrix": c2w.tolist(),
+            "fl_x": float(base_frame["fl_x"]),
+            "fl_y": float(base_frame["fl_y"]),
+            "cx": float(base_frame["cx"]),
+            "cy": float(base_frame["cy"]),
+            "camera_center": c2w[:3, 3].tolist(),
+            "path_t": t,
+            "path_ease": ease,
+        }
+        frames.append(frame)
+
+    meta = {
+        "base_frame": {
+            "transform_matrix": base_c2w.tolist(),
+            "fl_x": float(base_frame["fl_x"]),
+            "fl_y": float(base_frame["fl_y"]),
+            "cx": float(base_frame["cx"]),
+            "cy": float(base_frame["cy"]),
+        },
+        "truck_right": float(truck_right),
+        "truck_down": float(truck_down),
+        "truck_forward": float(truck_forward),
+        "pan_yaw_degrees": float(pan_yaw_degrees),
+    }
+    return frames, meta
+
+
 def _render_points(
     points_world: np.ndarray,
     colors_rgb: np.ndarray,
@@ -437,9 +507,13 @@ def main() -> None:
     ap.add_argument("--frames", type=int, default=49)
     ap.add_argument("--fps", type=float, default=16.0)
     ap.add_argument("--truck_right", type=float, default=0.08)
+    ap.add_argument("--truck_down", type=float, default=0.0)
+    ap.add_argument("--truck_forward", type=float, default=0.0)
+    ap.add_argument("--pan_yaw_degrees", type=float, default=0.0)
     ap.add_argument("--target_track", type=float, default=1.0)
     ap.add_argument("--origin_z_sign", type=float, default=-1.0)
     ap.add_argument("--look_at_convention", choices=["opencv", "camera_y_up"], default="opencv")
+    ap.add_argument("--base_manifest", default="")
     ap.add_argument("--source_distance_scale", type=float, default=1.0)
     ap.add_argument("--target_down", type=float, default=0.0)
     ap.add_argument("--square_pixels", action="store_true")
@@ -481,28 +555,43 @@ def main() -> None:
     )
     print(f"point cache: {points.shape[0]} points")
 
-    frames, camera_meta = _camera_frames(
-        camera_angle_x=float(camera["camera_angle_x"]),
-        distance=float(camera["distance"]),
-        width=int(args.width),
-        height=int(args.height),
-        num_frames=int(args.frames),
-        truck_right=float(args.truck_right),
-        target_track=float(args.target_track),
-        origin_z_sign=float(args.origin_z_sign),
-        convention=str(args.look_at_convention),
-        source_distance_scale=float(args.source_distance_scale),
-        target_down=float(args.target_down),
-        square_pixels=bool(args.square_pixels),
-        principal_x_offset_px=float(args.principal_x_offset_px),
-        principal_y_offset_px=float(args.principal_y_offset_px),
-    )
+    base_manifest = Path(args.base_manifest) if args.base_manifest else None
+    if base_manifest:
+        base_doc = _load_json(base_manifest)
+        base_frame = base_doc.get("frame", base_doc)
+        frames, camera_meta = _camera_frames_from_base_frame(
+            base_frame,
+            num_frames=int(args.frames),
+            truck_right=float(args.truck_right),
+            truck_down=float(args.truck_down),
+            truck_forward=float(args.truck_forward),
+            pan_yaw_degrees=float(args.pan_yaw_degrees),
+        )
+    else:
+        frames, camera_meta = _camera_frames(
+            camera_angle_x=float(camera["camera_angle_x"]),
+            distance=float(camera["distance"]),
+            width=int(args.width),
+            height=int(args.height),
+            num_frames=int(args.frames),
+            truck_right=float(args.truck_right),
+            target_track=float(args.target_track),
+            origin_z_sign=float(args.origin_z_sign),
+            convention=str(args.look_at_convention),
+            source_distance_scale=float(args.source_distance_scale),
+            target_down=float(args.target_down),
+            square_pixels=bool(args.square_pixels),
+            principal_x_offset_px=float(args.principal_x_offset_px),
+            principal_y_offset_px=float(args.principal_y_offset_px),
+        )
 
     guide_video = _open_video(out_dir / "video_guide.mp4", width=int(args.width), height=int(args.height), fps=float(args.fps), is_color=True)
     mask_video = _open_video(out_dir / "video_mask.mp4", width=int(args.width), height=int(args.height), fps=float(args.fps), is_color=False)
 
     preview_frames: list[np.ndarray] = []
     preview_labels: list[str] = []
+    preview_masks: list[np.ndarray] = []
+    preview_mask_labels: list[str] = []
     known_ratios: list[float] = []
     alignment: dict | None = None
     for idx, frame in enumerate(frames):
@@ -546,12 +635,61 @@ def main() -> None:
         if idx in {0, max(0, int(args.frames) // 2), int(args.frames) - 1}:
             preview_frames.append(image_rgb)
             preview_labels.append(f"guide {idx:04d} known={known.mean():.2f}")
+            preview_masks.append(np.repeat(mask[:, :, None], 3, axis=2))
+            preview_mask_labels.append(f"mask {idx:04d} white=inpaint")
         print(f"rendered {idx:04d}: known_ratio={known.mean():.3f} near={near:.4f} far={far:.4f}")
 
     guide_video.release()
     mask_video.release()
 
     _write_contact_sheet(out_dir / "preview_contact_sheet.png", preview_frames, preview_labels)
+    _write_contact_sheet(out_dir / "preview_mask_sheet.png", preview_masks, preview_mask_labels)
+    authored_cameras = {
+        "w": int(args.width),
+        "h": int(args.height),
+        "fl_x": float(frames[0]["fl_x"]) if frames else 0.0,
+        "fl_y": float(frames[0]["fl_y"]) if frames else 0.0,
+        "cx": float(frames[0]["cx"]) if frames else 0.0,
+        "cy": float(frames[0]["cy"]) if frames else 0.0,
+        "coordinate_units": "glb_units",
+        "transform_translation_units": "glb_units",
+        "source_glb": str(glb_path),
+        "source_camera_json": str(camera_json),
+        "source_image": str(source_image),
+        "conditioning": {
+            "guide_video": "video_guide.mp4",
+            "mask_video": "video_mask.mp4",
+            "mask_semantics": "white=generate, black=keep",
+            "mask_feather_px": int(args.mask_feather_px),
+            "base_manifest": str(base_manifest) if base_manifest else "",
+            "truck_right": float(args.truck_right),
+            "truck_down": float(args.truck_down),
+            "truck_forward": float(args.truck_forward),
+            "pan_yaw_degrees": float(args.pan_yaw_degrees),
+        },
+        "frames": frames,
+    }
+    _write_json(out_dir / "cameras.json", authored_cameras)
+    _write_json(
+        out_dir / "conditioning_meta.json",
+        {
+            "glb": str(glb_path),
+            "camera_json": str(camera_json),
+            "source_image": str(source_image),
+            "out_dir": str(out_dir.resolve()),
+            "guide_video": str((out_dir / "video_guide.mp4").resolve()),
+            "mask_video": str((out_dir / "video_mask.mp4").resolve()),
+            "width": int(args.width),
+            "height": int(args.height),
+            "frames": int(args.frames),
+            "fps": float(args.fps),
+            "known_ratio_min": float(min(known_ratios)) if known_ratios else 0.0,
+            "known_ratio_max": float(max(known_ratios)) if known_ratios else 0.0,
+            "known_ratio_mean": float(np.mean(known_ratios)) if known_ratios else 0.0,
+            "mask_semantics": "white=generate, black=keep",
+            "base_manifest": str(base_manifest) if base_manifest else "",
+        },
+    )
     manifest = {
         "glb": str(glb_path),
         "camera_json": str(camera_json),
@@ -567,12 +705,19 @@ def main() -> None:
             "video_guide": "video_guide.mp4",
             "video_mask": "video_mask.mp4",
             "preview_contact_sheet": "preview_contact_sheet.png",
+            "preview_mask_sheet": "preview_mask_sheet.png",
+            "cameras": "cameras.json",
+            "conditioning_meta": "conditioning_meta.json",
         },
         "path": {
             "truck_right": float(args.truck_right),
+            "truck_down": float(args.truck_down),
+            "truck_forward": float(args.truck_forward),
+            "pan_yaw_degrees": float(args.pan_yaw_degrees),
             "target_track": float(args.target_track),
             "origin_z_sign": float(args.origin_z_sign),
             "look_at_convention": str(args.look_at_convention),
+            "base_manifest": str(base_manifest) if base_manifest else "",
             "source_distance_scale": float(args.source_distance_scale),
             "target_down": float(args.target_down),
             "square_pixels": bool(args.square_pixels),
